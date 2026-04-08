@@ -117,16 +117,41 @@ echo ""
 echo "[*] Verifying installation..."
 pwnpilot check 2>/dev/null || echo "Note: Some checks may fail if security tools aren't installed yet"
 
+# Create activation helper script
+cat > .pwnpilot-activate.sh << 'EOF'
+#!/bin/bash
+# PwnPilot activation helper
+# Source this file to activate the PwnPilot environment:
+#   source .pwnpilot-activate.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate"
+echo "✓ PwnPilot environment activated"
+EOF
+chmod +x .pwnpilot-activate.sh
+
 # Installation complete
 echo ""
 echo "================================================"
 echo "  ✓ Installation Complete!"
 echo "================================================"
 echo ""
-echo "Next steps:"
-echo "  1. Activate the virtual environment:"
-echo "     source .venv/bin/activate"
+echo "⚠️  IMPORTANT: Activate the virtual environment"
 echo ""
+echo "Run one of these commands to activate PwnPilot:"
+echo ""
+echo "  Option 1 (recommended - easy to remember):"
+echo "    source .pwnpilot-activate.sh"
+echo ""
+echo "  Option 2 (standard venv activation):"
+echo "    source .venv/bin/activate"
+echo ""
+echo "After activation, verify with:"
+echo "    pwnpilot --version"
+echo ""
+echo "================================================"
+echo ""
+echo "Next steps:"
+echo "  1. Activate the virtual environment (see above)"
 echo "  2. Configure LLM (default: Ollama)"
 echo "     Make sure Ollama is running: ollama serve"
 echo ""
@@ -139,4 +164,6 @@ echo "     pwnpilot start --help"
 echo ""
 echo "  5. View dashboard:"
 echo "     pwnpilot tui"
+echo ""
+echo "================================================"
 echo ""

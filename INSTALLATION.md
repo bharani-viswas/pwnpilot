@@ -297,6 +297,59 @@ sudo apt --fix-broken install
 sudo apt install ./dist/pwnpilot_*.deb
 ```
 
+### Tools Not in PATH After Installation
+
+**Error**: `pwnpilot: command not found` or `alembic: command not found` after running install script
+
+**Explanation:**
+The install script installs tools into a Python virtual environment (`.venv/`). This environment must be activated in each new shell session to access the tools.
+
+**Solution - Choose One:**
+
+**Option 1: Activate for Current Session (Recommended for now)**
+```bash
+# From the pwnpilot directory, run:
+source .pwnpilot-activate.sh
+
+# Or use standard venv activation:
+source .venv/bin/activate
+
+# Verify it worked:
+pwnpilot --version
+```
+
+**Option 2: Make Activation Permanent (Add to Shell Profile)**
+```bash
+# Add to ~/.bashrc or ~/.zshrc:
+echo 'export PWNPILOT_DIR="/path/to/pwnpilot"' >> ~/.bashrc
+echo 'alias pwnpilot-activate="source $PWNPILOT_DIR/.pwnpilot-activate.sh"' >> ~/.bashrc
+
+# Then activate with:
+pwnpilot-activate
+```
+
+**Option 3: Install Globally (Advanced)**
+```bash
+# Copy venv to /opt (requires sudo)
+sudo cp -r .venv /opt/pwnpilot-venv
+
+# Create a wrapper script
+sudo tee /usr/local/bin/pwnpilot << 'EOF'
+#!/bin/bash
+source /opt/pwnpilot-venv/bin/activate
+exec python -m pwnpilot.cli "$@"
+EOF
+sudo chmod +x /usr/local/bin/pwnpilot
+```
+
+**Option 4: Use Debian Package (No Activation Needed)**
+```bash
+# Instead of the bash script, use the .deb package:
+make deb
+sudo apt install ./dist/pwnpilot_*.deb
+# Now 'pwnpilot' will be globally available
+```
+
 ### LLM Connection Issues
 
 **Error**: `Connection to Ollama failed`
