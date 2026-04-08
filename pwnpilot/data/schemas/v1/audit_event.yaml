@@ -1,0 +1,42 @@
+$schema: "http://json-schema.org/draft-07/schema#"
+title: AuditEvent
+type: object
+required:
+  - event_id
+  - engagement_id
+  - timestamp
+  - actor
+  - event_type
+  - payload_hash
+  - prev_event_hash
+properties:
+  event_id:
+    type: string
+    format: uuid
+  engagement_id:
+    type: string
+    format: uuid
+  timestamp:
+    type: string
+    format: date-time
+  actor:
+    type: string
+    minLength: 1
+  event_type:
+    type: string
+    minLength: 1
+  payload:
+    type: object
+  payload_hash:
+    type: string
+    minLength: 64
+  prev_event_hash:
+    type: string
+  decision_context:
+    oneOf:
+      - type: object
+      - type: "null"
+  schema_version:
+    type: string
+    const: "v1"
+additionalProperties: false

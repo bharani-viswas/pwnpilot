@@ -1,0 +1,51 @@
+[Unit]
+Description=Pwnpilot — Policy-first LLM-driven pentesting framework
+Documentation=https://github.com/bharani-viswas/pwnpilot
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+
+# Working directory — adjust to match your deployment path
+WorkingDirectory=/opt/pwnpilot
+
+# Path to the pwnpilot executable inside the virtual environment
+ExecStart=/opt/pwnpilot/.venv/bin/pwnpilot start \
+    --name "%I" \
+    --roe-hash "00000000000000000000000000000000000000000000000000000000000000000000" \
+    --authoriser "systemd"
+
+# Graceful stop: send SIGTERM, allow 35s drain window, then SIGKILL
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStopSec=35
+
+# Restart policy (ADR-009)
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Environment — override via /etc/pwnpilot/pwnpilot.env or a drop-in unit
+EnvironmentFile=-/etc/pwnpilot/pwnpilot.env
+
+# Enforce that PWNPILOT_VAULT_KEY or PWNPILOT_VAULT_KEY_FILE is set at start
+# (the application will hard-fail on startup if neither is present)
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pwnpilot /var/log/pwnpilot /tmp
+PrivateTmp=true
+PrivateDevices=true
+
+# Logging — captured by the systemd journal; retrieve with:
+#   journalctl -u pwnpilot@<name> -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pwnpilot
+
+[Install]
+WantedBy=multi-user.target

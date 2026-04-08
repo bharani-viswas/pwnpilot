@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+sdist/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Environment / secrets
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+config.yaml
+config.local.yaml
+~/.pwnpilot/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+# Alembic runtime artefacts
+alembic.ini.local
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Evidence / report output directories
+evidence/
+reports/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+
+# OS
+*~
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Type stubs
+*.pyi
+!py.typed

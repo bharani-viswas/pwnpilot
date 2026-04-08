@@ -1,0 +1,52 @@
+$schema: "http://json-schema.org/draft-07/schema#"
+title: Finding
+type: object
+required:
+  - finding_id
+  - engagement_id
+  - asset_ref
+  - title
+  - vuln_ref
+  - severity
+properties:
+  finding_id:
+    type: string
+    format: uuid
+  engagement_id:
+    type: string
+    format: uuid
+  asset_ref:
+    type: string
+    minLength: 1
+  title:
+    type: string
+    minLength: 1
+  vuln_ref:
+    type: string
+    minLength: 1
+  severity:
+    type: string
+    enum: [info, low, medium, high, critical]
+  confidence:
+    type: number
+    minimum: 0.0
+    maximum: 1.0
+  exploitability:
+    type: string
+    enum: [none, low, medium, high, functional, weaponized]
+  cvss_vector:
+    type: ["string", "null"]
+  evidence_ids:
+    type: array
+    items:
+      type: string
+      format: uuid
+  remediation:
+    type: string
+  status:
+    type: string
+    enum: [new, confirmed, remediated, false_positive]
+  schema_version:
+    type: string
+    const: "v1"
+additionalProperties: false

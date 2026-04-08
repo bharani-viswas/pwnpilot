@@ -1,0 +1,32 @@
+# Core framework
+typer>=0.12
+textual>=0.60
+pydantic>=2.7
+sqlalchemy>=2.0
+alembic>=1.13
+
+# Agent / LLM
+langgraph>=0.2
+langchain-core>=0.2
+langchain-community>=0.2
+ollama>=0.2
+openai>=1.30
+anthropic>=0.25
+
+# Security / crypto
+cryptography>=42
+
+# Observability
+structlog>=24.1
+
+# Templating / schema
+jinja2>=3.1
+jsonschema>=4.22
+pyyaml>=6.0
+
+# HTTP
+httpx>=0.27
+
+# UI helpers
+rich>=13.7
+click>=8.1

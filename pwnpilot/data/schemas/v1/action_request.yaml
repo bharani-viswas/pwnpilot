@@ -1,0 +1,38 @@
+$schema: "http://json-schema.org/draft-07/schema#"
+title: ActionRequest
+type: object
+required:
+  - action_id
+  - engagement_id
+  - action_type
+  - tool_name
+  - params
+  - risk_level
+properties:
+  action_id:
+    type: string
+    format: uuid
+  engagement_id:
+    type: string
+    format: uuid
+  action_type:
+    type: string
+    enum: [recon_passive, active_scan, exploit, post_exploit, data_exfil]
+  tool_name:
+    type: string
+    minLength: 1
+  params:
+    type: object
+  expected_evidence:
+    type: array
+    items:
+      type: string
+  risk_level:
+    type: string
+    enum: [low, medium, high, critical]
+  requires_approval:
+    type: boolean
+  schema_version:
+    type: string
+    const: "v1"
+additionalProperties: false

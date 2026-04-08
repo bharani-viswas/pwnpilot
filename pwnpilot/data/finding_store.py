@@ -1,0 +1,227 @@
+"""
+Finding Store — deduplication, correlation, and severity scoring.
+
+Deduplication fingerprint: SHA-256(asset_ref + vuln_ref + tool_name)
+Severity scoring: CVSS_base * exposure_weight * confidence_weight * criticality_weight
+Status lifecycle: NEW → CONFIRMED → REMEDIATED | FALSE_POSITIVE
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+import structlog
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Session
+
+from pwnpilot.data.models import (
+    Exploitability,
+    Finding,
+    FindingStatus,
+    Severity,
+)
+
+log = structlog.get_logger(__name__)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class FindingRow(Base):
+    __tablename__ = "findings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    finding_id = Column(String(36), nullable=False, unique=True, index=True)
+    engagement_id = Column(String(36), nullable=False, index=True)
+    fingerprint = Column(String(64), nullable=False, index=True)
+    asset_ref = Column(String(512), nullable=False)
+    title = Column(String(512), nullable=False)
+    vuln_ref = Column(String(256), nullable=False)
+    tool_name = Column(String(128), nullable=False)
+    severity = Column(String(32), nullable=False)
+    confidence = Column(Float, nullable=False, default=0.5)
+    exploitability = Column(String(32), nullable=False, default="none")
+    cvss_score = Column(Float, nullable=True)
+    cvss_vector = Column(String(256), nullable=True)
+    risk_score = Column(Float, nullable=False, default=0.0)
+    evidence_ids_json = Column(Text, nullable=False, default="[]")
+    remediation = Column(Text, nullable=False, default="")
+    status = Column(String(32), nullable=False, default="new")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("engagement_id", "fingerprint", name="uq_eng_fingerprint"),
+    )
+
+
+# Severity → CVSS-like base scores for risk score calculation
+_SEVERITY_BASE: dict[str, float] = {
+    "info": 0.0,
+    "low": 2.0,
+    "medium": 5.0,
+    "high": 7.5,
+    "critical": 9.5,
+}
+
+# Exploitability multipliers
+_EXPLOIT_MULT: dict[str, float] = {
+    "none": 0.5,
+    "low": 0.7,
+    "medium": 0.85,
+    "high": 1.0,
+    "functional": 1.1,
+    "weaponized": 1.25,
+}
+
+
+def _compute_risk_score(
+    severity: str,
+    confidence: float,
+    exploitability: str,
+    cvss_score: float | None,
+) -> float:
+    """
+    Risk score = (CVSS_base or severity_base) * exploit_mult * confidence
+    Clamped to [0.0, 10.0].
+    """
+    base = cvss_score if cvss_score is not None else _SEVERITY_BASE.get(severity, 5.0)
+    exploit = _EXPLOIT_MULT.get(exploitability, 1.0)
+    score = base * exploit * confidence
+    return min(10.0, max(0.0, round(score, 2)))
+
+
+def _fingerprint(asset_ref: str, vuln_ref: str, tool_name: str) -> str:
+    raw = f"{asset_ref}:{vuln_ref}:{tool_name}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+class FindingStore:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        Base.metadata.create_all(session.bind)  # type: ignore[arg-type]
+
+    def upsert(
+        self,
+        engagement_id: UUID,
+        asset_ref: str,
+        title: str,
+        vuln_ref: str,
+        tool_name: str,
+        severity: Severity,
+        confidence: float = 0.5,
+        exploitability: Exploitability = Exploitability.NONE,
+        cvss_score: float | None = None,
+        cvss_vector: str | None = None,
+        evidence_ids: list[UUID] | None = None,
+        remediation: str = "",
+    ) -> Finding:
+        """
+        Insert or update a finding.  Returns the canonical Finding model.
+        Deduplicates by fingerprint(asset_ref + vuln_ref + tool_name).
+        """
+        fp = _fingerprint(asset_ref, vuln_ref, tool_name)
+        risk = _compute_risk_score(severity.value, confidence, exploitability.value, cvss_score)
+        now = datetime.now(timezone.utc)
+        ev_ids = [str(e) for e in (evidence_ids or [])]
+
+        existing = (
+            self._session.query(FindingRow)
+            .filter(
+                FindingRow.engagement_id == str(engagement_id),
+                FindingRow.fingerprint == fp,
+            )
+            .first()
+        )
+
+        if existing:
+            # Merge evidence IDs (dedup)
+            stored_ev = json.loads(existing.evidence_ids_json)
+            merged = list(dict.fromkeys(stored_ev + ev_ids))
+            existing.evidence_ids_json = json.dumps(merged)
+            existing.confidence = max(existing.confidence, confidence)
+            existing.risk_score = risk
+            existing.updated_at = now
+            self._session.commit()
+            finding_id = UUID(existing.finding_id)
+        else:
+            finding_id = uuid4()
+            row = FindingRow(
+                finding_id=str(finding_id),
+                engagement_id=str(engagement_id),
+                fingerprint=fp,
+                asset_ref=asset_ref,
+                title=title,
+                vuln_ref=vuln_ref,
+                tool_name=tool_name,
+                severity=severity.value,
+                confidence=confidence,
+                exploitability=exploitability.value,
+                cvss_score=cvss_score,
+                cvss_vector=cvss_vector,
+                risk_score=risk,
+                evidence_ids_json=json.dumps(ev_ids),
+                remediation=remediation,
+                status=FindingStatus.NEW.value,
+                created_at=now,
+                updated_at=now,
+            )
+            self._session.add(row)
+            self._session.commit()
+            log.info("finding.created", finding_id=str(finding_id), vuln_ref=vuln_ref)
+
+        return Finding(
+            finding_id=finding_id,
+            engagement_id=engagement_id,
+            asset_ref=asset_ref,
+            title=title,
+            vuln_ref=vuln_ref,
+            severity=severity,
+            confidence=confidence,
+            exploitability=exploitability,
+            cvss_vector=cvss_vector,
+            evidence_ids=[UUID(e) for e in ev_ids],
+            remediation=remediation,
+        )
+
+    def findings_for_engagement(self, engagement_id: UUID) -> list[Finding]:
+        rows = (
+            self._session.query(FindingRow)
+            .filter(FindingRow.engagement_id == str(engagement_id))
+            .order_by(FindingRow.risk_score.desc())
+            .all()
+        )
+        result = []
+        for r in rows:
+            ev_ids = [UUID(e) for e in json.loads(r.evidence_ids_json)]
+            result.append(
+                Finding(
+                    finding_id=UUID(r.finding_id),
+                    engagement_id=UUID(r.engagement_id),
+                    asset_ref=r.asset_ref,
+                    title=r.title,
+                    vuln_ref=r.vuln_ref,
+                    severity=Severity(r.severity),
+                    confidence=r.confidence,
+                    exploitability=Exploitability(r.exploitability),
+                    cvss_vector=r.cvss_vector,
+                    evidence_ids=ev_ids,
+                    remediation=r.remediation,
+                    status=FindingStatus(r.status),
+                )
+            )
+        return result
+
+    def update_status(self, finding_id: UUID, status: FindingStatus) -> None:
+        row = (
+            self._session.query(FindingRow)
+            .filter(FindingRow.finding_id == str(finding_id))
+            .first()
+        )
+        if row:
+            row.status = status.value
+            row.updated_at = datetime.now(timezone.utc)
+            self._session.commit()
