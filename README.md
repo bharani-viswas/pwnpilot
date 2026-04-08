@@ -12,6 +12,12 @@ pwnpilot orchestrates a team of LLM-backed agents — Planner, Validator, Execut
 - [Architecture Overview](#architecture-overview)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+  - [Option 1: Quick Installation from Source](#option-1-quick-installation-from-source-recommended-for-development)
+  - [Option 2: Debian/Ubuntu Package Installation](#option-2-debian-ubuntu-package-installation-recommended-for-production)
+  - [Option 3: Development Installation](#option-3-development-installation)
+  - [Option 4: Using Make](#option-4-using-make-comprehensive-build-system)
+  - [Security Tools Installation](#security-tools-installation)
+  - [Verify Installation](#verify-installation)
 - [Configuration](#configuration)
   - [Config file](#config-file)
   - [Environment variable overrides](#environment-variable-overrides)
@@ -125,29 +131,142 @@ bash scripts/verify_toolchain.sh        # sanity-check all binaries
 
 ## Installation
 
+Choose your installation method based on your needs:
+
+### Option 1: Quick Installation from Source (Recommended for Development)
+
+**On Ubuntu/Debian/Kali Linux:**
+
 ```bash
-# 1. Clone the repository
+git clone https://github.com/bharani-viswas/pwnpilot.git
+cd pwnpilot
+bash scripts/install.sh --system-deps
+```
+
+**Or manually (step-by-step):**
+
+```bash
 git clone https://github.com/bharani-viswas/pwnpilot.git
 cd pwnpilot
 
-# 2. Create and activate a virtual environment
-python -m venv .venv
+# Create virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 
-# 3. Install the package (editable mode recommended for development)
+# Install dependencies
+pip install --upgrade pip setuptools wheel
 pip install -e .
 
-# 4. (Optional) Install development extras
-pip install -e ".[dev]"
-
-# 5. Apply database migrations
+# Setup database and keys
 alembic upgrade head
-
-# 6. Generate operator signing keys
 pwnpilot keys --generate
 
-# 7. Verify the installation
+# Verify installation
 pwnpilot check
+```
+
+### Option 2: Debian/Ubuntu Package Installation (Recommended for Production)
+
+**Build the .deb package:**
+
+```bash
+git clone https://github.com/bharani-viswas/pwnpilot.git
+cd pwnpilot
+make deb
+```
+
+**Install the package:**
+
+```bash
+# Install with automatic dependency resolution
+sudo apt install ./dist/pwnpilot_*.deb
+
+# Or with dpkg (requires manual dependency installation)
+sudo dpkg -i dist/pwnpilot_*.deb
+```
+
+**What the package includes:**
+- ✓ Python virtual environment with all dependencies
+- ✓ Automatic database initialization
+- ✓ Systemd service for daemon deployment
+- ✓ Configuration templates in `/etc/pwnpilot/`
+- ✓ Data directory: `/var/lib/pwnpilot`
+- ✓ Logs: `/var/log/pwnpilot`
+
+**Post-installation:**
+
+```bash
+# Start the service
+sudo systemctl start pwnpilot
+
+# Enable on boot
+sudo systemctl enable pwnpilot
+
+# Check status
+sudo systemctl status pwnpilot
+```
+
+### Option 3: Development Installation
+
+**For contributing to PwnPilot:**
+
+```bash
+git clone https://github.com/bharani-viswas/pwnpilot.git
+cd pwnpilot
+bash scripts/install.sh --dev --system-deps
+```
+
+Or using make:
+
+```bash
+make dev          # Install with dev dependencies
+make lint         # Run linters
+make test         # Run tests
+make format       # Format code
+```
+
+### Option 4: Using Make (Comprehensive Build System)
+
+**Available targets:**
+
+```bash
+make help              # Show all available targets
+make install-deps      # Install system dependencies (requires sudo)
+make quick-install     # Install from source (Python only)
+make install           # Full installation with system deps
+make dev               # Development installation with extras
+make test              # Run test suite
+make lint              # Run linters
+make format            # Auto-format code
+make build             # Build Python distribution
+make deb               # Build Debian package
+make release           # Create release tarball
+make clean             # Clean build artifacts
+```
+
+### Security Tools Installation
+
+To use all tool adapters (nmap, nuclei, ZAP, nikto, sqlmap, etc.), install the security toolkit:
+
+```bash
+# Only on first installation
+sudo bash scripts/install_security_tools.sh
+
+# Verify all tools
+bash scripts/verify_toolchain.sh
+```
+
+### Verify Installation
+
+```bash
+# Check if all components are installed correctly
+pwnpilot check
+
+# Show version
+pwnpilot version
+
+# Show help
+pwnpilot --help
 pwnpilot version
 ```
 
