@@ -65,7 +65,7 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _CONFIG_SEARCH_PATHS = [
-    Path(os.environ.get("PWNPILOT_CONFIG", "")),
+    Path(os.environ.get("PWNPILOT_CONFIG", "")) if os.environ.get("PWNPILOT_CONFIG") else None,
     Path("config.yaml"),
     Path.home() / ".pwnpilot" / "config.yaml",
 ]
@@ -75,7 +75,7 @@ def _load_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load YAML config from known locations.  Returns empty dict if not found."""
     candidates = ([config_path] if config_path else []) + _CONFIG_SEARCH_PATHS
     for path in candidates:
-        if path and path.exists():
+        if path and path.exists() and path.is_file():
             with path.open() as fh:
                 return yaml.safe_load(fh) or {}
     return {}

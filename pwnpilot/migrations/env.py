@@ -75,7 +75,9 @@ def _get_db_url() -> str:
     except Exception:
         pass
 
-    return "sqlite:///pwnpilot.db"
+    # Use absolute path for consistency with config.py
+    from pathlib import Path
+    return f"sqlite:///{Path.home() / '.pwnpilot' / 'pwnpilot.db'}"
 
 
 # ---------------------------------------------------------------------------

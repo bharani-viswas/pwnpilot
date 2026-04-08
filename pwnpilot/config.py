@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 
 class DatabaseConfig(BaseModel):
     url: str = Field(
-        default="sqlite:///pwnpilot.db",
+        default_factory=lambda: f"sqlite:///{Path.home() / '.pwnpilot' / 'pwnpilot.db'}",
         description="SQLAlchemy database URL",
     )
     pool_size: int = Field(default=5, ge=1, le=50)

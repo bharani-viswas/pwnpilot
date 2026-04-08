@@ -104,6 +104,7 @@ fi
 # Database setup
 echo ""
 echo "[*] Setting up database..."
+mkdir -p ~/.pwnpilot
 alembic upgrade head
 
 # Generate signing keys
