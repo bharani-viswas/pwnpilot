@@ -27,9 +27,12 @@ ENV/
 *.key
 *.pem
 *.p12
-config.yaml              # Contains LLM API keys, database credentials, and sensitive settings
-config.local.yaml        # Local config overrides with secrets
-~/.pwnpilot/             # Local user directory with keys, config, databases
+# Contains LLM API keys, database credentials, and sensitive settings
+config.yaml
+# Local config overrides with secrets
+config.local.yaml
+# Local user directory with keys, config, databases
+~/.pwnpilot/
 
 # pytest / coverage
 .pytest_cache/
