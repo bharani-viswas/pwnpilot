@@ -47,11 +47,13 @@ class PlannerNode:
         llm_router: Any,
         engagement_summary: dict[str, Any],
         audit_store: Any | None = None,
+        finding_store: Any | None = None,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
         self._no_novel_count: int = 0
         self._audit = audit_store
+        self._finding_store = finding_store
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -72,7 +74,7 @@ class PlannerNode:
         if prev_proposal:
             rejection_reason = prev_proposal.get("rejection_reason")
 
-        # Build LLM prompt context
+        # Build LLM prompt context with findings data (NEW: Rich context for LLM)
         context = {
             "engagement": self._engagement,
             "iteration": iteration,
@@ -80,6 +82,42 @@ class PlannerNode:
             "previous_actions": previous[-10:],  # last 10 for context window efficiency
             "rejection_reason": rejection_reason,
         }
+        
+        # Add findings context if available
+        if self._finding_store:
+            try:
+                engagement_id = self._engagement.get("engagement_id")
+                if engagement_id:
+                    from uuid import UUID
+                    try:
+                        eng_uuid = UUID(engagement_id)
+                    except (ValueError, TypeError):
+                        eng_uuid = None
+                    
+                    if eng_uuid:
+                        all_findings = self._finding_store.findings_for_engagement(eng_uuid)
+                        unverified_high = [
+                            {
+                                "finding_id": str(f.finding_id),
+                                "title": f.title,
+                                "asset_ref": f.asset_ref,
+                                "severity": f.severity.value if hasattr(f.severity, 'value') else str(f.severity),
+                                "confidence": f.confidence,
+                                "status": f.status.value if hasattr(f.status, 'value') else str(f.status),
+                            }
+                            for f in all_findings
+                            if (f.status.value if hasattr(f.status, 'value') else str(f.status)) == "new"
+                            and (f.severity.value if hasattr(f.severity, 'value') else str(f.severity)) in ["critical", "high"]
+                        ][:5]  # Top 5 unverified high-risk findings
+                        
+                        context["unverified_high_findings"] = unverified_high
+                        context["findings_count"] = {
+                            "total": len(all_findings),
+                            "unverified": len([f for f in all_findings if (f.status.value if hasattr(f.status, 'value') else str(f.status)) == "new"]),
+                            "verified": len([f for f in all_findings if (f.status.value if hasattr(f.status, 'value') else str(f.status)) == "confirmed"]),
+                        }
+            except Exception as e:
+                log.warning("planner.findings_context_error", exc=str(e))
 
         try:
             raw_proposal = self._llm.plan(context)

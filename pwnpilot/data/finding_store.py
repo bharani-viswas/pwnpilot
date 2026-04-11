@@ -225,3 +225,68 @@ class FindingStore:
             row.status = status.value
             row.updated_at = datetime.now(timezone.utc)
             self._session.commit()
+
+    def get_summary(self, engagement_id: UUID) -> dict:
+        """
+        Return findings aggregated by severity and status for planner context.
+        Provides rich context for LLM decision-making.
+        """
+        findings = self.findings_for_engagement(engagement_id)
+        
+        # Aggregate by severity
+        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        by_status = {"new": 0, "confirmed": 0, "remediated": 0, "false_positive": 0}
+        
+        for f in findings:
+            sev = f.severity.value if hasattr(f.severity, 'value') else str(f.severity)
+            if sev in by_severity:
+                by_severity[sev] += 1
+            
+            status = f.status.value if hasattr(f.status, 'value') else str(f.status)
+            if status in by_status:
+                by_status[status] += 1
+        
+        # Get top high-risk findings
+        high_risk = [f for f in findings if (f.severity.value if hasattr(f.severity, 'value') else str(f.severity)) in ["critical", "high"]]
+        top_findings = high_risk[:5]
+        
+        return {
+            "total_findings": len(findings),
+            "by_severity": by_severity,
+            "by_status": by_status,
+            "top_findings": [
+                {
+                    "finding_id": str(f.finding_id),
+                    "title": f.title,
+                    "asset_ref": f.asset_ref,
+                    "severity": f.severity.value if hasattr(f.severity, 'value') else str(f.severity),
+                    "confidence": f.confidence,
+                    "risk_score": _compute_risk_score(
+                        f.severity.value if hasattr(f.severity, 'value') else str(f.severity),
+                        f.confidence,
+                        f.exploitability.value if hasattr(f.exploitability, 'value') else str(f.exploitability),
+                        f.cvss_vector,
+                    ),
+                    "status": f.status.value if hasattr(f.status, 'value') else str(f.status),
+                    "tool_name": f.vuln_ref.split(":")[0] if ":" in f.vuln_ref else "unknown",
+                }
+                for f in top_findings
+            ],
+        }
+
+    def mark_false_positive(self, finding_id: UUID, confidence: float = 0.9) -> None:
+        """
+        Mark a finding as a false positive.
+        Reduces confidence and updates status to FALSE_POSITIVE.
+        """
+        row = (
+            self._session.query(FindingRow)
+            .filter(FindingRow.finding_id == str(finding_id))
+            .first()
+        )
+        if row:
+            row.status = FindingStatus.FALSE_POSITIVE.value
+            row.confidence = min(row.confidence, 1.0 - confidence)  # Reduce confidence
+            row.updated_at = datetime.now(timezone.utc)
+            self._session.commit()
+            log.info("finding.marked_false_positive", finding_id=str(finding_id))

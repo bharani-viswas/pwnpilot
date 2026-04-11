@@ -278,6 +278,7 @@ def create_and_run_engagement(
         llm_router=rt["llm_router"],
         engagement_summary=engagement_summary,
         audit_store=rt["audit_store"],
+        finding_store=rt["finding_store"],
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -289,6 +290,8 @@ def create_and_run_engagement(
         tool_runner=rt["tool_runner"],
         approval_service=rt["approval_service"],
         audit_store=rt["audit_store"],
+        finding_store=rt["finding_store"],
+        recon_store=rt["recon_store"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -406,6 +409,7 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         llm_router=rt["llm_router"],
         engagement_summary={"engagement_id": thread_id},
         audit_store=rt["audit_store"],
+        finding_store=rt["finding_store"],
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -417,6 +421,8 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         tool_runner=rt["tool_runner"],
         approval_service=rt["approval_service"],
         audit_store=rt["audit_store"],
+        finding_store=rt["finding_store"],
+        recon_store=rt["recon_store"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

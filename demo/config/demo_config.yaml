@@ -1,0 +1,38 @@
+# PwnPilot Demo Configuration
+# This config is for demo/testing purposes
+
+database:
+  url: sqlite:////tmp/pwnpilot_demo.db
+  pool_size: 5
+  max_overflow: 10
+
+llm:
+  local_url: http://localhost:11434
+  local_model: llama2
+  validator_model: mistral
+  cloud_provider: openai
+  cloud_model: gpt-4o-mini
+  cloud_allowed: false
+  max_retries: 2
+  timeout_seconds: 30
+
+policy:
+  active_scan_rate_limit: 5
+  recon_passive_soft_limit: 30
+  require_approval_for_exploit: true
+  require_approval_for_post_exploit: true
+
+checkpoint:
+  enabled: true
+  dir: /tmp/pwnpilot_checkpoints
+  serialize_protocol: json
+
+audit:
+  enabled: true
+  dir: /tmp/pwnpilot_audit
+  retention_days: 30
+
+approvals:
+  require_for_exploit: true
+  timeout_minutes: 15
+  storage_dir: /tmp/pwnpilot_approvals

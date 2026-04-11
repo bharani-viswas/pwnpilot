@@ -49,11 +49,15 @@ class ExecutorNode:
         tool_runner: Any,
         approval_service: ApprovalService,
         audit_store: Any,
+        finding_store: Any = None,
+        recon_store: Any = None,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
         self._approval = approval_service
         self._audit = audit_store
+        self._finding_store = finding_store
+        self._recon_store = recon_store
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -155,6 +159,72 @@ class ExecutorNode:
         streak = state.get("no_new_findings_streak", 0)
         streak = 0 if new_evidence > 0 else streak + 1
 
+        # Store findings and hosts from tool output (NEW: Feedback loop)
+        if self._finding_store and self._recon_store:
+            try:
+                # Extract and store findings
+                findings_list = result.parsed_output.get("findings", [])
+                for finding in findings_list:
+                    # Convert severity string to enum
+                    severity_str = finding.get("severity", "medium").lower()
+                    try:
+                        severity_enum = {
+                            "info": RiskLevel.LOW,
+                            "low": RiskLevel.LOW,
+                            "medium": RiskLevel.MEDIUM,
+                            "high": RiskLevel.HIGH,
+                            "critical": RiskLevel.CRITICAL,
+                        }.get(severity_str, RiskLevel.MEDIUM)
+                    except KeyError:
+                        severity_enum = RiskLevel.MEDIUM
+                    
+                    # Map RiskLevel to Severity enum
+                    from pwnpilot.data.models import Severity
+                    severity_map = {
+                        RiskLevel.LOW: Severity.LOW,
+                        RiskLevel.MEDIUM: Severity.MEDIUM,
+                        RiskLevel.HIGH: Severity.HIGH,
+                        RiskLevel.CRITICAL: Severity.CRITICAL,
+                    }
+                    severity = severity_map.get(severity_enum, Severity.MEDIUM)
+                    
+                    self._finding_store.upsert(
+                        engagement_id=engagement_id,
+                        asset_ref=finding.get("target", proposal.target),
+                        title=finding.get("description", ""),
+                        vuln_ref=f"{action.tool_name}:{finding.get('type', 'unknown')}",
+                        tool_name=action.tool_name,
+                        severity=severity,
+                        confidence=finding.get("confidence", 0.5),
+                        evidence_ids=[],
+                        remediation=finding.get("remediation", ""),
+                    )
+
+                # Extract and store hosts
+                hosts_list = result.parsed_output.get("hosts", [])
+                for host in hosts_list:
+                    host_id = self._recon_store.upsert_host(
+                        engagement_id=engagement_id,
+                        ip_address=host.get("ip_address", host.get("ip", "")),
+                        hostname=host.get("hostname"),
+                        os_guess=host.get("os"),
+                    )
+                    # Store services for this host
+                    for port_info in host.get("ports", []):
+                        port = port_info if isinstance(port_info, int) else port_info.get("port")
+                        service_name = port_info.get("service") if isinstance(port_info, dict) else None
+                        self._recon_store.upsert_service(
+                            host_id=host_id,
+                            engagement_id=engagement_id,
+                            port=port,
+                            service_name=service_name,
+                        )
+
+                log.info("executor.data_stored", findings_count=len(findings_list), hosts_count=len(hosts_list))
+            except Exception as store_exc:
+                log.warning("executor.store_error", exc=str(store_exc))
+                # Don't fail the action if storage fails, just log it
+
         # Record completed action
         previous = list(state.get("previous_actions", []))
         previous.append(
@@ -177,6 +247,17 @@ class ExecutorNode:
             },
         )
 
+        # Build recon summary for planner context (NEW: Feedback loop)
+        recon_summary = state.get("recon_summary", {})
+        if self._recon_store and self._finding_store:
+            try:
+                recon_summary = self._recon_store.get_summary(engagement_id)
+                findings_summary = self._finding_store.get_summary(engagement_id)
+                # Merge with recon summary
+                recon_summary["findings_summary"] = findings_summary
+            except Exception as summary_exc:
+                log.warning("executor.summary_error", exc=str(summary_exc))
+
         output = {
             **state,
             "last_result": result.model_dump(mode="json"),
@@ -185,6 +266,7 @@ class ExecutorNode:
             "proposed_action": None,
             "validation_result": None,
             "no_new_findings_streak": streak,
+            "recon_summary": recon_summary,
             "error": None,
         }
         # Emit AgentInvoked for executor

@@ -134,12 +134,45 @@ class LLMRouter:
         """
         Ask the LLM to produce a PlannerProposal dict given *context*.
         The response is parsed as JSON and returned as a dict.
+        Enhanced to leverage findings for intelligent prioritization.
         """
-        system = (
-            "You are a penetration testing planner.  Given the engagement context, "
-            "produce a single JSON object matching the PlannerProposal schema.  "
-            "Return ONLY the raw JSON object, no markdown, no explanation."
-        )
+        system = """You are an intelligent penetration testing orchestrator for automated security assessments.
+
+Your role: Analyze engagement state and decide the NEXT action that provides maximum value.
+
+Decision Logic (Priority Order):
+1. VERIFY HIGH-RISK FINDINGS: If unverified high/critical findings exist → attempt verification
+2. DEEPEN EXPLOITATION: If verified vulnerabilities exist → attempt exploitation or post-exploitation
+3. EXPAND DISCOVERY: If few findings → expand reconnaissance to new targets/ranges
+4. VALIDATE FINDINGS: Use different tools to confirm/eliminate findings
+
+Context Available:
+- discovered_hosts: List of IPs/domains with services detected
+- findings_count: Total findings, unverified, and verified counts
+- unverified_high_findings: Specific high/critical findings needing verification
+- previous_actions: Last 10 actions (avoid duplicates)
+
+Strategy Examples:
+- "Found CORS vulnerability" → "Test PUT/DELETE requests to verify exploitability"
+- "SSH service discovered" → "Attempt credential brute-force or key enumeration"
+- "Empty recon" → "Run initial network scan to discover services"
+- "HTTP methods testing failed" → "Try OPTIONS request or test specific deprecated methods"
+- "Found 5 vulnerabilities" → "Prioritize the highest severity ones first"
+
+DO NOT:
+- Repeat actions already in previous_actions (check the list)
+- Try the exact same tool twice on the same target
+- Ignore high-severity findings
+
+MUST return ONLY valid JSON matching PlannerProposal schema:
+{
+  "action_type": "recon_passive|active_scan|exploit|post_exploit",
+  "tool_name": "tool_name",
+  "target": "IP or domain or URL",
+  "params": {"key": "value", ...},
+  "rationale": "Why this action will advance the engagement",
+  "estimated_risk": "low|medium|high|critical"
+}"""
         user = json.dumps(context, default=str)
         raw = self.complete(system, user)
         return self._parse_json(raw, "PlannerProposal")
@@ -147,13 +180,29 @@ class LLMRouter:
     def validate(self, context: dict[str, Any]) -> dict[str, Any]:
         """
         Ask the LLM to produce a ValidationResult dict given *context*.
+        Enhanced to assess finding confidence and detect false positives.
         """
-        system = (
-            "You are a penetration testing risk validator.  Given the proposed action, "
-            "produce a single JSON object matching the ValidationResult schema "
-            "(verdict: approve|reject|escalate, risk_override: null|str, rationale: str).  "
-            "Return ONLY the raw JSON object."
-        )
+        system = """You are a penetration testing risk validator and findings analyst.
+
+Your tasks: 
+1. Assess the risk level of the proposed action
+2. If a finding is provided, assess its likelihood of being a real vulnerability vs false positive
+
+For findings assessment:
+- Real vulnerabilities: Typically reproducible, match known exploits, consistent across tools
+- False positives: Single tool detection, unrealistic scenarios, contradicting evidence
+
+For actions assessment:
+- Escalate risk if multiple high-severity findings or confirmed vulnerabilities exist
+- Never downgrade risk level from proposal
+- Reject if action violates policy or scope
+
+Return a JSON object matching ValidationResult schema:
+{
+  "verdict": "approve|reject",
+  "risk_override": "low|medium|high|critical" or null,
+  "rationale": "Why this decision"
+}"""
         user = json.dumps(context, default=str)
         raw = self.complete(system, user)
         return self._parse_json(raw, "ValidationResult")

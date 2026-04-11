@@ -226,3 +226,46 @@ class ReconStore:
             for svc in self.services_for_host(host["host_id"]):
                 result.append({**svc, "ip": host["ip_address"]})
         return result
+
+    def get_summary(self, engagement_id: UUID) -> dict:
+        """
+        Return reconnaissance data aggregated for planner context.
+        Provides network topology and service discovery summary for LLM decisions.
+        """
+        hosts = self.hosts_for_engagement(engagement_id)
+        
+        all_services = set()
+        all_ports = set()
+        high_risk_hosts = []
+        high_risk_services = {"ssh", "rdp", "smb", "http", "https", "telnet", "ftp", "mysql", "mssql", "postgres", "oracle"}
+        
+        discovered_hosts = []
+        for host in hosts:
+            services = self.services_for_host(host["host_id"])
+            host_services = [s["service_name"] or f"unknown:{s['port']}" for s in services]
+            host_ports = [s["port"] for s in services]
+            
+            all_services.update(host_services)
+            all_ports.update(host_ports)
+            
+            # Check for high-risk services
+            if any(svc.lower() in high_risk_services for svc in host_services):
+                high_risk_hosts.append(host["ip_address"])
+            
+            discovered_hosts.append({
+                "ip_address": host["ip_address"],
+                "hostname": host["hostname"],
+                "os_guess": host["os_guess"],
+                "ports": sorted(host_ports),
+                "services": host_services,
+                "status": host["status"],
+            })
+        
+        return {
+            "total_hosts": len(hosts),
+            "discovered_hosts": discovered_hosts,
+            "common_services": sorted(list(all_services))[:20],
+            "all_ports_found": sorted(list(all_ports)),
+            "port_count": len(all_ports),
+            "high_risk_hosts": high_risk_hosts,
+        }
