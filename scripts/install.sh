@@ -117,6 +117,18 @@ echo ""
 echo "[*] Verifying installation..."
 pwnpilot check 2>/dev/null || echo "Note: Some checks may fail if security tools aren't installed yet"
 
+# Copy example config if not present
+echo ""
+echo "[*] Setting up configuration..."
+if [ ! -f ~/.pwnpilot/config.yaml ]; then
+    cp examples/config.example.yaml ~/.pwnpilot/config.yaml
+    chmod 600 ~/.pwnpilot/config.yaml
+    echo "✓ Created config at ~/.pwnpilot/config.yaml"
+    echo "  Edit this file to add your LLM API keys"
+else
+    echo "✓ Config file already exists at ~/.pwnpilot/config.yaml"
+fi
+
 # Create activation helper script
 cat > .pwnpilot-activate.sh << 'EOF'
 #!/bin/bash

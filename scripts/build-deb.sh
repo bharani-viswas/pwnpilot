@@ -25,6 +25,7 @@ echo "Copying application files..."
 cp -r pwnpilot "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp -r scripts "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp -r schemas "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
+cp -r examples "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
 cp requirements.txt "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp pyproject.toml "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp README.md LICENSE "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/"
@@ -99,44 +100,14 @@ mkdir -p /var/log/pwnpilot
 # Fix permissions
 chown -R pwnpilot:pwnpilot /var/lib/pwnpilot /var/log/pwnpilot /etc/pwnpilot
 
-# Create default config
-if [ ! -f /etc/pwnpilot/config.yaml ]; then
-    cat > /etc/pwnpilot/config.yaml << 'CONFIG'
-# PwnPilot Configuration
-# See README for detailed configuration options
-
-llm:
-  provider: ollama
-  base_url: http://localhost:11434
-  planner_model: llama3
-  validator_model: mistral
-  executor_model: llama3
-  reporter_model: llama3
-
-database:
-  type: sqlite
-  sqlite_path: /var/lib/pwnpilot/pwnpilot.db
-
-tools:
-  nmap:
-    enabled: true
-  nuclei:
-    enabled: true
-  nikto:
-    enabled: true
-  sqlmap:
-    enabled: true
-  whatweb:
-    enabled: true
-  zap:
-    enabled: true
-    port: 8080
-
-policy:
-  deny_by_default: true
-  approval_required: true
-CONFIG
+# Copy configuration from example if present
+if [ -f "$INSTALL_PREFIX/examples/config.example.yaml" ] && [ ! -f /etc/pwnpilot/config.yaml ]; then
+    echo "Copying configuration template..."
+    cp "$INSTALL_PREFIX/examples/config.example.yaml" /etc/pwnpilot/config.yaml
     chown pwnpilot:pwnpilot /etc/pwnpilot/config.yaml
+    chmod 640 /etc/pwnpilot/config.yaml
+    echo "✓ Configuration copied to /etc/pwnpilot/config.yaml"
+    echo "  Edit this file to add your LLM API keys"
 fi
 
 # Initialize database
