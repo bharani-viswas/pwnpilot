@@ -5,13 +5,11 @@ pydantic>=2.7
 sqlalchemy>=2.0
 alembic>=1.13
 
-# Agent / LLM
+# Agent / LLM — unified multi-provider support
 langgraph>=0.2
 langchain-core>=0.2
 langchain-community>=0.2
-ollama>=0.2
-openai>=1.30
-anthropic>=0.25
+litellm>=1.32
 
 # Security / crypto
 cryptography>=42

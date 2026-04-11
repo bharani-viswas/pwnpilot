@@ -59,7 +59,7 @@ pwnpilot orchestrates a team of LLM-backed agents — Planner, Validator, Execut
 | **Crash recovery** | LangGraph checkpointing; resume any interrupted engagement with `pwnpilot resume` |
 | **10+ tool adapters** | nmap, nuclei, ZAP, nikto, sqlmap, whatweb, whois, dnsutils, searchsploit, CVE enrichment |
 | **Ed25519 report signing** | JSON report bundles signed with operator key; verifiable offline |
-| **Local-first LLM** | Ollama / vLLM by default; cloud (OpenAI, Anthropic) is policy-gated and prompt-redacted |
+| **Multi-provider LLM (via LiteLLM)** | Supports 100+ providers: OpenAI, Claude, Gemini, Ollama, vLLM, LocalAI, Mistral, and more. Local-first by default; cloud is policy-gated and prompt-redacted. |
 | **TUI dashboard** | Live Textual-based engagement dashboard |
 | **SQLite & PostgreSQL** | SQLite for labs; PostgreSQL with connection pooling for production |
 

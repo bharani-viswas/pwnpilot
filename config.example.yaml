@@ -1,0 +1,252 @@
+# PwnPilot Configuration Example
+# Save as: ~/.pwnpilot/config.yaml or /etc/pwnpilot/config.yaml
+#
+# All settings can be overridden with environment variables:
+# PWNPILOT_<SECTION>__<KEY>=value (use double underscore for nested keys)
+
+# =============================================================================
+# DATABASE CONFIGURATION
+# =============================================================================
+database:
+  # SQLAlchemy database URL
+  # Examples:
+  #   sqlite:///pwnpilot.db                  (local file)
+  #   postgresql://user:pass@localhost/pwnpilot  (PostgreSQL)
+  #   mysql+pymysql://user:pass@localhost/pwnpilot (MySQL)
+  url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"
+  
+  # Connection pool settings
+  pool_size: 5        # Active connections to maintain
+  max_overflow: 10    # Additional connections if pool exhausted
+
+# =============================================================================
+# LLM CONFIGURATION - UNIFIED MULTI-PROVIDER SUPPORT (via LiteLLM)
+# =============================================================================
+llm:
+  # ═══════════════════════════════════════════════════════════════════════
+  # PRIMARY MODEL CONFIGURATION
+  # ═══════════════════════════════════════════════════════════════════════
+  
+  # Model identifier (determines provider)
+  # Examples:
+  #   "gpt-4"                           → OpenAI GPT-4
+  #   "gpt-3.5-turbo"                  → OpenAI GPT-3.5
+  #   "claude-3-sonnet-20240229"       → Anthropic Claude 3
+  #   "claude-3-opus-20240229"         → Anthropic Claude 3 Opus
+  #   "gemini-pro"                     → Google Gemini
+  #   "mistral/mistral-large-latest"   → Mistral AI
+  #   "ollama/llama3"                  → Local Ollama (Llama 3)
+  #   "ollama/mistral"                 → Local Ollama (Mistral)
+  #   "ollama/neural-chat"             → Local Ollama (Neural Chat)
+  model_name: "ollama/llama3"
+  
+  # API key for the primary provider
+  # Can be left empty for local models (Ollama, vLLM on localhost)
+  # Environment variable override: PWNPILOT_LLM__API_KEY
+  api_key: ""
+  
+  # Custom API base URL (optional)
+  # Used for: self-hosted Ollama, vLLM, LocalAI, or custom OpenAI-compatible endpoints
+  # Examples:
+  #   "http://localhost:11434"         → Ollama on localhost
+  #   "http://localhost:8000/v1"       → vLLM on localhost
+  #   "http://internal-gpu-01:8000/v1" → Internal vLLM cluster
+  #   "http://localhost:8080/v1"       → LocalAI
+  #   (leave empty for official APIs)
+  api_base_url: ""
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # FALLBACK MODEL CONFIGURATION
+  # ═══════════════════════════════════════════════════════════════════════
+  
+  # Fallback model if primary fails and cloud_allowed=true
+  # Recommended: Use a cloud provider for redundancy
+  # Examples:
+  #   "gpt-4o-mini"                    → OpenAI (cost-effective)
+  #   "claude-3-haiku-20240307"        → Anthropic (fast, cheap)
+  #   "gemini-1.5-pro"                 → Google Gemini
+  fallback_model_name: "gpt-4o-mini"
+  
+  # API key for fallback model
+  # Environment variable override: PWNPILOT_LLM__FALLBACK_API_KEY
+  fallback_api_key: ""
+  
+  # Custom base URL for fallback model (optional)
+  fallback_api_base_url: ""
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # POLICY & CONTROL
+  # ═══════════════════════════════════════════════════════════════════════
+  
+  # Allow cloud fallback when primary model fails?
+  # ⚠️ Important: Cost control gate!
+  #   true  → Can fall back to cloud provider (may incur costs)
+  #   false → Halt assessment if primary fails (zero cloud costs)
+  cloud_allowed: false
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # PERFORMANCE & RESILIENCE
+  # ═══════════════════════════════════════════════════════════════════════
+  
+  # Maximum retry attempts per model
+  # Circuit breaker opens after this many consecutive failures
+  max_retries: 3
+  
+  # Request timeout in seconds
+  # Increase for slow models/networks, decrease for fast failover
+  timeout_seconds: 30
+
+# =============================================================================
+# POLICY CONFIGURATION
+# =============================================================================
+policy:
+  # Maximum active_scan actions per minute (rate limiting)
+  # Controls aggressiveness of active reconnaissance
+  active_scan_rate_limit: 10
+  
+  # Soft rate limit for passive reconnaissance (logs warning only)
+  recon_passive_soft_limit: 60
+  
+  # Require operator approval for exploitation?
+  require_approval_for_exploit: true
+  
+  # Require operator approval for post-exploitation?
+  require_approval_for_post_exploit: true
+
+# =============================================================================
+# AGENT CONFIGURATION
+# =============================================================================
+agent:
+  # Maximum iterations (planning cycles) per engagement
+  # Lower = faster termination, higher = deeper assessment
+  max_iterations: 50
+  
+  # Convergence threshold: consecutive cycles with no new findings
+  # When reached, assessment auto-terminates (enables cost control)
+  convergence_threshold: 3
+
+# =============================================================================
+# STORAGE CONFIGURATION
+# =============================================================================
+storage:
+  # Root directory for raw evidence files (tool outputs, screenshots, etc.)
+  evidence_dir: "~/.pwnpilot/evidence"
+  
+  # Output directory for generated reports
+  report_dir: "reports"
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # Use DEBUG for troubleshooting, INFO for production
+  level: "INFO"
+  
+  # Log file path (empty = stdout only)
+  # Examples:
+  #   "/var/log/pwnpilot/pwnpilot.log"
+  #   "/home/operator/.pwnpilot/logs/assessment.log"
+  #   "" (leave empty for stdout only)
+  file: ""
+  
+  # Log rotation interval (days)
+  # Old logs deleted after this many days
+  rotation_days: 30
+
+# =============================================================================
+# ENGAGEMENT DEFAULTS
+# =============================================================================
+engagement:
+  # Valid engagement duration (hours)
+  # Engagements auto-archive after this duration
+  valid_hours: 24
+  
+  # Default operator identifier
+  operator_id: "operator"
+
+# =============================================================================
+# CONFIGURATION EXAMPLES BY USE CASE
+# =============================================================================
+
+# --- Example 1: Development (Privacy-First, Local) ---
+# Save as: ~/.pwnpilot/config.yaml
+# Requires: Ollama running on localhost:11434
+#
+# llm:
+#   model_name: "ollama/llama3"
+#   api_key: ""
+#   api_base_url: "http://localhost:11434"
+#   fallback_model_name: "gpt-4o-mini"
+#   fallback_api_key: ""  # Set via env var if needed
+#   cloud_allowed: false  # No cloud fallback in dev
+#   timeout_seconds: 60
+#   max_retries: 3
+
+
+# --- Example 2: Production (Resilient Hybrid) ---
+# Primary: Internal vLLM cluster
+# Fallback: OpenAI API (business hours only)
+#
+# llm:
+#   model_name: "mistral"
+#   api_key: ""
+#   api_base_url: "http://internal-gpu-cluster:8000/v1"
+#   fallback_model_name: "gpt-4o-mini"
+#   fallback_api_key: "${OPENAI_API_KEY}"  # Set via env var
+#   cloud_allowed: true
+#   timeout_seconds: 120
+#   max_retries: 5
+
+
+# --- Example 3: Cloud-Only (Maximum Intelligence) ---
+# Uses OpenAI GPT-4 with Claude 3 fallback
+#
+# llm:
+#   model_name: "gpt-4"
+#   api_key: "${OPENAI_API_KEY}"
+#   api_base_url: ""
+#   fallback_model_name: "claude-3-sonnet-20240229"
+#   fallback_api_key: "${ANTHROPIC_API_KEY}"
+#   cloud_allowed: true
+#   timeout_seconds: 60
+#   max_retries: 3
+
+
+# --- Example 4: Cost-Optimized (Local First, Cloud Fallback) ---
+# Primary: Fast Mistral locally
+# Fallback: Cheaper GPT-3.5 if primary fails
+#
+# llm:
+#   model_name: "ollama/mistral"
+#   api_key: ""
+#   api_base_url: "http://localhost:11434"
+#   fallback_model_name: "gpt-3.5-turbo"
+#   fallback_api_key: "${OPENAI_API_KEY}"
+#   cloud_allowed: true
+#   timeout_seconds: 30
+#   max_retries: 3
+
+# =============================================================================
+# ENVIRONMENT VARIABLE OVERRIDES
+# =============================================================================
+#
+# All config values can be overridden via environment variables:
+#
+# Format: PWNPILOT_<SECTION>__<KEY>=value
+#
+# Examples:
+#   PWNPILOT_LLM__MODEL_NAME=gpt-4
+#   PWNPILOT_LLM__API_KEY=sk-...
+#   PWNPILOT_LLM__CLOUD_ALLOWED=true
+#   PWNPILOT_LOGGING__LEVEL=DEBUG
+#   PWNPILOT_POLICY__ACTIVE_SCAN_RATE_LIMIT=20
+#
+# Environment variables take precedence over config.yaml!
+# This is useful for:
+#   - Running in Docker/K8s (use secrets as env vars)
+#   - CI/CD pipelines (set via GitHub Actions secrets)
+#   - Deployment automation (pass via Ansible/Terraform)
+#   - Local testing (override temporarily without editing yaml)
+
+# =============================================================================

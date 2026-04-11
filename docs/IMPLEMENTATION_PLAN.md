@@ -98,8 +98,9 @@ The system is a single-machine, **multi-agent**, human-in-the-loop for high-risk
   - Local-first inference (Ollama/vLLM); retry up to 3× with exponential backoff (base 1s, max 8s)
   - Circuit breaker: CLOSED → OPEN (after 3 consecutive local failures) → HALF_OPEN (after 60s cooldown) → CLOSED
   - Policy-gated cloud fallback; raises `PolicyDeniedError` if cloud policy is denied
+  - **Multi-Provider Support via LiteLLM**: Supports 100+ providers (OpenAI, Claude, Gemini, Ollama, vLLM, LocalAI, Mistral, and more). Configuration: `model_name`, `api_key`, `api_base_url`. LiteLLM auto-detects provider.
   - Redactor scrubs all prompts before cloud dispatch; routing decision logged to audit store
-  - Per-agent model config (e.g., planner: llama3; validator: mistral)
+  - Per-agent model config (e.g., planner: ollama/llama3; validator: ollama/mistral; fallback: gpt-4o-mini)
 - Approval Service
   - Queue of pending high-risk actions with approve / deny / defer / annotate + reason
   - Tickets persisted to DB atomically on creation (survive process crash); PENDING state reloaded on startup
@@ -290,14 +291,16 @@ Deliverables:
 - LangGraph `StateGraph` with Planner, Validator, Executor, Reporter nodes and conditional edges
 - `AgentState` TypedDict; `SqliteCheckpointer` for crash recovery and `pwnpilot resume` support
 - `ActionEnvelope` structured output parser; all free-form LLM output rejected before ActionRequest construction
-- Local-first LLM Router (Ollama/vLLM) with retry, exponential backoff, and circuit breaker
+- **Multi-Provider LLM Router (via LiteLLM)** supporting 100+ providers: Ollama, vLLM, LocalAI, OpenAI, Claude, Gemini, and more
+- Local-first inference with automatic retry, exponential backoff, and circuit breaker
 - Policy-gated cloud fallback with redaction middleware
 Tasks:
 1. Define `AgentState` TypedDict; compile LangGraph `StateGraph` with four agent nodes.
 2. Implement conditional edge routing: Validator verdict → Executor / Planner / halt; Executor result → Planner / Reporter / halt.
 3. Add `max_iterations` cap, novelty check, and repeated-state circuit breaker in Planner node.
 4. Implement `ActionEnvelope` parser; enforce typed `ActionRequest` construction (AfterValidator on params).
-5. Build local model invocation path (Ollama/vLLM) with 3× retry and exponential backoff.
+5. Build unified LLM Router with LiteLLM supporting local inference (Ollama/vLLM) and cloud providers with 3× retry and exponential backoff.
+6. Implement circuit breaker: CLOSED → OPEN (after 3 consecutive failures) → HALF_OPEN → CLOSED (60s cooldown).
 6. Build cloud fallback path with redaction middleware and policy gate.
 7. Configure `SqliteCheckpointer`; validate crash-recovery via `pwnpilot resume <engagement_id>`.
 Exit Criteria:

@@ -1,33 +1,39 @@
 """
-LLM Router — local-first inference with redaction, retry, circuit breaker, and
-policy-gated cloud fallback.
+LLM Router — unified multi-provider inference with redaction, retry, circuit breaker,
+and policy-gated fallback.
 
 Routing logic (ADR-004):
-1. Attempt local model (Ollama/vLLM endpoint) up to 3 times with exponential backoff.
+1. Attempt primary model (via LiteLLM) up to 3 times with exponential backoff.
 2. After 3 consecutive failures, open circuit breaker for 60s.
 3. If circuit is open: evaluate cloud fallback policy gate.
-4. If cloud denied: raise PolicyDeniedError; orchestrator halts.
+4. If fallback denied: raise PolicyDeniedError; orchestrator halts.
 5. Before cloud dispatch: run redactor.scrub() on the prompt.
 6. Log all routing decisions to audit store.
+
+LiteLLM unified API supports: OpenAI, Claude, Gemini, Ollama, vLLM, LocalAI, 
+Mistral, Cohere, LLaMA2, and 100+ other providers with zero code changes.
+Just configure: model_name, api_key, api_base_url
 
 Circuit breaker states: CLOSED → OPEN → HALF_OPEN → CLOSED
 """
 from __future__ import annotations
 
 import json
+import os
 import time
 from enum import Enum
 from typing import Any
 
-import httpx
+import litellm
 import structlog
 
 from pwnpilot.secrets.redactor import Redactor
 
 log = structlog.get_logger(__name__)
 
-_LOCAL_TIMEOUT: float = 120.0
-_CLOUD_TIMEOUT: float = 60.0
+# Timeouts and retry config
+_PRIMARY_TIMEOUT: float = 120.0
+_FALLBACK_TIMEOUT: float = 60.0
 _MAX_RETRIES: int = 3
 _BACKOFF_BASE: float = 1.0
 _BACKOFF_MAX: float = 8.0
@@ -41,7 +47,7 @@ class CircuitState(Enum):
 
 
 class PolicyDeniedError(Exception):
-    """Raised when cloud fallback is blocked by policy."""
+    """Raised when fallback is blocked by policy."""
 
 
 class LLMRouterError(Exception):
@@ -50,40 +56,60 @@ class LLMRouterError(Exception):
 
 class LLMRouter:
     """
-    Routes LLM inference requests: local first, cloud fallback if policy permits.
+    Routes LLM inference requests across any provider via LiteLLM.
+    
+    Supports: OpenAI, Claude, Gemini, Ollama, vLLM, LocalAI, and 100+ providers.
+    Just configure model_name, api_key, and optional api_base_url.
 
     Args:
-        local_base_url:       Base URL for Ollama/vLLM (e.g. http://localhost:11434).
-        local_model:          Model name for local inference.
-        cloud_client:         Optional pre-configured cloud client (openai.OpenAI etc.).
-        cloud_model:          Cloud model name.
-        cloud_allowed_fn:     Callable() -> bool: returns True if cloud is policy-allowed.
-        redactor:             Redactor instance for prompt scrubbing.
-        audit_fn:             Optional audit logging callback(event_type, payload).
+        model_name:           Primary model identifier (e.g. "gpt-4", "claude-3-sonnet-20240229", "ollama/llama2")
+        api_key:              API key for primary model (can be empty for local models)
+        api_base_url:         Optional custom API endpoint (e.g. "http://localhost:8000/v1")
+        fallback_model_name:  Fallback model if primary exhausted and policy allows
+        fallback_api_key:     API key for fallback model
+        fallback_api_base_url: Custom base URL for fallback model
+        cloud_allowed_fn:     Callable() -> bool: returns True if fallback is policy-allowed
+        redactor:             Redactor instance for prompt scrubbing before cloud dispatch
+        audit_fn:             Optional audit logging callback(event_type, payload)
+        timeout_seconds:      Request timeout in seconds
+        max_retries:          Max retry attempts per model
     """
 
     def __init__(
         self,
-        local_base_url: str = "http://localhost:11434",
-        local_model: str = "llama3",
-        cloud_client: Any = None,
-        cloud_model: str = "gpt-4o",
+        model_name: str = "ollama/llama3",
+        api_key: str = "",
+        api_base_url: str = "",
+        fallback_model_name: str = "gpt-4o-mini",
+        fallback_api_key: str = "",
+        fallback_api_base_url: str = "",
         cloud_allowed_fn: Any = None,
         redactor: Redactor | None = None,
         audit_fn: Any = None,
+        timeout_seconds: int = 30,
+        max_retries: int = 3,
     ) -> None:
-        self._local_url = local_base_url.rstrip("/")
-        self._local_model = local_model
-        self._cloud_client = cloud_client
-        self._cloud_model = cloud_model
+        self._model_name = model_name
+        self._api_key = api_key or os.environ.get("LITELLM_API_KEY", "")
+        self._api_base_url = api_base_url
+        
+        self._fallback_model_name = fallback_model_name
+        self._fallback_api_key = fallback_api_key or os.environ.get("LITELLM_FALLBACK_API_KEY", "")
+        self._fallback_api_base_url = fallback_api_base_url
+        
         self._cloud_allowed = cloud_allowed_fn or (lambda: False)
         self._redactor = redactor or Redactor()
         self._audit = audit_fn
+        self._timeout = timeout_seconds
+        self._max_retries = max_retries
 
         # Circuit breaker state
         self._circuit_state = CircuitState.CLOSED
         self._circuit_open_at: float = 0.0
         self._consecutive_failures: int = 0
+        
+        # Suppress litellm debug output
+        litellm.suppress_debug_info = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,44 +117,56 @@ class LLMRouter:
 
     def complete(self, system_prompt: str, user_prompt: str) -> str:
         """
-        Send a completion request.  Returns the model response string.
-        Tries local first; falls back to cloud if policy permits.
+        Send a completion request. Returns the model response string.
+        Tries primary model first; falls back to fallback model if policy permits.
         """
-        routing = "local"
+        routing = "primary"
         self._check_circuit()
 
         if self._circuit_state != CircuitState.OPEN:
             try:
-                response = self._local_complete_with_retry(system_prompt, user_prompt)
-                self._on_local_success()
+                response = self._complete_with_retry(
+                    self._model_name,
+                    self._api_key,
+                    self._api_base_url,
+                    system_prompt,
+                    user_prompt,
+                )
+                self._on_success()
                 if self._audit:
-                    self._audit("LLMRouted", {"routing": "local", "model": self._local_model})
+                    self._audit("LLMRouted", {"routing": routing, "model": self._model_name})
                 return response
             except Exception as exc:
-                self._on_local_failure()
-                log.warning("llm_router.local_failed", exc=str(exc))
+                self._on_failure()
+                log.warning("llm_router.primary_failed", exc=str(exc), model=self._model_name)
 
-        # Cloud fallback
-        routing = "cloud"
+        # Fallback routing
+        routing = "fallback"
         if not self._cloud_allowed():
             raise PolicyDeniedError(
-                "Cloud LLM fallback is not permitted by current policy."
+                "Fallback LLM routing is not permitted by current policy."
             )
 
-        if self._cloud_client is None:
-            raise LLMRouterError("No cloud client configured and local model is unavailable.")
+        if not self._fallback_model_name:
+            raise LLMRouterError("No fallback model configured and primary model is unavailable.")
 
-        # Redact prompt before cloud dispatch
+        # Redact prompt before fallback dispatch
         safe_system = self._redactor.scrub(system_prompt)
         safe_user = self._redactor.scrub(user_prompt)
 
         try:
-            response = self._cloud_complete(safe_system, safe_user)
+            response = self._complete_with_retry(
+                self._fallback_model_name,
+                self._fallback_api_key,
+                self._fallback_api_base_url,
+                safe_system,
+                safe_user,
+            )
             if self._audit:
-                self._audit("LLMRouted", {"routing": "cloud", "model": self._cloud_model})
+                self._audit("LLMRouted", {"routing": routing, "model": self._fallback_model_name})
             return response
         except Exception as exc:
-            raise LLMRouterError(f"Cloud LLM also failed: {exc}") from exc
+            raise LLMRouterError(f"Fallback model also failed: {exc}") from exc
 
     def plan(self, context: dict[str, Any]) -> dict[str, Any]:
         """
@@ -184,7 +222,7 @@ MUST return ONLY valid JSON matching PlannerProposal schema:
         """
         system = """You are a penetration testing risk validator and findings analyst.
 
-Your tasks: 
+Your tasks:
 1. Assess the risk level of the proposed action
 2. If a finding is provided, assess its likelihood of being a real vulnerability vs false positive
 
@@ -211,72 +249,85 @@ Return a JSON object matching ValidationResult schema:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _local_complete_with_retry(self, system: str, user: str) -> str:
+    def _complete_with_retry(
+        self,
+        model_name: str,
+        api_key: str,
+        api_base_url: str,
+        system: str,
+        user: str,
+    ) -> str:
+        """Call the model with exponential backoff retry logic."""
         last_exc: Exception | None = None
-        for attempt in range(_MAX_RETRIES):
+        for attempt in range(self._max_retries):
             try:
-                return self._ollama_complete(system, user)
+                return self._litellm_complete(model_name, api_key, api_base_url, system, user)
             except Exception as exc:
                 last_exc = exc
                 wait = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
                 log.debug(
-                    "llm_router.local_retry",
+                    "llm_router.retry",
+                    model=model_name,
                     attempt=attempt + 1,
                     wait=wait,
                     exc=str(exc),
                 )
                 time.sleep(wait)
-        raise last_exc or RuntimeError("Local LLM failed after retries.")
+        raise last_exc or RuntimeError(f"Model {model_name} failed after {self._max_retries} retries.")
 
-    def _ollama_complete(self, system: str, user: str) -> str:
-        """Call the Ollama /api/chat endpoint."""
-        payload = {
-            "model": self._local_model,
+    def _litellm_complete(
+        self,
+        model_name: str,
+        api_key: str,
+        api_base_url: str,
+        system: str,
+        user: str,
+    ) -> str:
+        """Call LiteLLM's completion endpoint with unified provider support."""
+        # Set up environment for this request
+        if api_key:
+            os.environ["LITELLM_API_KEY"] = api_key
+        
+        kwargs = {
+            "model": model_name,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "stream": False,
+            "timeout": self._timeout,
+            "max_retries": 1,  # We handle retries ourselves
         }
-        resp = httpx.post(
-            f"{self._local_url}/api/chat",
-            json=payload,
-            timeout=_LOCAL_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json()["message"]["content"]
-
-    def _cloud_complete(self, system: str, user: str) -> str:
-        """Call the configured cloud client (OpenAI-compatible)."""
-        resp = self._cloud_client.chat.completions.create(
-            model=self._cloud_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            timeout=_CLOUD_TIMEOUT,
-        )
-        return resp.choices[0].message.content or ""
+        
+        # Add custom base URL if provided (for Ollama, vLLM, LocalAI, etc.)
+        if api_base_url:
+            kwargs["api_base"] = api_base_url
+        
+        response = litellm.completion(**kwargs)
+        return response.choices[0].message.content or ""
 
     def _check_circuit(self) -> None:
+        """Check circuit breaker state and transition if needed."""
         now = time.monotonic()
         if self._circuit_state == CircuitState.OPEN:
             if now - self._circuit_open_at >= _CIRCUIT_OPEN_DURATION:
                 log.info("llm_router.circuit_half_open")
                 self._circuit_state = CircuitState.HALF_OPEN
 
-    def _on_local_success(self) -> None:
+    def _on_success(self) -> None:
+        """Handle successful model call."""
         self._consecutive_failures = 0
         if self._circuit_state != CircuitState.CLOSED:
             log.info("llm_router.circuit_closed")
             self._circuit_state = CircuitState.CLOSED
 
-    def _on_local_failure(self) -> None:
+    def _on_failure(self) -> None:
+        """Handle failed model call and update circuit state."""
         self._consecutive_failures += 1
-        if self._consecutive_failures >= _MAX_RETRIES:
+        if self._consecutive_failures >= self._max_retries:
             log.warning(
                 "llm_router.circuit_open",
                 failures=self._consecutive_failures,
+                model=self._model_name,
             )
             self._circuit_state = CircuitState.OPEN
             self._circuit_open_at = time.monotonic()

@@ -183,12 +183,19 @@ def _build_runtime(
         kill_switch=kill_switch,
     )
 
-    # LLM router
+    # LLM router — unified multi-provider support via LiteLLM
     redactor = Redactor()
     llm_router = LLMRouter(
-        local_base_url=typed_cfg.llm.local_url,
-        local_model=typed_cfg.llm.local_model,
+        model_name=typed_cfg.llm.model_name,
+        api_key=typed_cfg.llm.api_key,
+        api_base_url=typed_cfg.llm.api_base_url,
+        fallback_model_name=typed_cfg.llm.fallback_model_name,
+        fallback_api_key=typed_cfg.llm.fallback_api_key,
+        fallback_api_base_url=typed_cfg.llm.fallback_api_base_url,
+        cloud_allowed_fn=lambda: typed_cfg.llm.cloud_allowed,
         redactor=redactor,
+        timeout_seconds=typed_cfg.llm.timeout_seconds,
+        max_retries=typed_cfg.llm.max_retries,
     )
 
     # Approval service — wired to DB for crash durability

@@ -352,9 +352,13 @@ sudo apt install ./dist/pwnpilot_*.deb
 
 ### LLM Connection Issues
 
-**Error**: `Connection to Ollama failed`
+**Error**: `Connection to Ollama failed` or other LLM provider errors
 
 **Solution:**
+
+PwnPilot supports 100+ LLM providers via LiteLLM. First, identify which provider you're using:
+
+**For Local Ollama:**
 1. Verify Ollama is running:
    ```bash
    ollama serve
@@ -366,13 +370,53 @@ sudo apt install ./dist/pwnpilot_*.deb
    curl http://localhost:11434/api/tags
    ```
 
-3. If not working, configure alt LLM:
+3. Ensure config is correct:
    ```yaml
-   # Edit /etc/pwnpilot/config.yaml
+   # ~/.pwnpilot/config.yaml or /etc/pwnpilot/config.yaml
    llm:
-     provider: openai  # or anthropic
-     api_key: sk-...
+     model_name: "ollama/llama3"
+     api_key: ""
+     api_base_url: "http://localhost:11434"
    ```
+
+**For Cloud Providers (OpenAI, Claude, Anthropic, etc.):**
+
+1. Set API key:
+   ```bash
+   # Option A: Environment variable
+   export PWNPILOT_LLM__API_KEY="sk-..."
+   
+   # Option B: Config file
+   # ~/.pwnpilot/config.yaml
+   llm:
+     model_name: "gpt-4"
+     api_key: "sk-..."
+   ```
+
+2. Verify connectivity:
+   ```bash
+   python3 -c "import litellm; litellm.completion(model='gpt-4', messages=[{'role': 'user', 'content': 'test'}])"
+   ```
+
+**For Self-Hosted vLLM/LocalAI:**
+
+```yaml
+llm:
+  model_name: "mistral"          # Model running in vLLM
+  api_key: ""                    # Usually not needed
+  api_base_url: "http://localhost:8000/v1"  # Your vLLM endpoint
+```
+
+**See the comprehensive config example:**
+```bash
+cat examples/config.example.yaml
+```
+
+For debugging, enable debug logging:
+```bash
+export PWNPILOT_LOGGING__LEVEL=DEBUG
+pwnpilot start --engagement target.com
+```
 
 ## Post-Installation
 
@@ -429,7 +473,10 @@ sudo apt-get install nmap nikto sqlmap whatweb nuclei zaproxy
 
 ### Configure LLM
 
-**Local (Recommended):**
+PwnPilot supports 100+ LLM providers via **LiteLLM**: OpenAI, Claude, Gemini, Ollama, vLLM, LocalAI, Mistral, and more.
+
+**Option 1: Local Ollama (Recommended for Development)**
+
 ```bash
 # Install and run Ollama
 curl https://ollama.ai/install.sh | sh
@@ -437,12 +484,40 @@ ollama pull llama3
 ollama serve
 ```
 
-**Cloud (OpenAI):**
+Then configure:
 ```yaml
-# /etc/pwnpilot/config.yaml
+# ~/.pwnpilot/config.yaml
 llm:
-  provider: openai
-  api_key: sk-...
+  model_name: "ollama/llama3"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
+```
+
+**Option 2: Cloud Provider (OpenAI)**
+
+```yaml
+# ~/.pwnpilot/config.yaml
+llm:
+  model_name: "gpt-4"
+  api_key: "sk-..."
+  api_base_url: ""
+```
+
+**Option 3: Use Configuration Example**
+
+Copy and customize the comprehensive example:
+```bash
+cp examples/config.example.yaml ~/.pwnpilot/config.yaml
+# Edit as needed
+```
+
+**Environment Variable Override:**
+
+All config can be overridden via environment variables:
+```bash
+export PWNPILOT_LLM__MODEL_NAME=gpt-4
+export PWNPILOT_LLM__API_KEY=sk-...
+export PWNPILOT_LLM__CLOUD_ALLOWED=true
 ```
 
 ### Test Installation
@@ -469,8 +544,9 @@ pwnpilot --version
 
 After successful installation:
 
-1. **Configure LLM**: Set up local (Ollama) or cloud LLM
-2. **Configure Policy**: Edit `/etc/pwnpilot/config.yaml` (package install)
-3. **Install Tools**: Run `sudo bash scripts/install_security_tools.sh`
+1. **Configure LLM**: Choose your provider (Ollama for local privacy, or cloud: OpenAI/Claude/Gemini)
+   - See "Configure LLM" section above or `examples/config.example.yaml` for detailed options
+2. **Configure Policy**: Edit `/etc/pwnpilot/config.yaml` (package install) or `~/.pwnpilot/config.yaml` (source install)
+3. **Install Tools**: Run `sudo bash scripts/install_security_tools.sh` for tool adapters
 4. **Test Setup**: Run `pwnpilot check`
 5. **Start First Test**: `pwnpilot start --target <target>`

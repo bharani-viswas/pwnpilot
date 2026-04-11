@@ -21,14 +21,15 @@ ENV/
 .env
 
 # Environment / secrets
+# ⚠️ CRITICAL: Never commit files containing API keys, credentials, or secrets!
 .env.local
 .env.*.local
 *.key
 *.pem
 *.p12
-config.yaml
-config.local.yaml
-~/.pwnpilot/
+config.yaml              # Contains LLM API keys, database credentials, and sensitive settings
+config.local.yaml        # Local config overrides with secrets
+~/.pwnpilot/             # Local user directory with keys, config, databases
 
 # pytest / coverage
 .pytest_cache/

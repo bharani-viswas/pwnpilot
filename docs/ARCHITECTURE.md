@@ -425,22 +425,51 @@ LangGraph persists a full snapshot of this dict to the checkpoint store at the e
 
 ### 5.5 LLM Router (`control/llm_router.py`)
 
-**Responsibility:** Route inference requests to the appropriate model with redaction.
+**Responsibility:** Route inference requests to the appropriate model with redaction and fallback.
+
+**Multi-Provider Support:** The LLM Router uses **LiteLLM** to support 100+ LLM providers:
+- **Cloud**: OpenAI (GPT-4, GPT-3.5), Anthropic (Claude 3), Google (Gemini), Mistral AI, Cohere, Replicate
+- **Self-Hosted**: Ollama, vLLM, LocalAI, HuggingFace TGI
+- **Private**: Any OpenAI-compatible API endpoint
+
+Configuration is unified: just specify `model_name`, `api_key`, and optional `api_base_url`. LiteLLM auto-detects the provider.
 
 **Routing logic:**
-1. Always attempt local model first (Ollama/vLLM endpoint).
-2. Retry local up to 3 times with exponential backoff (base 1s, max 8s) on transient errors.
-3. After 3 consecutive local failures, open the local circuit breaker for 60s; all subsequent requests skip to step 4 until the breaker resets.
-4. If local is circuit-open or confidence threshold not met, evaluate cloud fallback policy gate.
-5. If cloud fallback is denied by policy, raise `PolicyDeniedError`; the orchestrator records this as a loop error and halts.
+1. Always attempt primary model first (local by default, cloud optional).
+2. Retry primary up to 3 times (configurable) with exponential backoff (base 1s, max 8s) on transient errors.
+3. After 3 consecutive failures, open the circuit breaker for 60s; all subsequent requests skip to step 4 until reset.
+4. If primary is circuit-open and policy allows: evaluate fallback model option (e.g., cheaper cloud provider).
+5. If fallback is denied by policy, raise `PolicyDeniedError`; the orchestrator records this as a loop error and halts.
 6. Before sending to cloud: run `redactor.scrub(prompt)` to remove scope targets, credentials, and PII.
-7. Log routing decision (local vs cloud, circuit state) to audit store.
+7. Log routing decision (primary vs fallback, circuit state, provider) to audit store.
 
-**Circuit breaker states:** `CLOSED` (normal) → `OPEN` (failing; skip local) → `HALF_OPEN` (probe after cooldown) → `CLOSED`.
+**Circuit breaker states:** `CLOSED` (normal) → `OPEN` (failing; skip primary) → `HALF_OPEN` (probe after cooldown) → `CLOSED`.
 
 **Outputs:** Structured action envelope (not free-form text). The envelope parser validates before use.
 
-**Timeout:** Local model call timeout: 120s. Cloud model call timeout: 60s. Both are configurable.
+**Timeouts:** 
+- Primary model timeout: 120s (for local inference)
+- Fallback/cloud timeout: 60s
+- Both configurable via `config.yaml` or environment variables
+
+**Configuration example:**
+
+```yaml
+# Primary: Local Ollama, Fallback: OpenAI GPT-4o
+llm:
+  model_name: "ollama/llama3"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
+  
+  fallback_model_name: "gpt-4o-mini"
+  fallback_api_key: "sk-..."
+  
+  cloud_allowed: true  # Allow fallback if primary fails
+  max_retries: 3
+  timeout_seconds: 120
+```
+
+See `examples/config.example.yaml` for comprehensive configuration examples.
 
 ---
 

@@ -199,15 +199,11 @@ class TestLLMRouter:
 
         router = LLMRouter(cloud_allowed_fn=lambda: False)
 
-        response_body = {
-            "message": {"content": '{"action_type":"recon_passive","tool_name":"nmap","target":"10.0.0.1","rationale":"init","estimated_risk":"low"}'}
-        }
+        response_json = '{"action_type":"recon_passive","tool_name":"nmap","target":"10.0.0.1","rationale":"init","estimated_risk":"low"}'
 
-        with mock.patch("httpx.post") as mock_post:
-            mock_post.return_value = mock.Mock(
-                status_code=200,
-                json=lambda: response_body,
-                raise_for_status=lambda: None,
+        with mock.patch("litellm.completion") as mock_completion:
+            mock_completion.return_value = mock.Mock(
+                choices=[mock.Mock(message=mock.Mock(content=response_json))]
             )
             result = router.plan({"context": "test"})
 
@@ -218,8 +214,8 @@ class TestLLMRouter:
 
         router = LLMRouter(cloud_allowed_fn=lambda: False)
 
-        with mock.patch("httpx.post") as mock_post:
-            mock_post.side_effect = Exception("Connection refused")
+        with mock.patch("litellm.completion") as mock_completion:
+            mock_completion.side_effect = Exception("Connection refused")
             with pytest.raises(Exception):
                 router.complete("sys", "user")
 
@@ -233,8 +229,8 @@ class TestLLMRouter:
 
         router = LLMRouter(cloud_allowed_fn=lambda: False)
 
-        with mock.patch("httpx.post") as mock_post:
-            mock_post.side_effect = Exception("Network error")
+        with mock.patch("litellm.completion") as mock_completion:
+            mock_completion.side_effect = Exception("Network error")
             with mock.patch("time.sleep"):  # skip backoff
                 # Need MAX_RETRIES consecutive complete() calls to open circuit
                 for _ in range(3):
