@@ -25,11 +25,14 @@ echo "Copying application files..."
 cp -r pwnpilot "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp -r scripts "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp -r schemas "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
+cp -r migrations "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
 cp -r examples "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
 cp requirements.txt "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
 cp pyproject.toml "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/"
-cp README.md LICENSE "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/"
-cp INSTALLATION.md "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/" 2>/dev/null || true
+cp alembic.ini "$BUILD_DIR/$PACKAGE_NAME$INSTALL_PREFIX/" 2>/dev/null || true
+cp docs/README.md docs/LICENSE "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/"
+cp docs/INSTALLATION.md "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/" 2>/dev/null || true
+cp docs/CURRENT_SCHEMA.md "$BUILD_DIR/$PACKAGE_NAME/usr/share/doc/$PROJECT_NAME/" 2>/dev/null || true
 
 # Copy systemd service file
 if [ -f "scripts/pwnpilot.service" ]; then
@@ -39,7 +42,15 @@ fi
 # Create wrapper script for /usr/bin
 cat > "$BUILD_DIR/$PACKAGE_NAME/usr/bin/pwnpilot" << 'EOF'
 #!/bin/bash
-exec /opt/pwnpilot/.venv/bin/pwnpilot "$@"
+# Wrapper for pwnpilot CLI
+VENV_BIN="/opt/pwnpilot/.venv/bin/pwnpilot"
+if [ -x "$VENV_BIN" ]; then
+    exec "$VENV_BIN" "$@"
+else
+    echo "Error: PwnPilot package is not properly installed." >&2
+    echo "Please run: sudo dpkg --configure -a" >&2
+    exit 1
+fi
 EOF
 chmod +x "$BUILD_DIR/$PACKAGE_NAME/usr/bin/pwnpilot"
 
@@ -92,6 +103,10 @@ echo "Installing Python dependencies..."
 "$INSTALL_PREFIX/.venv/bin/pip" install --upgrade pip setuptools wheel
 "$INSTALL_PREFIX/.venv/bin/pip" install -r "$INSTALL_PREFIX/requirements.txt"
 
+# Install pwnpilot package in development mode
+echo "Installing PwnPilot package..."
+cd "$INSTALL_PREFIX" && "$INSTALL_PREFIX/.venv/bin/pip" install -e . 2>/dev/null || true
+
 # Create data directories
 mkdir -p /etc/pwnpilot
 mkdir -p /var/lib/pwnpilot
@@ -110,14 +125,19 @@ if [ -f "$INSTALL_PREFIX/examples/config.example.yaml" ] && [ ! -f /etc/pwnpilot
     echo "  Edit this file to add your LLM API keys"
 fi
 
-# Initialize database
+# Initialize database (skip if alembic not properly configured)
 echo "Initializing database..."
-cd "$INSTALL_PREFIX"
-"$INSTALL_PREFIX/.venv/bin/alembic" upgrade head || true
+if [ -f "$INSTALL_PREFIX/alembic.ini" ]; then
+    cd "$INSTALL_PREFIX" && "$INSTALL_PREFIX/.venv/bin/alembic" upgrade head 2>/dev/null || echo "⚠ Database initialization skipped (requires manual setup)"
+else
+    echo "⚠ alembic.ini not found, skipping database initialization"
+fi
 
-# Generate keys if not present
-echo "Generating signing keys..."
-"$INSTALL_PREFIX/.venv/bin/pwnpilot" keys --generate --output /etc/pwnpilot || true
+# Generate keys if CLI is available
+if command -v pwnpilot >/dev/null 2>&1 || [ -f /usr/bin/pwnpilot ]; then
+    echo "Generating signing keys..."
+    /usr/bin/pwnpilot keys --generate --output /etc/pwnpilot 2>/dev/null || echo "⚠ Signing key generation requires manual setup: pwnpilot keys --generate"
+fi
 
 # Enable systemd service
 if [ -f /etc/systemd/system/pwnpilot.service ]; then
