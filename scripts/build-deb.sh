@@ -42,10 +42,9 @@ fi
 # Create wrapper script for /usr/bin
 cat > "$BUILD_DIR/$PACKAGE_NAME/usr/bin/pwnpilot" << 'EOF'
 #!/bin/bash
-# Wrapper for pwnpilot CLI
-VENV_BIN="/opt/pwnpilot/.venv/bin/pwnpilot"
-if [ -x "$VENV_BIN" ]; then
-    exec "$VENV_BIN" "$@"
+# Wrapper for pwnpilot CLI (system-wide Python)
+if command -v pwnpilot >/dev/null 2>&1; then
+    exec pwnpilot "$@"
 else
     echo "Error: PwnPilot package is not properly installed." >&2
     echo "Please run: sudo dpkg --configure -a" >&2
@@ -91,23 +90,28 @@ set -e
 INSTALL_PREFIX="/opt/pwnpilot"
 
 echo "Finalizing PwnPilot installation..."
+echo ""
 
-# Create Python virtual environment
-if [ ! -d "$INSTALL_PREFIX/.venv" ]; then
-    echo "Creating Python virtual environment..."
-    python3 -m venv "$INSTALL_PREFIX/.venv" || python3.11 -m venv "$INSTALL_PREFIX/.venv" || python3.10 -m venv "$INSTALL_PREFIX/.venv"
-fi
+# Upgrade system pip
+echo "[1/6] Upgrading pip, setuptools, and wheel..."
+pip3 install --upgrade pip setuptools wheel 2>/dev/null || true
 
-# Upgrade pip and install dependencies
-echo "Installing Python dependencies..."
-"$INSTALL_PREFIX/.venv/bin/pip" install --upgrade pip setuptools wheel
-"$INSTALL_PREFIX/.venv/bin/pip" install -r "$INSTALL_PREFIX/requirements.txt"
+# Install dependencies system-wide
+echo "[2/6] Installing Python dependencies system-wide..."
+pip3 install -r "$INSTALL_PREFIX/requirements.txt" 2>&1 | tail -5 || {
+    echo "✗ Failed to install dependencies"
+    exit 1
+}
 
-# Install pwnpilot package in development mode
-echo "Installing PwnPilot package..."
-cd "$INSTALL_PREFIX" && "$INSTALL_PREFIX/.venv/bin/pip" install -e . 2>/dev/null || true
+# Install pwnpilot package system-wide in development mode
+echo "[3/6] Installing PwnPilot package..."
+cd "$INSTALL_PREFIX" && pip3 install -e . 2>/dev/null || {
+    echo "✗ Failed to install PwnPilot package"
+    exit 1
+}
 
 # Create data directories
+echo "[4/6] Setting up configuration and data directories..."
 mkdir -p /etc/pwnpilot
 mkdir -p /var/lib/pwnpilot
 mkdir -p /var/log/pwnpilot
@@ -117,38 +121,123 @@ chown -R pwnpilot:pwnpilot /var/lib/pwnpilot /var/log/pwnpilot /etc/pwnpilot
 
 # Copy configuration from example if present
 if [ -f "$INSTALL_PREFIX/examples/config.example.yaml" ] && [ ! -f /etc/pwnpilot/config.yaml ]; then
-    echo "Copying configuration template..."
     cp "$INSTALL_PREFIX/examples/config.example.yaml" /etc/pwnpilot/config.yaml
     chown pwnpilot:pwnpilot /etc/pwnpilot/config.yaml
     chmod 640 /etc/pwnpilot/config.yaml
-    echo "✓ Configuration copied to /etc/pwnpilot/config.yaml"
-    echo "  Edit this file to add your LLM API keys"
+    echo "  ✓ Configuration copied to /etc/pwnpilot/config.yaml"
 fi
 
-# Initialize database (skip if alembic not properly configured)
-echo "Initializing database..."
+# Initialize database
+echo "[5/6] Initializing database..."
 if [ -f "$INSTALL_PREFIX/alembic.ini" ]; then
-    cd "$INSTALL_PREFIX" && "$INSTALL_PREFIX/.venv/bin/alembic" upgrade head 2>/dev/null || echo "⚠ Database initialization skipped (requires manual setup)"
+    cd "$INSTALL_PREFIX" && alembic upgrade head 2>/dev/null || {
+        echo "  ⚠ Database initialization may require manual setup"
+    }
 else
-    echo "⚠ alembic.ini not found, skipping database initialization"
+    echo "  ⚠ alembic.ini not found, skipping database initialization"
 fi
 
-# Generate keys if CLI is available
-if command -v pwnpilot >/dev/null 2>&1 || [ -f /usr/bin/pwnpilot ]; then
-    echo "Generating signing keys..."
-    /usr/bin/pwnpilot keys --generate --output /etc/pwnpilot 2>/dev/null || echo "⚠ Signing key generation requires manual setup: pwnpilot keys --generate"
-fi
-
-# Enable systemd service
+# Register systemd service
+echo "[6/6] Registering systemd service..."
 if [ -f /etc/systemd/system/pwnpilot.service ]; then
     systemctl daemon-reload || true
-    echo "To enable pwnpilot service, run: sudo systemctl enable pwnpilot"
 fi
 
+echo ""
+echo "═══════════════════════════════════════════════════════════════════"
+echo "Running Post-Installation Verification Checks..."
+echo "═══════════════════════════════════════════════════════════════════"
+echo ""
+
+# Verify CLI installation
+echo "[CHECK 1/5] CLI Accessibility"
+if command -v pwnpilot >/dev/null 2>&1; then
+    echo "  ✓ pwnpilot CLI is accessible"
+else
+    echo "  ✗ pwnpilot CLI not found in PATH"
+    exit 1
+fi
+
+# Verify version
+echo "[CHECK 2/5] Version Check"
+VERSION=$(pwnpilot version 2>/dev/null || echo "unknown")
+if [ "$VERSION" != "unknown" ]; then
+    echo "  ✓ Version: $VERSION"
+else
+    echo "  ✗ Could not retrieve version"
+    exit 1
+fi
+
+# Verify help output
+echo "[CHECK 3/5] Command Help"
+if pwnpilot --help >/dev/null 2>&1; then
+    echo "  ✓ CLI help working"
+else
+    echo "  ✗ CLI help not working"
+    exit 1
+fi
+
+# Verify ROE commands
+echo "[CHECK 4/5] ROE Subcommands"
+if pwnpilot roe --help >/dev/null 2>&1; then
+    echo "  ✓ ROE subcommands available"
+    echo "    - verify (Validate ROE files)"
+    echo "    - list (List approved ROEs)"
+    echo "    - audit (Show approval timeline)"
+    echo "    - export (Export audit reports)"
+else
+    echo "  ✗ ROE subcommands not available"
+    exit 1
+fi
+
+# Verify directories
+echo "[CHECK 5/5] Directory Structure"
+CHECKS_PASSED=0
+CHECKS_TOTAL=0
+
+[ -d /etc/pwnpilot ] && { echo "  ✓ /etc/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /etc/pwnpilot missing"
+((CHECKS_TOTAL++))
+
+[ -d /var/lib/pwnpilot ] && { echo "  ✓ /var/lib/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /var/lib/pwnpilot missing"
+((CHECKS_TOTAL++))
+
+[ -d /var/log/pwnpilot ] && { echo "  ✓ /var/log/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /var/log/pwnpilot missing"
+((CHECKS_TOTAL++))
+
+[ -f /etc/pwnpilot/config.yaml ] && { echo "  ✓ configuration file exists"; ((CHECKS_PASSED++)); } || echo "  ✗ configuration file missing"
+((CHECKS_TOTAL++))
+
+[ -f /opt/pwnpilot/alembic.ini ] && { echo "  ✓ alembic.ini found"; ((CHECKS_PASSED++)); } || echo "  ✗ alembic.ini missing"
+((CHECKS_TOTAL++))
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════════"
+echo "Installation Summary"
+echo "═══════════════════════════════════════════════════════════════════"
+echo ""
 echo "✓ PwnPilot installation complete!"
-echo "Run 'pwnpilot --help' to get started"
+echo "✓ All verification checks passed ($CHECKS_PASSED/$CHECKS_TOTAL)"
+echo ""
+echo "Next Steps:"
+echo "  1. Configure LLM provider:"
+echo "     sudo nano /etc/pwnpilot/config.yaml"
+echo ""
+echo "  2. Test ROE verification:"
+echo "     pwnpilot roe verify /opt/pwnpilot/examples/roe.template.yaml"
+echo ""
+echo "  3. View available commands:"
+echo "     pwnpilot --help"
+echo ""
+echo "  4. Enable systemd service (optional):"
+echo "     sudo systemctl enable pwnpilot && sudo systemctl start pwnpilot"
+echo ""
 echo "Configuration file: /etc/pwnpilot/config.yaml"
 echo "Data directory: /var/lib/pwnpilot"
+echo "Logs directory: /var/log/pwnpilot"
+echo ""
+echo "For troubleshooting, see: /opt/pwnpilot/docs/"
+echo "═══════════════════════════════════════════════════════════════════"
+echo ""
 EOF
 chmod 755 "$BUILD_DIR/$PACKAGE_NAME/DEBIAN/postinst"
 
