@@ -229,14 +229,47 @@ pwnpilot roe verify /path/to/roe.yaml
 
 ## Uninstallation
 
-### Complete Removal
+### Remove Package (Preserves Configuration)
 
 ```bash
-sudo dpkg -r pwnpilot
-sudo rm -rf /etc/pwnpilot        # Optional: remove config
-sudo rm -rf /var/lib/pwnpilot    # Optional: remove data
-sudo rm -rf /var/log/pwnpilot    # Optional: remove logs
-sudo userdel pwnpilot            # Optional: remove user
+# Remove application files, keep configuration for recovery
+sudo apt remove pwnpilot
+```
+
+This removes:
+- ✓ `/opt/pwnpilot` (application directory)
+- ✓ Systemd service files
+
+This preserves (for recovery):
+- `/etc/pwnpilot/` (configuration)
+- `/var/lib/pwnpilot/` (database)
+- `/var/log/pwnpilot/` (logs)
+
+### Complete Removal (Purge All)
+
+```bash
+# Remove everything including configuration and data
+sudo apt purge pwnpilot
+```
+
+This removes everything:
+- ✓ `/opt/pwnpilot` (application)
+- ✓ `/etc/pwnpilot/` (configuration)
+- ✓ `/var/lib/pwnpilot/` (database)
+- ✓ `/var/log/pwnpilot/` (logs)
+- ✓ `pwnpilot` (system user)
+- ✓ Systemd service files
+
+### Manual Cleanup (If Needed)
+
+```bash
+# Only if files remain after removal
+sudo rm -rf /etc/pwnpilot
+sudo rm -rf /var/lib/pwnpilot
+sudo rm -rf /var/log/pwnpilot
+sudo userdel pwnpilot
+sudo rm -f /etc/systemd/system/pwnpilot.service
+sudo systemctl daemon-reload
 ```
 
 ---
