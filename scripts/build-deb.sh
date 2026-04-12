@@ -119,20 +119,41 @@ mkdir -p /var/log/pwnpilot
 # Fix permissions
 chown -R pwnpilot:pwnpilot /var/lib/pwnpilot /var/log/pwnpilot /etc/pwnpilot
 
-# Copy configuration from example if present
+# Copy configuration from example if present, otherwise create minimal config
 if [ -f "$INSTALL_PREFIX/examples/config.example.yaml" ] && [ ! -f /etc/pwnpilot/config.yaml ]; then
     cp "$INSTALL_PREFIX/examples/config.example.yaml" /etc/pwnpilot/config.yaml
     chown pwnpilot:pwnpilot /etc/pwnpilot/config.yaml
     chmod 640 /etc/pwnpilot/config.yaml
-    echo "  ✓ Configuration copied to /etc/pwnpilot/config.yaml"
+    echo "  ✓ Configuration copied from examples"
+elif [ ! -f /etc/pwnpilot/config.yaml ]; then
+    # Create minimal default configuration
+    cat > /etc/pwnpilot/config.yaml << 'CONFIGEOF'
+# PwnPilot Configuration
+database:
+  url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"
+
+llm:
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  model: "mistral"
+  timeout: 30
+  temperature: 0.7
+CONFIGEOF
+    chown pwnpilot:pwnpilot /etc/pwnpilot/config.yaml
+    chmod 640 /etc/pwnpilot/config.yaml
+    echo "  ✓ Default configuration created"
+else
+    echo "  ✓ Configuration already exists"
 fi
 
 # Initialize database
 echo "[5/6] Initializing database..."
 if [ -f "$INSTALL_PREFIX/alembic.ini" ]; then
-    cd "$INSTALL_PREFIX" && alembic upgrade head 2>/dev/null || {
-        echo "  ⚠ Database initialization may require manual setup"
-    }
+    if cd "$INSTALL_PREFIX" && alembic upgrade head >/dev/null 2>&1; then
+        echo "  ✓ Database initialized successfully"
+    else
+        echo "  ⚠ Database initialization deferred (will init on first CLI use)"
+    fi
 else
     echo "  ⚠ alembic.ini not found, skipping database initialization"
 fi
@@ -192,23 +213,37 @@ fi
 
 # Verify directories
 echo "[CHECK 5/5] Directory Structure"
-CHECKS_PASSED=0
-CHECKS_TOTAL=0
 
-[ -d /etc/pwnpilot ] && { echo "  ✓ /etc/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /etc/pwnpilot missing"
-((CHECKS_TOTAL++))
+# Use simple exit on failure for critical paths
+if [ ! -d /etc/pwnpilot ]; then
+    echo "  ✗ CRITICAL: /etc/pwnpilot not found"
+    exit 1
+fi
+echo "  ✓ /etc/pwnpilot exists"
 
-[ -d /var/lib/pwnpilot ] && { echo "  ✓ /var/lib/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /var/lib/pwnpilot missing"
-((CHECKS_TOTAL++))
+if [ ! -d /var/lib/pwnpilot ]; then
+    echo "  ✗ CRITICAL: /var/lib/pwnpilot not found"
+    exit 1
+fi
+echo "  ✓ /var/lib/pwnpilot exists"
 
-[ -d /var/log/pwnpilot ] && { echo "  ✓ /var/log/pwnpilot exists"; ((CHECKS_PASSED++)); } || echo "  ✗ /var/log/pwnpilot missing"
-((CHECKS_TOTAL++))
+if [ ! -d /var/log/pwnpilot ]; then
+    echo "  ✗ CRITICAL: /var/log/pwnpilot not found"
+    exit 1
+fi
+echo "  ✓ /var/log/pwnpilot exists"
 
-[ -f /etc/pwnpilot/config.yaml ] && { echo "  ✓ configuration file exists"; ((CHECKS_PASSED++)); } || echo "  ✗ configuration file missing"
-((CHECKS_TOTAL++))
+if [ ! -f /etc/pwnpilot/config.yaml ]; then
+    echo "  ✗ CRITICAL: /etc/pwnpilot/config.yaml not found"
+    exit 1
+fi
+echo "  ✓ configuration file exists"
 
-[ -f /opt/pwnpilot/alembic.ini ] && { echo "  ✓ alembic.ini found"; ((CHECKS_PASSED++)); } || echo "  ✗ alembic.ini missing"
-((CHECKS_TOTAL++))
+if [ ! -f /opt/pwnpilot/alembic.ini ]; then
+    echo "  ✗ CRITICAL: /opt/pwnpilot/alembic.ini not found"
+    exit 1
+fi
+echo "  ✓ alembic.ini found"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════"
@@ -216,7 +251,7 @@ echo "Installation Summary"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
 echo "✓ PwnPilot installation complete!"
-echo "✓ All verification checks passed ($CHECKS_PASSED/$CHECKS_TOTAL)"
+echo "✓ All verification checks passed (5/5)"
 echo ""
 echo "Next Steps:"
 echo "  1. Configure LLM provider:"
