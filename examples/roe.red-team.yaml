@@ -1,0 +1,36 @@
+# PwnPilot Rules of Engagement: Red Team Exercise
+# ================================================
+# EXAMPLE: Cooperative offensive security exercise with blue team coordination
+# Designed for mature security operations with clear training objectives
+
+engagement:
+  name: "red-team-exercise-blue-team-training-q1-2024"
+  authorizer: "ciso@company.com"
+  description: "Cooperative red team exercise to validate blue team incident response capabilities. Red team tasked with: (1) Initial access via phishing (coordinated with comms team), (2) establish persistence in dev environment, (3) lateral movement to production network, (4) data exfiltration of test database, (5) trigger blue team detection/response. Objectives: validate EDR effectiveness, test incident response procedures, assess blue team skills. Blue team leadership: alice@company.com. Red team lead: charlie@company.com. Coordination calls: daily at 10am PT. Engagement period: Jan 22-26, 2024 (5 days). Expected to result in 2-3 simulated alerts for blue team to investigate."
+  valid_hours: 40
+
+scope:
+  # Full internal infrastructure in scope for red team exercise
+  cidrs: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  # All domains in scope
+  domains: "company.com,internal.company.com,admin.company.com,dev.company.com"
+  # Specific test URLs for web app attacks
+  urls: "https://intranet.company.com,https://admin.company.com,https://dev.company.com:8080"
+  # Test database only (no production DB access)
+  excluded_ips: "10.0.1.100,172.16.0.50"
+  # Allow modification of test data only, no production data changes
+  restricted_actions: "DELETE_DATA,ENCRYPT_DATA,STOP_SERVICES,EXFILTRATE_DATA"
+
+policy:
+  # Red team may access cloud test environment for full attack chain simulation
+  cloud_allowed: true
+  # Higher iterations appropriate for comprehensive red team exercise
+  max_iterations: 100
+  # Higher retries for persistence testing (red team needs realistic persistence)
+  max_retries: 8
+  # 40 hour timeout = full engagement duration, no interruption
+  timeout_seconds: 144000
+
+metadata:
+  organization: "ACME Corp Security Operations - Red Team"
+  notes: "Exercise code: RTX-Q1-2024. Red team lead: charlie@company.com. Blue team lead: alice@company.com. Control cell lead: david@company.com. Phishing campaign pre-coordinated with marketing. Log aggregation baseline established Jan 20. Blue team standing up on Jan 22 8am. Lessons learned session: Jan 27 2pm. Post-engagement report due: Feb 2."

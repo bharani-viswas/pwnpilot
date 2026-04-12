@@ -1,0 +1,34 @@
+# PwnPilot Rules of Engagement: Internal Security Assessment
+# ============================================================
+# EXAMPLE: High-trust internal network penetration test
+# For a mature security program with existing offense/defense frameworks
+
+engagement:
+  name: "internal-security-assessment-q1-2024"
+  authorizer: "ciso@company.com"
+  description: "Authorized quarterly internal security assessment of corporate network infrastructure. Includes red team coordination with SecOps team. Covers office IP ranges, internal servers, and employee workstations. Target: identify network segmentation weaknesses and lateral movement paths. Scope coordinated with IT leadership (John Doe, CTO). Timeline: Jan 15-19, 2024 (5 business days, 40 hours). Approved under internal security testing policy POL-SEC-042."
+  valid_hours: 40
+
+scope:
+  # Internal network ranges
+  cidrs: "10.0.0.0/8,172.16.0.0/12"
+  domains: "internal.company.com,admin.company.com,dev.company.com"
+  urls: ""
+  # Critical systems excluded from live testing (get via out-of-band coordination)
+  excluded_ips: "10.0.1.1,10.0.1.5,172.16.0.1,172.16.1.50-172.16.1.60"
+  # No data modification allowed - observation only
+  restricted_actions: "MODIFY_DATA,DELETE_DATA,ENCRYPT_DATA"
+
+policy:
+  # No cloud testing for internal assessment (on-prem only)
+  cloud_allowed: false
+  # Higher iterations for thorough internal assessment
+  max_iterations: 50
+  # More retries acceptable for internal, stable systems
+  max_retries: 5
+  # 8 hour timeout = full business day of testing
+  timeout_seconds: 28800
+
+metadata:
+  organization: "ACME Corp Security Team"
+  notes: "Coordinated with SecOps on Jan 10. Contact: alice@company.com. Red team engagement code: RT-Q1-2024-001. Previous findings to retest: CVE-2023-581 (old DC vuln), lateral movement via NTLM relay."

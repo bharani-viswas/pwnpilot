@@ -13,6 +13,7 @@ Commands:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -56,22 +57,117 @@ def cmd_version() -> None:
 @app.command("start")
 def cmd_start(
     name: str = typer.Option(..., "--name", "-n", help="Engagement name"),
-    scope_cidr: list[str] = typer.Option([], "--cidr", help="Scope CIDR range (repeatable)"),
-    scope_domain: list[str] = typer.Option([], "--domain", help="Scope domain (repeatable)"),
-    scope_url: list[str] = typer.Option([], "--url", help="Scope URL prefix (repeatable)"),
-    roe_hash: str = typer.Option(..., "--roe-hash", help="SHA-256 hash of the ROE document"),
-    authoriser: str = typer.Option(..., "--authoriser", help="Authoriser identity"),
+    roe_file: Optional[Path] = typer.Option(None, "--roe-file", help="Path to ROE YAML file (new engagement flow)"),
+    scope_cidr: list[str] = typer.Option([], "--cidr", help="Scope CIDR range (repeatable, legacy)"),
+    scope_domain: list[str] = typer.Option([], "--domain", help="Scope domain (repeatable, legacy)"),
+    scope_url: list[str] = typer.Option([], "--url", help="Scope URL prefix (repeatable, legacy)"),
+    roe_hash: str = typer.Option("", "--roe-hash", help="SHA-256 hash of the ROE document (legacy)"),
+    authoriser: str = typer.Option("", "--authoriser", help="Authoriser identity (legacy)"),
+    roe_dry_run: bool = typer.Option(False, "--roe-dry-run", help="Validate ROE file only (do not create engagement)"),
+    roe_skip_approval: bool = typer.Option(False, "--roe-skip-approval", help="Skip approval workflow (admin override)"),
     valid_hours: int = typer.Option(24, "--valid-hours", help="Engagement validity window (hours)"),
     max_iterations: int = typer.Option(50, "--max-iter", help="Maximum agent loop iterations"),
     config_file: Optional[Path] = typer.Option(None, "--config", help="Config YAML path"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Policy simulation only (no execution)"),
 ) -> None:
-    """Start a new engagement with the given scope."""
+    """Start a new engagement with the given scope.
+    
+    NEW: Use --roe-file for ROE-based engagement creation (recommended).
+    LEGACY: Use --cidr/--domain/--url/--roe-hash for direct scope specification.
+    """
     from pwnpilot.runtime import create_and_run_engagement
+    from pwnpilot.data.roe_validator import validate_roe_file
+    from pwnpilot.agent.roe_interpreter import ROEInterpreter
+    from pwnpilot.control.roe_approval import ApprovalWorkflow
+    import yaml
 
-    if not scope_cidr and not scope_domain and not scope_url:
-        console.print("[red]Error: at least one scope target is required (--cidr, --domain, or --url).")
-        raise typer.Exit(code=1)
+    if roe_file:
+        # NEW ROE-based workflow
+        if not roe_file.exists():
+            console.print(f"[red]Error: ROE file not found:[/red] {roe_file}")
+            raise typer.Exit(code=1)
+
+        try:
+            # Load and validate ROE file
+            with open(roe_file) as f:
+                roe_yaml = yaml.safe_load(f)
+            
+            is_valid, error_msg = validate_roe_file(roe_yaml)
+            if not is_valid:
+                console.print("[red]ROE validation failed:[/red]")
+                console.print(error_msg)
+                raise typer.Exit(code=1)
+            
+            if not roe_dry_run:
+                # Step 1: Interpret ROE with AI
+                console.print("[bold cyan]Step 1: Interpreting ROE policies with AI...[/bold cyan]")
+                interpreter = ROEInterpreter()
+                interpretation_result = interpreter.interpret_roe(roe_yaml)
+                
+                if not interpretation_result.is_valid:
+                    console.print(f"[red]Policy interpretation failed:[/red] {interpretation_result.error_message}")
+                    raise typer.Exit(code=1)
+                
+                # Step 2: Request user approval
+                console.print("\n[bold cyan]Step 2: Requesting user approval...[/bold cyan]")
+                workflow = ApprovalWorkflow()
+                session = workflow.create_session(
+                    user=os.getenv("USER", "unknown"),
+                    engagement_id=None,
+                )
+                
+                try:
+                    workflow.display_policies(session.session_id, interpretation_result)
+                    workflow.request_approval(session.session_id)
+                    
+                    if not roe_skip_approval:
+                        console.print("\n[bold cyan]Step 3: Verifying sudo password...[/bold cyan]")
+                        password = typer.prompt("Sudo password", hide_input=True)
+                        approval_record = workflow.approve_policies(
+                            session.session_id,
+                            interpretation_result,
+                            password,
+                        )
+                        console.print("[green]✓ Approval recorded and sudo verified.[/green]")
+                    else:
+                        console.print("[yellow]Skipping sudo verification (admin override).[/yellow]")
+                        approval_record = None
+                    
+                    # Extract scope from interpreted policy
+                    policy = interpretation_result.extracted_policy
+                    scope_cidr = policy.scope_cidrs
+                    scope_domain = policy.scope_domains
+                    scope_url = policy.scope_urls
+                    roe_hash = hashlib.sha256(yaml.dump(roe_yaml).encode()).hexdigest()
+                    authoriser = os.getenv("USER", "unknown")
+                    
+                except Exception as e:
+                    console.print(f"[red]Approval workflow failed:[/red] {e}")
+                    raise typer.Exit(code=1)
+            else:
+                # Dry run - just validate
+                console.print("[green]✓ ROE validation passed (dry run).[/green]")
+                raise typer.Exit(code=0)
+        
+        except yaml.YAMLError as e:
+            console.print(f"[red]Invalid YAML in ROE file:[/red] {e}")
+            raise typer.Exit(code=1)
+        except Exception as e:
+            console.print(f"[red]ROE processing failed:[/red] {e}")
+            log.error("cli.roe_processing_failed", exc=str(e))
+            raise typer.Exit(code=1)
+    else:
+        # LEGACY scope-based workflow
+        if not scope_cidr and not scope_domain and not scope_url:
+            console.print("[red]Error: --roe-file required, or at least one scope target (--cidr, --domain, or --url).")
+            raise typer.Exit(code=1)
+        
+        if not roe_hash:
+            console.print("[red]Error: --roe-hash required for legacy scope-based engagement.")
+            raise typer.Exit(code=1)
+        
+        if not authoriser:
+            authoriser = os.getenv("USER", "unknown")
 
     console.print(f"[bold green]Starting engagement:[/bold green] {name}")
     if dry_run:
@@ -452,6 +548,124 @@ def cmd_check(
         console.print(f"[red]✗ {issue}[/red]")
 
     raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# ROE Commands (Phase 5-6)
+# ---------------------------------------------------------------------------
+
+
+roe_app = typer.Typer(
+    help="ROE (Rules of Engagement) management and verification.",
+    add_completion=False,
+)
+app.add_typer(roe_app, name="roe")
+
+
+@roe_app.command("verify")
+def cmd_roe_verify(
+    file: Path = typer.Argument(..., help="Path to ROE YAML file"),
+) -> None:
+    """Validate a ROE file against the schema."""
+    from pwnpilot.data.roe_validator import validate_roe_file, _parse_comma_separated_string
+    import yaml
+
+    if not file.exists():
+        console.print(f"[red]Error: File not found:[/red] {file}")
+        raise typer.Exit(code=1)
+
+    try:
+        with open(file) as f:
+            roe_yaml = yaml.safe_load(f)
+        
+        is_valid, error_msg = validate_roe_file(roe_yaml)
+        
+        if is_valid:
+            console.print(f"[green]✓ ROE file is valid:[/green] {file}")
+            console.print(f"  Schema version: v1")
+            # Parse comma-separated strings from scope
+            scope = roe_yaml.get('scope', {})
+            cidrs = _parse_comma_separated_string(scope.get('cidrs', ''))
+            domains = _parse_comma_separated_string(scope.get('domains', ''))
+            restricted_actions = _parse_comma_separated_string(scope.get('restricted_actions', ''))
+            console.print(f"  Scope targets: {len(cidrs) + len(domains)}")
+            console.print(f"  Allowed actions: {len(restricted_actions)}")
+        else:
+            console.print(f"[red]✗ ROE file validation failed:[/red] {file}")
+            console.print(error_msg)
+            raise typer.Exit(code=1)
+    except yaml.YAMLError as e:
+        console.print(f"[red]Invalid YAML:[/red] {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@roe_app.command("list")
+def cmd_roe_list(
+    engagement_id: Optional[str] = typer.Option(None, "--engagement", "-e", help="Filter by engagement ID"),
+    active_only: bool = typer.Option(True, "--all", help="Show inactive ROE files"),
+) -> None:
+    """List approved ROE files and their approval status."""
+    # This would query the database in a real implementation
+    console.print("[bold cyan]ROE Files[/bold cyan]")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ROE ID")
+    table.add_column("Filename")
+    table.add_column("Uploaded By")
+    table.add_column("Status")
+    table.add_column("Uploaded At")
+    
+    # TODO: Query ROEFile and ROEApprovalRecord from database
+    console.print("[yellow]No ROE files available (database not connected).[/yellow]")
+
+
+@roe_app.command("audit")
+def cmd_roe_audit(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+) -> None:
+    """Show approval and audit trail for an engagement."""
+    from pwnpilot.data.models import ROEApprovalRecord
+    
+    console.print(f"[bold cyan]Audit Trail for Engagement:[/bold cyan] {engagement_id}")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Timestamp")
+    table.add_column("User")
+    table.add_column("Event")
+    table.add_column("Details")
+    
+    # TODO: Query AuditEvent records for engagement_id
+    console.print(table)
+    console.print("[yellow]No audit records available (database not connected).[/yellow]")
+
+
+@roe_app.command("export")
+def cmd_roe_export(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    output: Path = typer.Option(None, "--output", "-o", help="Export file path (default: roe-audit-{engagement_id}.json)"),
+) -> None:
+    """Export audit report with ROE, approval chain, and timeline."""
+    import json
+    
+    output_path = output or Path(f"roe-audit-{engagement_id}.json")
+    
+    # TODO: Gather ROE file content, approval records, audit trail
+    audit_report = {
+        "engagement_id": engagement_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "roe_file": None,  # TODO: Load from database
+        "approvals": [],  # TODO: Load approval records
+        "audit_trail": [],  # TODO: Load audit events
+    }
+    
+    try:
+        with open(output_path, "w") as f:
+            json.dump(audit_report, f, indent=2, default=str)
+        console.print(f"[green]✓ Audit report exported:[/green] {output_path}")
+    except Exception as e:
+        console.print(f"[red]Error exporting report:[/red] {e}")
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------

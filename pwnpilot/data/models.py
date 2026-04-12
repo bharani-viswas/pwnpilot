@@ -296,3 +296,62 @@ class EvidenceIndex(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     truncated: bool = False
     schema_version: str = "v1"
+
+
+# ---------------------------------------------------------------------------
+# ROE models (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class ROEFile(BaseModel):
+    """Represents a stored ROE (Rules of Engagement) file with versioning."""
+    
+    roe_id: UUID = Field(default_factory=uuid4)
+    filename: str
+    content_hash: str  # SHA256 of original YAML file
+    content_yaml: str  # Full YAML content (immutable)
+    uploaded_by: str
+    uploaded_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    version: int = 1  # For tracking updates
+    is_active: bool = True  # Current ROE version for engagement
+    schema_version: str = "v1"
+    
+    model_config = {"frozen": True}
+
+
+class EngagementPolicy(BaseModel):
+    """Represents policies derived from ROE for a specific engagement."""
+    
+    policy_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    roe_id: UUID
+    scope_cidrs: list[str] = Field(default_factory=list)
+    scope_domains: list[str] = Field(default_factory=list)
+    scope_urls: list[str] = Field(default_factory=list)
+    excluded_ips: list[str] = Field(default_factory=list)
+    restricted_actions: list[str] = Field(default_factory=list)
+    max_iterations: int
+    max_retries: int
+    timeout_seconds: int
+    cloud_allowed: bool
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    schema_version: str = "v1"
+    
+    model_config = {"frozen": True}
+
+
+class ROEApprovalRecord(BaseModel):
+    """Immutable record of ROE approval with audit trail."""
+    
+    approval_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    roe_id: UUID
+    approved_by: str
+    approved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    password_verified: bool  # Sudo password verification status
+    session_id: str  # Reference to ApprovalSession for audit trail
+    nonce_token_hash: str  # Hash of nonce (not plain nonce)
+    schema_version: str = "v1"
+    
+    model_config = {"frozen": True}

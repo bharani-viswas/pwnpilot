@@ -1,0 +1,77 @@
+# PwnPilot Rules of Engagement (ROE) Template
+# ==========================================
+# Copy this file and customize for your engagement.
+# All fields must be completed before AI policy interpretation.
+# For more information: https://github.com/l1onsec/pwnpilot/docs/roe-usage.md
+
+engagement:
+  # Unique name for this engagement (alphanumeric + dashes, no spaces)
+  # Example: "acme-corp-pentest-2024-01"
+  name: "YOUR_ENGAGEMENT_NAME_HERE"
+
+  # Email address of the person authorizing this engagement
+  # This person must be a senior technical leader with scope authority
+  # Example: "ciso@company.com"
+  authorizer: "authorizer@company.com"
+
+  # Human-readable description of the engagement objectives (min 100 chars)
+  # Include business rationale, timeline context, and key stakeholders
+  # Example: "Annual external penetration test of AWS infrastructure to validate security controls following PCI-DSS requirements. Coordinated with SecOps on Dec 15-19 2024."
+  description: "DESCRIBE_ENGAGEMENT_OBJECTIVES_AND_CONTEXT_HERE_MIN_100_CHARS"
+
+  # How many hours will this engagement run? (1-8760, max 1 year)
+  # Includes setup, execution, and remediation handoff
+  # Example: 40 = 5 business days
+  valid_hours: 40
+
+scope:
+  # Target IP ranges (CIDR notation, comma-separated)
+  # These networks you're authorizing to be tested
+  # Example: "10.0.0.0/8,172.16.0.0/12"
+  cidrs: ""
+
+  # Target domain names (FQDN, comma-separated)
+  # Example: "api.company.com,admin.company.com,internal.company.com"
+  domains: ""
+
+  # Target URLs (http/https required, comma-separated)
+  # Used for web app testing - be specific to avoid scope creep!
+  # Example: "https://api.company.com/v1,https://admin.company.com"
+  urls: ""
+
+  # IP addresses to EXCLUDE from testing within scope
+  # Use this for production DBs, payment systems, etc you don't want touched
+  # Example: "10.0.1.5,10.0.2.10-10.0.2.15"
+  excluded_ips: ""
+
+  # Actions explicitly forbidden during this engagement
+  # Must use values from: MODIFY_DATA, DELETE_DATA, ENCRYPT_DATA, STOP_SERVICES, MODIFY_CREDENTIALS, EXFILTRATE_DATA
+  # Example: "MODIFY_DATA,DELETE_DATA"
+  restricted_actions: ""
+
+policy:
+  # Is cloud infrastructure testing approved? (true/false)
+  # If true, includes AWS/Azure/GCP. If false, on-prem only.
+  cloud_allowed: false
+
+  # Maximum attack iterations the AI can execute for exploration (1-1000)
+  # Higher = more thorough but longer and higher risk
+  # Recommended: 20-50 for standard penetration tests
+  max_iterations: 20
+
+  # Maximum retries if an action fails (1-10)
+  # Higher = more persistent reconnection attempts
+  max_retries: 3
+
+  # Session timeout in seconds (minimum 300 = 5 minutes)
+  # AI operations will terminate after this duration to prevent runaway execution
+  timeout_seconds: 3600
+
+metadata:
+  # Organization or team name
+  # Example: "ACME Corp Security Team"
+  organization: "YOUR_ORGANIZATION"
+
+  # Any additional notes for context
+  # Example: "Coordinated with Bob Smith (engineering lead). See ticket SEC-1234."
+  notes: ""

@@ -34,6 +34,16 @@ config.local.yaml
 # Local user directory with keys, config, databases
 ~/.pwnpilot/
 
+# Rules of Engagement documents (confidential)
+# ⚠️ CRITICAL: ROE files contain sensitive authorization details and should never be committed!
+roe.yaml
+roe.local.yaml
+*.roe.yaml
+*.roe.yml
+roe_*.yaml
+/roe/
+# EXCEPTION: roe.template.yaml and examples/roe.*.yaml are safe to commit (templates only, no secrets)
+
 # pytest / coverage
 .pytest_cache/
 .coverage
