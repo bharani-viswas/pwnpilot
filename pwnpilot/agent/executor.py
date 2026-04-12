@@ -35,6 +35,53 @@ from pwnpilot.data.models import (
 log = structlog.get_logger(__name__)
 
 
+# Severity order from highest to lowest
+_SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+
+
+def _normalize_params(params: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    """
+    Normalize tool parameters from LLM output.
+    
+    Handles cases where LLM mistakenly passes arrays where strings are expected,
+    e.g., nuclei severity filter expects a single string, not a list.
+    """
+    normalized = params.copy()
+    
+    # For tools that expect a single severity level
+    if tool_name in ("nuclei", "nikto", "sqlmap") and "severity" in normalized:
+        severity = normalized["severity"]
+        
+        # If severity is a list, pick the highest severity level
+        if isinstance(severity, (list, tuple)):
+            valid_severities = [s.lower() for s in severity if isinstance(s, str) and s.lower() in _SEVERITY_ORDER]
+            if valid_severities:
+                # Pick the highest severity (earliest in order)
+                highest = min(valid_severities, key=lambda s: _SEVERITY_ORDER.index(s))
+                normalized["severity"] = highest
+                log.info(
+                    "executor.param_normalized",
+                    tool=tool_name,
+                    param="severity",
+                    from_value=severity,
+                    to_value=highest,
+                )
+            else:
+                # If no valid severities found, default to medium
+                normalized["severity"] = "medium"
+                log.warning(
+                    "executor.param_normalized_to_default",
+                    tool=tool_name,
+                    param="severity",
+                    original=severity,
+                )
+        elif isinstance(severity, str):
+            # Already a string, ensure it's lowercase and valid
+            normalized["severity"] = severity.lower() if severity.lower() in _SEVERITY_ORDER else "medium"
+    
+    return normalized
+
+
 class ExecutorNode:
     """
     Stateless callable used as a LangGraph executor node.
@@ -86,11 +133,12 @@ class ExecutorNode:
 
         # Construct typed ActionRequest
         try:
+            normalized_params = _normalize_params(proposal.params, proposal.tool_name)
             action = ActionRequest(
                 engagement_id=engagement_id,
                 action_type=ActionType(proposal.action_type),
                 tool_name=proposal.tool_name,
-                params={**proposal.params, "target": proposal.target},
+                params={**normalized_params, "target": proposal.target},
                 risk_level=effective_risk,
             )
         except Exception as exc:

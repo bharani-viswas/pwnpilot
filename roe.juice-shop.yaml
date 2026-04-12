@@ -1,0 +1,18 @@
+engagement:
+  name: "Juice Shop Assessment"
+  authorizer: "admin@example.com"
+  description: "Security assessment of OWASP Juice Shop application to identify and document vulnerabilities. This engagement aims to provide comprehensive vulnerability testing within the defined scope."
+  valid_hours: 24
+
+scope:
+  urls: "http://localhost:3000"
+  cidrs: ""
+  domains: ""
+  excluded_ips: ""
+  restricted_actions: ""
+
+policy:
+  max_iterations: 30
+  max_retries: 3
+  timeout_seconds: 3600
+  cloud_allowed: true

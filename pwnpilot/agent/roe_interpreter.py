@@ -95,10 +95,15 @@ class ROEInterpreter:
         "STOP_SERVICES", "MODIFY_CREDENTIALS", "EXFILTRATE_DATA"
     }
     
-    def __init__(self, litellm_api_key: Optional[str] = None):
-        """Initialize ROE interpreter with optional API key."""
+    def __init__(self, litellm_api_key: Optional[str] = None, model_name: Optional[str] = None, 
+                 api_base_url: Optional[str] = None):
+        """Initialize ROE interpreter with optional API key and model configuration."""
         if not LITELLM_AVAILABLE:
             raise ImportError("litellm package required: pip install litellm")
+        
+        # Use provided configuration or defaults
+        self.model_name = model_name or "openai/Bedrock-Claude-4.5-Sonnet"
+        self.api_base_url = api_base_url or ""
         
         if litellm_api_key:
             litellm.api_key = litellm_api_key
@@ -217,10 +222,11 @@ CRITICAL RULES:
         
         try:
             response = litellm.completion(
-                model=self.LLM_MODEL,
+                model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=self.TEMPERATURE,
                 max_tokens=self.MAX_TOKENS,
+                api_base=self.api_base_url if self.api_base_url else None,
             )
             
             # Extract JSON from response

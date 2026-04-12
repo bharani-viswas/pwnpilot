@@ -266,9 +266,22 @@ def validate_roe_file(roe_dict: dict) -> tuple:
     """
     Validate ROE dictionary against schema.
     
+    Args:
+        roe_dict: Dictionary parsed from YAML (must not be None)
+    
     Returns:
-        (is_valid, error_message)
+        (is_valid: bool, error_message: str or None)
+        
+    Raises:
+        TypeError: If roe_dict is None or not a dict
     """
+    # Defensive check - should never happen with proper CLI validation
+    if roe_dict is None:
+        return False, "FATAL: ROE dictionary is None. This should have been caught during YAML parsing."
+    
+    if not isinstance(roe_dict, dict):
+        return False, f"FATAL: ROE must be a dictionary, got {type(roe_dict).__name__}"
+    
     try:
         ROESchema(**roe_dict)
         return True, None

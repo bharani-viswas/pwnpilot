@@ -28,6 +28,7 @@ from rich.console import Console
 from rich.table import Table
 
 from pwnpilot import __version__
+from pwnpilot.config import load_config
 
 app = typer.Typer(
     name="pwnpilot",
@@ -86,11 +87,31 @@ def cmd_start(
         if not roe_file.exists():
             console.print(f"[red]Error: ROE file not found:[/red] {roe_file}")
             raise typer.Exit(code=1)
+        
+        # Check if file is empty before parsing
+        if roe_file.stat().st_size == 0:
+            console.print(f"[red]Error: ROE file is empty:[/red] {roe_file}")
+            console.print("[yellow]Hint:[/yellow] Create a valid ROE file with required fields (engagement, scope, policy)")
+            raise typer.Exit(code=1)
 
         try:
             # Load and validate ROE file
-            with open(roe_file) as f:
-                roe_yaml = yaml.safe_load(f)
+            try:
+                with open(roe_file) as f:
+                    roe_yaml = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                console.print("[red]Error: Invalid YAML in ROE file[/red]")
+                console.print(f"[yellow]Details:[/yellow] {str(e)}")
+                raise typer.Exit(code=1)
+            except Exception as e:
+                console.print(f"[red]Error reading ROE file: {e}[/red]")
+                raise typer.Exit(code=1)
+            
+            # Explicit None check after YAML parsing
+            if roe_yaml is None:
+                console.print("[red]Error: ROE file contains no valid YAML content[/red]")
+                console.print("[yellow]Hint:[/yellow] File appears to be empty or contains only comments")
+                raise typer.Exit(code=1)
             
             is_valid, error_msg = validate_roe_file(roe_yaml)
             if not is_valid:
@@ -101,8 +122,13 @@ def cmd_start(
             if not roe_dry_run:
                 # Step 1: Interpret ROE with AI
                 console.print("[bold cyan]Step 1: Interpreting ROE policies with AI...[/bold cyan]")
-                interpreter = ROEInterpreter()
-                interpretation_result = interpreter.interpret_roe(roe_yaml)
+                config = load_config(config_file)
+                interpreter = ROEInterpreter(
+                    litellm_api_key=config.llm.api_key,
+                    model_name=config.llm.model_name,
+                    api_base_url=config.llm.api_base_url,
+                )
+                interpretation_result = interpreter.interpret(roe_yaml)
                 
                 if not interpretation_result.is_valid:
                     console.print(f"[red]Policy interpretation failed:[/red] {interpretation_result.error_message}")
