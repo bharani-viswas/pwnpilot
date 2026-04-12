@@ -172,13 +172,20 @@ class LLMRouter:
         """
         Ask the LLM to produce a PlannerProposal dict given *context*.
         The response is parsed as JSON and returned as a dict.
-        Enhanced to leverage findings for intelligent prioritization.
+        Enhanced to leverage findings for intelligent prioritization and tool parameter schemas.
         """
-        system = """You are an intelligent penetration testing orchestrator for automated security assessments.
+        # Extract tool parameter schemas if available
+        tool_schemas = context.get("tool_parameter_schemas", {})
+        schemas_section = ""
+        if tool_schemas:
+            schemas_section = self._format_tool_schemas(tool_schemas)
+        
+        system = f"""You are an intelligent penetration testing orchestrator for automated security assessments.
 
 Your role: Analyze engagement state and decide the NEXT action that provides maximum value.
 
 Decision Logic (Priority Order):
+0. FOLLOW TARGET STRATEGY: If target_strategy_progress.current_step exists, prioritize that step before jumping ahead
 1. VERIFY HIGH-RISK FINDINGS: If unverified high/critical findings exist → attempt verification
 2. DEEPEN EXPLOITATION: If verified vulnerabilities exist → attempt exploitation or post-exploitation
 3. EXPAND DISCOVERY: If few findings → expand reconnaissance to new targets/ranges
@@ -189,6 +196,28 @@ Context Available:
 - findings_count: Total findings, unverified, and verified counts
 - unverified_high_findings: Specific high/critical findings needing verification
 - previous_actions: Last 10 actions (avoid duplicates)
+- available_tools: Runtime-enabled and trusted tool names
+- tools_catalog: Capability metadata for each available tool
+- tool_parameter_schemas: CANONICAL parameter specifications for each tool (SEE BELOW)
+- temporarily_unavailable_tools: tools that recently failed due to runtime availability errors
+- target_strategy: deterministic step sequence and tool mapping for this target family
+- target_strategy_progress: completed steps and current recommended step
+
+TOOL PARAMETER REFERENCE:
+{schemas_section}
+
+CONSTRAINTS:
+- You MUST choose tool_name only from available_tools.
+- You MUST use EXACT parameter names from the schema (not aliases or variations).
+- You MUST respect parameter types: strings vs arrays vs booleans as specified.
+- For enum parameters, ONLY use values listed in the schema's enum field.
+- You MUST prefer tools whose supported_target_types and required_params fit the target and action.
+- If an unavailable or incompatible tool would be ideal, pick the closest available alternative and explain why in rationale.
+- If a tool appears in temporarily_unavailable_tools, do NOT propose it in this iteration.
+- If rejection_reason indicates a missing binary/tool unavailable error, you MUST select a different tool.
+- If target_strategy_progress.current_step exists, prefer a tool from that step's preferred_tools,
+  then fallback_tools only if preferred tools are unavailable.
+- Do not skip endpoint/route discovery steps for web targets unless that step is marked completed.
 
 Strategy Examples:
 - "Found CORS vulnerability" → "Test PUT/DELETE requests to verify exploitability"
@@ -201,19 +230,62 @@ DO NOT:
 - Repeat actions already in previous_actions (check the list)
 - Try the exact same tool twice on the same target
 - Ignore high-severity findings
+- Use parameter names that differ from the canonical schema (e.g., use 'sV' not 'service_detection')
 
 MUST return ONLY valid JSON matching PlannerProposal schema:
-{
+{{
   "action_type": "recon_passive|active_scan|exploit|post_exploit",
   "tool_name": "tool_name",
   "target": "IP or domain or URL",
-  "params": {"key": "value", ...},
+  "params": {{"key": "value", ...}},
   "rationale": "Why this action will advance the engagement",
   "estimated_risk": "low|medium|high|critical"
-}"""
+}}"""
+        
         user = json.dumps(context, default=str)
         raw = self.complete(system, user)
         return self._parse_json(raw, "PlannerProposal")
+
+    def _format_tool_schemas(self, schemas: dict[str, Any]) -> str:
+        """Format tool schemas into a readable reference section."""
+        if not schemas:
+            return "(No tool schemas available)"
+        
+        lines = []
+        for tool_name in sorted(schemas.keys()):
+            tool_schema = schemas[tool_name]
+            lines.append(f"#### {tool_name}")
+            
+            desc = tool_schema.get("description", "")
+            if desc:
+                lines.append(f"{desc}")
+            
+            risk = tool_schema.get("risk_class", "")
+            if risk:
+                lines.append(f"Risk: {risk}")
+            
+            params = tool_schema.get("parameters", {})
+            if params:
+                required = tool_schema.get("required_params", [])
+                lines.append("Parameters:")
+                
+                for param_name, param_doc in sorted(params.items()):
+                    req_marker = "*REQUIRED*" if param_name in required else "optional"
+                    param_type = param_doc.get("type", "unknown")
+                    desc = param_doc.get("description", "")
+                    
+                    lines.append(f"  - `{param_name}` ({param_type}, {req_marker}): {desc}")
+                    
+                    if "enum" in param_doc:
+                        enum_vals = param_doc["enum"]
+                        lines.append(f"    Values: {', '.join(map(str, enum_vals))}")
+                    
+                    if "default" in param_doc:
+                        lines.append(f"    Default: {param_doc['default']}")
+            
+            lines.append("")
+        
+        return "\n".join(lines)
 
     def validate(self, context: dict[str, Any]) -> dict[str, Any]:
         """

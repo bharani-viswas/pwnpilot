@@ -23,6 +23,7 @@ Usage::
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from contextlib import AbstractContextManager
@@ -38,9 +39,13 @@ from langgraph.checkpoint.base import (
     get_checkpoint_metadata,
 )
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langchain_core.runnables import RunnableConfig
 
 log = structlog.get_logger(__name__)
+
+# Suppress LangGraph's msgpack allowlist warnings (configured in serde already)
+logging.getLogger("langgraph.checkpoint.serde.jsonplus").setLevel(logging.ERROR)
 
 # DDL — kept minimal to avoid schema conflicts with rest of the ORM schema
 _DDL = """
@@ -88,7 +93,24 @@ class SqliteCheckpointer(InMemorySaver, AbstractContextManager):
     """
 
     def __init__(self, db_path: Path | str) -> None:
+        # Configure serde with allowed modules BEFORE parent init
+        # This ensures msgpack decoder is created with proper allowlist
+        serde = JsonPlusSerializer().with_msgpack_allowlist(
+            [
+                ("pwnpilot.data.models", "RiskLevel"),
+                ("pwnpilot.data.models", "Engagement"),
+                ("pwnpilot.data.models", "*"),
+            ]
+        )
+        
+        # Store serde before calling super().__init__() so it's available
+        self._custom_serde = serde
+        
         super().__init__()
+        
+        # Override serde on parent with our configured one
+        self.serde = serde
+        
         self._db_path = Path(db_path)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None

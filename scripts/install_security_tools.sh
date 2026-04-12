@@ -36,6 +36,7 @@ APT_PACKAGES=(
   git
   curl
   jq
+  gobuster
   nmap
   nikto
   sqlmap

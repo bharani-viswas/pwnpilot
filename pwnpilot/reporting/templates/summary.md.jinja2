@@ -15,6 +15,16 @@ _No hosts discovered._
 
 ---
 
+## Discovered Services ({{ services | length }})
+
+{% for service in services %}
+- `{{ service.ip }}`:`{{ service.port }}`/{{ service.protocol }}{% if service.service_name %} — {{ service.service_name }}{% endif %}{% if service.product %} ({{ service.product }}{% if service.version %} {{ service.version }}{% endif %}){% endif %}
+{% else %}
+_No services discovered._
+{% endfor %}
+
+---
+
 ## Findings ({{ findings | length }})
 
 {% for f in findings %}

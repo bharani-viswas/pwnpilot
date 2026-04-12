@@ -7,6 +7,7 @@ REQUIRED_CMDS=(
   git
   curl
   jq
+  gobuster
   nmap
   nikto
   sqlmap

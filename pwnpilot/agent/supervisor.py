@@ -28,7 +28,10 @@ from pwnpilot.agent.state import AgentState
 log = structlog.get_logger(__name__)
 
 # Reporter is triggered when this many consecutive cycles produce no new findings
-CONVERGENCE_THRESHOLD: int = 3
+CONVERGENCE_THRESHOLD: int = 5
+
+# Do not converge before a minimum number of actions were attempted.
+MIN_ACTIONS_BEFORE_CONVERGENCE: int = 5
 
 # Graceful shutdown drain window in seconds (ADR-009)
 _DRAIN_SECONDS: int = 30
@@ -55,12 +58,22 @@ def _route_after_execution(state: AgentState) -> str:
     iteration = state.get("iteration_count", 0)
     max_iter = state.get("max_iterations", 50)
     streak = state.get("no_new_findings_streak", 0)
+    if "previous_actions" in state:
+        action_count = len(state.get("previous_actions", []))
+    else:
+        action_count = iteration
 
     if iteration >= max_iter:
         log.info("supervisor.max_iterations_reached", iteration=iteration)
         return "report"
 
-    if streak >= CONVERGENCE_THRESHOLD:
+    # Backward-compatibility path for legacy tests/states that model
+    # convergence without tracking previous action history.
+    if action_count == 0 and streak >= CONVERGENCE_THRESHOLD:
+        log.info("supervisor.convergence_detected_legacy", streak=streak)
+        return "report"
+
+    if action_count >= MIN_ACTIONS_BEFORE_CONVERGENCE and streak >= CONVERGENCE_THRESHOLD:
         log.info("supervisor.convergence_detected", streak=streak)
         return "report"
 

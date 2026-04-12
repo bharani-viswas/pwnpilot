@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -70,6 +71,39 @@ def _url_matches(target: str, scope_urls: list[str]) -> bool:
     """Return True if *target* URL is under any declared scope URL prefix."""
     for prefix in scope_urls:
         if target.startswith(prefix):
+            return True
+    return False
+
+
+def _local_aliases(value: str) -> set[str]:
+    aliases = {value.lower()}
+    if value.lower() in {"localhost", "127.0.0.1", "::1"}:
+        aliases.update({"localhost", "127.0.0.1", "::1"})
+    return aliases
+
+
+def _resolve_identities(value: str) -> set[str]:
+    identities = _local_aliases(value)
+    try:
+        infos = socket.getaddrinfo(value, None)
+    except OSError:
+        return identities
+
+    for info in infos:
+        addr = info[4][0]
+        identities.add(addr.lower())
+        identities.update(_local_aliases(addr))
+    return identities
+
+
+def _scope_url_host_matches(target: str, scope_urls: list[str]) -> bool:
+    host = _normalise_target(target)
+    host_identities = _resolve_identities(host)
+    for scope_url in scope_urls:
+        parsed = urlparse(scope_url)
+        if not parsed.hostname:
+            continue
+        if host_identities & _resolve_identities(parsed.hostname):
             return True
     return False
 
@@ -138,6 +172,11 @@ class EngagementService:
 
         # Normalise bare host for domain / IP checks
         host = _normalise_target(target)
+
+        # Host equivalence with scoped URLs, including localhost/loopback aliases.
+        if scope.scope_urls and _scope_url_host_matches(target, scope.scope_urls):
+            log.debug("scope.in_scope", target=target, match="url_host_equivalence")
+            return True
 
         # IP or CIDR check
         if scope.scope_cidrs and _is_ip_in_cidrs(host, scope.scope_cidrs):

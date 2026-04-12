@@ -97,6 +97,32 @@ llm:
   timeout_seconds: 30
 
 # =============================================================================
+# TOOLS CONFIGURATION — Resource Limits & Plugin Discovery
+# =============================================================================
+tools:
+  # Maximum virtual memory per tool subprocess (MB)
+  # Increase this if tools like Nuclei or WhatWeb run out of memory
+  # Examples:
+  #   512   MB  — minimum, resource-constrained environments
+  #   2048  MB  — default, recommended for most deployments
+  #   4096  MB  — high-performance, for intensive scanning
+  memory_limit_mb: 2048
+  
+  # Maximum CPU time per tool subprocess (seconds)
+  # Default 300s (5 minutes) per tool
+  # Increase if tools are slow or scanning large scopes
+  cpu_limit_seconds: 300
+  
+  # Tool discovery and trust configuration (advanced)
+  # Uncomment to customize behavior
+  
+  # discovery_mode: "package"
+  # Options: package, entrypoints, package_and_entrypoints
+  
+  # trust_mode: "first_party_only"
+  # Options: first_party_only, allow_trusted_third_party, strict_signed_all
+
+# =============================================================================
 # POLICY CONFIGURATION
 # =============================================================================
 policy:
@@ -142,6 +168,11 @@ logging:
   # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
   # Use DEBUG for troubleshooting, INFO for production
   level: "INFO"
+
+  # Stdout log format:
+  #   console -> human-readable key/value logs (recommended for interactive runs)
+  #   json    -> structured JSON on stdout
+  stdout_format: "console"
   
   # Log file path (empty = stdout only)
   # Examples:

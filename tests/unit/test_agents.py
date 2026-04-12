@@ -168,6 +168,79 @@ class TestPlannerNode:
         # After 3 consecutive repeats, kill_switch should be set
         assert state.get("kill_switch") is True
 
+    def test_schema_context_uses_tool_name_key(self):
+        class CaptureLLM:
+            def __init__(self):
+                self.seen_context = None
+
+            def plan(self, context: dict):
+                self.seen_context = context
+                return {
+                    "action_type": "recon_passive",
+                    "tool_name": "nmap",
+                    "target": "10.0.0.1",
+                    "params": {"scan_type": "sV"},
+                    "rationale": "schema-aware planning",
+                    "estimated_risk": "low",
+                }
+
+        llm = CaptureLLM()
+        planner = PlannerNode(
+            llm_router=llm,
+            engagement_summary={"engagement_id": str(uuid4())},
+            available_tools=["nmap"],
+            tools_catalog=[
+                {
+                    "tool_name": "nmap",
+                    "description": "Network mapper",
+                    "risk_class": "active_scan",
+                    "required_params": ["target"],
+                    "parameter_schema": {
+                        "scan_type": {
+                            "type": "string",
+                            "enum": ["sS", "sV"],
+                        }
+                    },
+                }
+            ],
+        )
+
+        result = planner(_base_state())
+        assert result["proposed_action"]["tool_name"] == "nmap"
+        assert llm.seen_context is not None
+        schemas = llm.seen_context.get("tool_parameter_schemas", {})
+        assert "nmap" in schemas
+        assert "scan_type" in schemas["nmap"]["parameters"]
+
+    def test_temporarily_unavailable_tool_is_avoided(self):
+        class RepeatLLM:
+            def plan(self, context: dict):
+                # Intentionally proposes blocked tool; planner should rewrite fallback.
+                return {
+                    "action_type": "active_scan",
+                    "tool_name": "gobuster",
+                    "target": "http://localhost:3000",
+                    "params": {},
+                    "rationale": "try gobuster",
+                    "estimated_risk": "low",
+                }
+
+        planner = PlannerNode(
+            llm_router=RepeatLLM(),
+            engagement_summary={"engagement_id": str(uuid4())},
+            available_tools=["gobuster", "nmap"],
+            tools_catalog=[],
+        )
+
+        state = {
+            **_base_state(),
+            "temporarily_unavailable_tools": {"gobuster": 3},
+        }
+        result = planner(state)
+
+        assert result["proposed_action"]["tool_name"] == "nmap"
+        assert result["temporarily_unavailable_tools"]["gobuster"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Validator node
@@ -210,6 +283,58 @@ class TestValidatorNode:
         result = validator(state)
         # risk_override "low" is a downgrade from "high"; should be overridden to "high"
         assert result["validation_result"]["risk_override"] == "high"
+
+    def test_capability_rejects_unavailable_tool(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["nmap", "nikto"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "nmap",
+                        "supported_target_types": ["ip", "cidr"],
+                        "required_params": ["target"],
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "recon_passive",
+            "tool_name": "gobuster",
+            "target": "10.0.0.1",
+            "rationale": "test",
+            "estimated_risk": "low",
+            "params": {},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "reject"
+        assert "not enabled or trusted" in result["validation_result"]["rationale"]
+
+    def test_capability_rejects_incompatible_target_type(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["nmap"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "nmap",
+                        "supported_target_types": ["ip", "cidr"],
+                        "required_params": ["target"],
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "recon_passive",
+            "tool_name": "nmap",
+            "target": "https://example.com",
+            "rationale": "test",
+            "estimated_risk": "low",
+            "params": {},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "reject"
+        assert "not supported" in result["validation_result"]["rationale"]
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +545,54 @@ class TestExecutorNode:
         result = executor(state)
         assert "Tool execution failed" in result["error"]
 
+    def test_unknown_tool_replans_instead_of_halting(self):
+        executor, runner, eng_id = self._make_executor()
+        runner.execute.side_effect = KeyError("Unknown tool: 'gobuster'")
+        runner.available_tools = ["nmap", "nikto", "nuclei"]
+
+        proposal = self._proposal_dict(eng_id)
+        proposal["tool_name"] = "gobuster"
+        validation = {
+            "verdict": "approve",
+            "risk_override": None,
+            "rejection_reason": None,
+            "rationale": "looks safe",
+        }
+        state = {
+            **_base_state(),
+            "engagement_id": str(eng_id),
+            "proposed_action": proposal,
+            "validation_result": validation,
+        }
+
+        result = executor(state)
+        assert result["error"] is None
+        assert result["validation_result"] is None
+        assert "not available" in result["proposed_action"]["rejection_reason"]
+        assert result["previous_actions"][-1]["error"] == "tool_not_available"
+
+    def test_tool_unavailable_sets_cooldown(self):
+        executor, runner, eng_id = self._make_executor()
+        runner.execute.side_effect = FileNotFoundError("Tool binary not found")
+
+        proposal = self._proposal_dict(eng_id)
+        proposal["tool_name"] = "gobuster"
+        validation = {
+            "verdict": "approve",
+            "risk_override": None,
+            "rejection_reason": None,
+            "rationale": "looks safe",
+        }
+        state = {
+            **_base_state(),
+            "engagement_id": str(eng_id),
+            "proposed_action": proposal,
+            "validation_result": validation,
+        }
+
+        result = executor(state)
+        assert result["temporarily_unavailable_tools"]["gobuster"] >= 3
+
     def test_requires_approval_sets_kill_switch(self):
         """EXPLOIT actions require approval"""
         executor, _, eng_id = self._make_executor()
@@ -467,6 +640,56 @@ class TestExecutorNode:
         }
         result = executor(state)
         assert result["no_new_findings_streak"] == 2
+
+    def test_tool_execution_completion_audit_contains_results(self):
+        from unittest.mock import MagicMock
+
+        executor, runner, eng_id = self._make_executor()
+
+        mock_result = MagicMock()
+        mock_result.exit_code = 0
+        mock_result.duration_ms = 123
+        mock_result.stdout_hash = "stdout-hash"
+        mock_result.stderr_hash = "stderr-hash"
+        mock_result.parser_confidence = 0.91
+        mock_result.error_class = None
+        mock_result.parsed_output = {
+            "new_findings_count": 1,
+            "raw_summary": "scan complete",
+        }
+        mock_result.model_dump.return_value = {
+            "exit_code": 0,
+            "parsed_output": mock_result.parsed_output,
+        }
+        runner.execute.return_value = mock_result
+
+        proposal = self._proposal_dict(eng_id)
+        validation = {
+            "verdict": "approve",
+            "risk_override": None,
+            "rejection_reason": None,
+            "rationale": "looks safe",
+        }
+        state = {
+            **_base_state(),
+            "engagement_id": str(eng_id),
+            "proposed_action": proposal,
+            "validation_result": validation,
+        }
+
+        result = executor(state)
+        assert result["error"] is None
+
+        events = list(executor._audit.events_for_engagement(eng_id))
+        completed = [e for e in events if e.event_type == "ToolExecutionCompleted"]
+        assert completed, "expected ToolExecutionCompleted audit event"
+
+        payload = completed[-1].payload
+        assert payload["exit_code"] == 0
+        assert payload["duration_ms"] == 123
+        assert payload["stdout_hash"] == "stdout-hash"
+        assert payload["stderr_hash"] == "stderr-hash"
+        assert payload["parsed_output"]["raw_summary"] == "scan complete"
 
 
 # ---------------------------------------------------------------------------

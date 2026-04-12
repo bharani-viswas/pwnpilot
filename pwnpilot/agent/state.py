@@ -26,12 +26,17 @@ class AgentState(TypedDict, total=False):
     # Previous actions (list of serialised ActionRequest summaries)
     previous_actions: list[dict[str, Any]]
 
+    # Temporary cooldown map for tools that recently failed due to runtime availability
+    # Key: tool_name, Value: remaining planner iterations to avoid proposing this tool.
+    temporarily_unavailable_tools: dict[str, int]
+
     # Inter-agent messages
     proposed_action: dict[str, Any] | None    # PlannerProposal serialised
     validation_result: dict[str, Any] | None  # ValidationResult serialised
 
     # Execution result
     last_result: dict[str, Any] | None        # ToolExecutionResult serialised
+    last_execution_hints: list[dict[str, Any]]
     evidence_ids: list[str]
 
     # Control flags

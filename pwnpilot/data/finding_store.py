@@ -265,7 +265,7 @@ class FindingStore:
                         f.severity.value if hasattr(f.severity, 'value') else str(f.severity),
                         f.confidence,
                         f.exploitability.value if hasattr(f.exploitability, 'value') else str(f.exploitability),
-                        f.cvss_vector,
+                        None,
                     ),
                     "status": f.status.value if hasattr(f.status, 'value') else str(f.status),
                     "tool_name": f.vuln_ref.split(":")[0] if ":" in f.vuln_ref else "unknown",

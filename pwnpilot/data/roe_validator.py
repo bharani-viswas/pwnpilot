@@ -11,7 +11,7 @@ Validates ROE YAML files against strict templates to prevent:
 import re
 from typing import Union, List, Optional
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator, EmailStr, ValidationError, ConfigDict
+from pydantic import BaseModel, Field, field_validator, EmailStr, ValidationError, ConfigDict, ValidationInfo
 
 
 def _parse_comma_separated_string(value: Union[str, List[str], None]) -> List[str]:
@@ -52,6 +52,11 @@ class EngagementMeta(BaseModel):
 
 class Scope(BaseModel):
     """Scope definition - must be explicit and machine-readable"""
+
+    target_profile: str = Field(
+        default="default",
+        description="Target profile: default, local, or lab"
+    )
     
     # Store as strings (comma-separated), but validate parse-ability and content
     cidrs: str = Field(
@@ -91,14 +96,25 @@ class Scope(BaseModel):
     
     @field_validator('domains', mode='after')
     @classmethod
-    def validate_domains(cls, v):
+    def validate_domains(cls, v, info: ValidationInfo):
         """Validate domains are valid FQDNs"""
         fqdn_pattern = r'^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]{2,}$'
+        target_profile = str(info.data.get('target_profile', 'default')).lower()
         
         items = _parse_comma_separated_string(v)
         for domain in items:
+            if domain.lower() == 'localhost' and target_profile in {'local', 'lab'}:
+                continue
             if not re.match(fqdn_pattern, domain.lower()):
                 raise ValueError(f"Invalid domain '{domain}': must be valid FQDN")
+        return v
+
+    @field_validator('target_profile', mode='after')
+    @classmethod
+    def validate_target_profile(cls, v):
+        allowed = {'default', 'local', 'lab'}
+        if v not in allowed:
+            raise ValueError(f"Invalid target_profile '{v}'. Allowed: {', '.join(sorted(allowed))}")
         return v
     
     @field_validator('urls', mode='after')

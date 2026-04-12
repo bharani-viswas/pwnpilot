@@ -728,6 +728,10 @@ class ToolExecutionResult(BaseModel):
     duration_ms: int
     stdout_hash: str                 # SHA-256
     stderr_hash: str
+    stdout_evidence_id: UUID | None  # immutable raw stdout artifact id
+    stderr_evidence_id: UUID | None
+    stdout_evidence_path: str | None # artifact path for post-run inspection
+    stderr_evidence_path: str | None
     parsed_output: Annotated[dict, AfterValidator(_validate_parsed_output)]
     # ^ validated against the adapter's output_schema at model construction time,
     #   same pattern as ActionRequest.params. Raises ValidationError on mismatch.
@@ -1095,6 +1099,18 @@ Executor node
   └─► tool_runner.execute(ActionRequest) → ToolExecutionResult
 ```
 
+### 19.4.1 Missing Tool/Binary Recovery
+
+If `tool_runner.execute()` fails because a tool is unavailable or its binary is missing:
+
+1. Executor writes `ActionFailed` with full error details.
+2. Executor injects `rejection_reason` into planner state.
+3. Executor marks that tool in `temporarily_unavailable_tools` for 3 planner iterations.
+4. Planner context includes `temporarily_unavailable_tools` and avoids those tools.
+5. Planner selects a different executable tool from runtime-available tools.
+
+Important: the runtime does not auto-install missing binaries during engagement execution. Installation is an explicit operator action.
+
 ### 19.5 LLM Model Assignment per Agent
 
 Each agent can be configured to use a different model, which allows optimising cost vs capability:
@@ -1241,7 +1257,7 @@ On every start, the application:
 - File paths containing absolute engagement data directories (replaced with `<evidence_path>`).
 
 ### 16.5 Log Rotation
-- If writing to a file (`INTRUDER_LOG_FILE`), logs are rotated daily with a 30-day retention by `logging.handlers.TimedRotatingFileHandler`.
+- If writing to a file (`logging.file` in `config.yaml`, or env override `PWNPILOT_LOGGING__FILE`), logs are rotated daily with retention set by `logging.rotation_days`.
 - Default output is stdout; rotation is the responsibility of the process supervisor (e.g., systemd journal).
 
 ---

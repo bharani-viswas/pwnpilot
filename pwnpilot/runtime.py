@@ -12,6 +12,7 @@ Provides the high-level entry points used by the CLI:
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from pwnpilot.agent.state import AgentState
 from pwnpilot.agent.supervisor import Supervisor, build_graph
 from pwnpilot.agent.validator import ValidatorNode
 from pwnpilot.control.approval import ApprovalService
+from pwnpilot.control.target_strategy import build_engagement_strategy
 from pwnpilot.data.approval_store import ApprovalStore
 from pwnpilot.control.engagement import EngagementService
 from pwnpilot.control.llm_router import LLMRouter
@@ -44,21 +46,19 @@ from pwnpilot.data.recon_store import ReconStore
 from pwnpilot.governance.authorization import AuthorizationArtifact, assert_authorized
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.governance.simulation import SimulationEngine
-from pwnpilot.plugins.adapters.nmap import NmapAdapter
-from pwnpilot.plugins.adapters.nikto import NiktoAdapter
-from pwnpilot.plugins.adapters.nuclei import NucleiAdapter
-from pwnpilot.plugins.adapters.searchsploit import SearchsploitAdapter
-from pwnpilot.plugins.adapters.sqlmap import SqlmapAdapter
-from pwnpilot.plugins.adapters.whatweb import WhatWebAdapter
-from pwnpilot.plugins.adapters.whois import WhoisAdapter
-from pwnpilot.plugins.adapters.dns import DnsAdapter
-from pwnpilot.plugins.adapters.zap import ZapAdapter
-from pwnpilot.plugins.adapters.cve_enrich import CveEnrichAdapter
+from pwnpilot.plugins.loader import PluginLoader
+from pwnpilot.plugins.binaries import candidate_binaries, resolve_binary_for_tool
+from pwnpilot.plugins.policy import PluginTrustPolicy
 from pwnpilot.plugins.runner import ToolRunner
+from pwnpilot.plugins.registry import ToolRegistry
+from pwnpilot.observability.logging_setup import configure_logging_from_config
 from pwnpilot.reporting.generator import ReportGenerator
 from pwnpilot.secrets.redactor import Redactor
 
 log = structlog.get_logger(__name__)
+
+_REGISTRY_CACHE_LOCK = threading.Lock()
+_REGISTRY_CACHE: dict[tuple[str, str, str, str, str, tuple[str, ...], tuple[str, ...]], ToolRegistry] = {}
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -84,6 +84,107 @@ def _load_config(config_path: Path | None = None) -> dict[str, Any]:
 def _load_typed_config(config_path: Path | None = None) -> PwnpilotConfig:
     """Return a validated PwnpilotConfig (hard-fails on invalid config)."""
     return _pydantic_load_config(config_path)
+
+
+def invalidate_tool_registry_cache() -> None:
+    with _REGISTRY_CACHE_LOCK:
+        _REGISTRY_CACHE.clear()
+
+
+def _build_tool_registry_from_typed_config(typed_cfg: PwnpilotConfig) -> ToolRegistry:
+    tools_cfg = getattr(typed_cfg, "tools", None)
+    trust_mode = str(getattr(tools_cfg, "trust_mode", "first_party_only"))
+    allow_unsigned_first_party = bool(getattr(tools_cfg, "allow_unsigned_first_party", True))
+    plugin_package = str(getattr(tools_cfg, "plugin_package", "pwnpilot.plugins.adapters"))
+    entrypoint_group = str(getattr(tools_cfg, "entrypoint_group", "pwnpilot.plugins"))
+    discovery_mode = str(getattr(tools_cfg, "discovery_mode", "package"))
+
+    enabled_tools_raw = getattr(tools_cfg, "enabled_tools", []) if tools_cfg else []
+    disabled_tools_raw = getattr(tools_cfg, "disabled_tools", []) if tools_cfg else []
+    enabled_tools = enabled_tools_raw if isinstance(enabled_tools_raw, list) else []
+    disabled_tools = disabled_tools_raw if isinstance(disabled_tools_raw, list) else []
+
+    cache_key = (
+        trust_mode,
+        str(allow_unsigned_first_party),
+        plugin_package,
+        entrypoint_group,
+        discovery_mode,
+        tuple(sorted(enabled_tools)),
+        tuple(sorted(disabled_tools)),
+    )
+    with _REGISTRY_CACHE_LOCK:
+        cached = _REGISTRY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    trust_policy = PluginTrustPolicy(
+        mode=trust_mode,
+        allow_unsigned_first_party=allow_unsigned_first_party,
+    )
+    loader = PluginLoader(
+        trust_policy=trust_policy,
+        package_name=plugin_package,
+        entrypoint_group=entrypoint_group,
+        discovery_mode=discovery_mode,
+    )
+    registry = loader.load_registry(
+        enabled_tools=enabled_tools,
+        disabled_tools=disabled_tools,
+    )
+    with _REGISTRY_CACHE_LOCK:
+        _REGISTRY_CACHE[cache_key] = registry
+    return registry
+
+
+def _emit_plugin_load_audit(audit_store: AuditStore, tool_registry: ToolRegistry) -> None:
+    system_engagement_id = UUID(int=0)
+    for tool_name, desc in tool_registry.tools.items():
+        payload = {
+            "tool_name": tool_name,
+            "enabled": desc.enabled,
+            "enablement_source": desc.enablement_source,
+            "source": desc.source,
+            "risk_class": desc.risk_class,
+            "binary_name": desc.binary_name,
+            "trust_status": desc.trust_status,
+            "trust_reason": desc.trust_reason,
+            "manifest_version": desc.manifest_version,
+            "manifest_schema_version": desc.manifest_schema_version,
+            "load_error": desc.load_error,
+            "loaded_at": desc.loaded_at,
+            "verified_at": desc.verified_at,
+        }
+        try:
+            audit_store.append(
+                engagement_id=system_engagement_id,
+                actor="system",
+                event_type="PluginLoad",
+                payload=payload,
+            )
+        except Exception as exc:
+            log.warning("runtime.plugin_audit_failed", tool=tool_name, exc=str(exc))
+
+
+def _compute_executable_tool_names(tool_registry: ToolRegistry) -> list[str]:
+    """Return tools that are both enabled and executable in the current environment."""
+    executable: list[str] = []
+    for tool_name, desc in tool_registry.enabled_tools.items():
+        binary = (desc.binary_name or "").strip()
+        if not binary:
+            executable.append(tool_name)
+            continue
+        if resolve_binary_for_tool(tool_name, binary):
+            executable.append(tool_name)
+    return sorted(executable)
+
+
+def _filter_tools_catalog(
+    tools_catalog: list[dict[str, Any]],
+    allowed_tools: list[str],
+) -> list[dict[str, Any]]:
+    allowed = set(allowed_tools)
+    return [t for t in tools_catalog if t.get("tool_name") in allowed]
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +236,10 @@ def _build_runtime(
     """Build and return all runtime components."""
     cfg = _load_config(config_path)
     typed_cfg = _load_typed_config(config_path)
+
+    # Configure process-wide structured logging from runtime config.
+    configure_logging_from_config(getattr(typed_cfg, "logging", None))
+
     session = get_db_session(config_path)
 
     evidence_dir = Path(
@@ -147,6 +252,8 @@ def _build_runtime(
     evidence_store = EvidenceStore(base_dir=evidence_dir, session=session)
     recon_store = ReconStore(session)
     finding_store = FindingStore(session)
+    from pwnpilot.data.permission_store import PermissionStore
+    permission_store = PermissionStore(session)
 
     # Governance — kill switch wired to audit store for KillSwitchTriggered events
     def _kill_switch_audit(reason: str) -> None:
@@ -162,25 +269,63 @@ def _build_runtime(
 
     kill_switch = KillSwitch(audit_fn=_kill_switch_audit)
 
-    # Adapters
-    adapters = {
-        "nmap": NmapAdapter(),
-        "nikto": NiktoAdapter(),
-        "nuclei": NucleiAdapter(),
-        "searchsploit": SearchsploitAdapter(),
-        "sqlmap": SqlmapAdapter(),
-        "whatweb": WhatWebAdapter(),
-        "whois": WhoisAdapter(),
-        "dns": DnsAdapter(),
-        "zap": ZapAdapter(),
-        "cve_enrich": CveEnrichAdapter(),
-    }
+    # Registry-driven plugin loading
+    tool_registry = _build_tool_registry_from_typed_config(typed_cfg)
+    adapters = tool_registry.adapters_for_runner()
 
-    # Tool runner
+    _emit_plugin_load_audit(audit_store, tool_registry)
+
+    if not adapters:
+        log.warning("runtime.no_tools_loaded", reason="No enabled tools were loaded from registry")
+        if bool(getattr(getattr(typed_cfg, "tools", None), "static_fallback_when_empty", False)):
+            from pwnpilot.plugins.adapters.cve_enrich import CveEnrichAdapter
+            from pwnpilot.plugins.adapters.dns import DnsAdapter
+            from pwnpilot.plugins.adapters.gobuster import GobusterAdapter
+            from pwnpilot.plugins.adapters.nikto import NiktoAdapter
+            from pwnpilot.plugins.adapters.nmap import NmapAdapter
+            from pwnpilot.plugins.adapters.nuclei import NucleiAdapter
+            from pwnpilot.plugins.adapters.searchsploit import SearchsploitAdapter
+            from pwnpilot.plugins.adapters.shell import ShellAdapter
+            from pwnpilot.plugins.adapters.sqlmap import SqlmapAdapter
+            from pwnpilot.plugins.adapters.whatweb import WhatWebAdapter
+            from pwnpilot.plugins.adapters.whois import WhoisAdapter
+            from pwnpilot.plugins.adapters.zap import ZapAdapter
+
+            adapters = {
+                "nmap": NmapAdapter(),
+                "nikto": NiktoAdapter(),
+                "nuclei": NucleiAdapter(),
+                "searchsploit": SearchsploitAdapter(),
+                "shell": ShellAdapter(),  # Shell adapter without permission context (permissions granted via approval flow)
+                "sqlmap": SqlmapAdapter(),
+                "whatweb": WhatWebAdapter(),
+                "whois": WhoisAdapter(),
+                "dns": DnsAdapter(),
+                "gobuster": GobusterAdapter(),
+                "zap": ZapAdapter(),
+                "cve_enrich": CveEnrichAdapter(),
+            }
+            log.warning("runtime.static_fallback_enabled", tools=sorted(adapters.keys()))
+
+    # Tool runner — pass memory/CPU limits from config
+    tools_cfg = getattr(typed_cfg, "tools", None)
+    mem_limit_mb = int(getattr(tools_cfg, "memory_limit_mb", 2048)) if tools_cfg else 2048
+    cpu_limit_sec = int(getattr(tools_cfg, "cpu_limit_seconds", 300)) if tools_cfg else 300
+    
     tool_runner = ToolRunner(
         adapters=adapters,
         evidence_store=evidence_store,
         kill_switch=kill_switch,
+        mem_limit=mem_limit_mb * 1024 * 1024,  # Convert MB to bytes
+        cpu_limit=cpu_limit_sec,
+    )
+
+    planner_available_tools = _compute_executable_tool_names(tool_registry)
+    if not planner_available_tools:
+        planner_available_tools = tool_runner.available_tools
+    planner_tools_catalog = _filter_tools_catalog(
+        tool_registry.planner_context().get("tools_catalog", []),
+        planner_available_tools,
     )
 
     # LLM router — unified multi-provider support via LiteLLM
@@ -219,9 +364,13 @@ def _build_runtime(
         "evidence_store": evidence_store,
         "recon_store": recon_store,
         "finding_store": finding_store,
+        "permission_store": permission_store,
         "kill_switch": kill_switch,
         "adapters": adapters,
+        "tool_registry": tool_registry,
         "tool_runner": tool_runner,
+        "planner_available_tools": planner_available_tools,
+        "planner_tools_catalog": planner_tools_catalog,
         "llm_router": llm_router,
         "approval_service": approval_service,
         "report_generator": report_generator,
@@ -279,6 +428,12 @@ def create_and_run_engagement(
         "scope_cidrs": scope_cidrs,
         "scope_domains": scope_domains,
         "scope_urls": scope_urls,
+        "strategy_plan": build_engagement_strategy(
+            scope_cidrs=scope_cidrs,
+            scope_domains=scope_domains,
+            scope_urls=scope_urls,
+            available_tools=rt["planner_available_tools"],
+        ),
     }
 
     planner = PlannerNode(
@@ -286,10 +441,16 @@ def create_and_run_engagement(
         engagement_summary=engagement_summary,
         audit_store=rt["audit_store"],
         finding_store=rt["finding_store"],
+        available_tools=rt["planner_available_tools"],
+        tools_catalog=rt["planner_tools_catalog"],
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
-        policy_context={"gates": "recon_passive:allow,active_scan:allow,exploit:requires_approval"},
+        policy_context={
+            "gates": "recon_passive:allow,active_scan:allow,exploit:requires_approval",
+            "available_tools": rt["planner_available_tools"],
+            "tools_catalog": rt["planner_tools_catalog"],
+        },
         audit_store=rt["audit_store"],
     )
     executor = ExecutorNode(
@@ -299,6 +460,7 @@ def create_and_run_engagement(
         audit_store=rt["audit_store"],
         finding_store=rt["finding_store"],
         recon_store=rt["recon_store"],
+        planner_available_tools=rt["planner_available_tools"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -330,6 +492,7 @@ def create_and_run_engagement(
         "no_new_findings_streak": 0,
         "recon_summary": {},
         "previous_actions": [],
+        "temporarily_unavailable_tools": {},
         "proposed_action": None,
         "validation_result": None,
         "last_result": None,
@@ -352,6 +515,22 @@ def create_and_run_engagement(
         log.error("runtime.engagement_error", error=final_state["error"])
 
     return str(engagement.engagement_id)
+
+
+def get_engagement_preflight(
+    scope_cidrs: list[str],
+    scope_domains: list[str],
+    scope_urls: list[str],
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return deterministic target strategy and tool availability for a scope."""
+    rt = _build_runtime(config_path)
+    return build_engagement_strategy(
+        scope_cidrs=scope_cidrs,
+        scope_domains=scope_domains,
+        scope_urls=scope_urls,
+        available_tools=rt["planner_available_tools"],
+    )
 
 
 def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> str:
@@ -414,13 +593,26 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
 
     planner = PlannerNode(
         llm_router=rt["llm_router"],
-        engagement_summary={"engagement_id": thread_id},
+        engagement_summary={
+            "engagement_id": thread_id,
+            "strategy_plan": build_engagement_strategy(
+                scope_cidrs=[],
+                scope_domains=[],
+                scope_urls=[],
+                available_tools=rt["planner_available_tools"],
+            ),
+        },
         audit_store=rt["audit_store"],
         finding_store=rt["finding_store"],
+        available_tools=rt["planner_available_tools"],
+        tools_catalog=rt["planner_tools_catalog"],
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
-        policy_context={},
+        policy_context={
+            "available_tools": rt["planner_available_tools"],
+            "tools_catalog": rt["planner_tools_catalog"],
+        },
         audit_store=rt["audit_store"],
     )
     executor = ExecutorNode(
@@ -430,6 +622,7 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         audit_store=rt["audit_store"],
         finding_store=rt["finding_store"],
         recon_store=rt["recon_store"],
+        planner_available_tools=rt["planner_available_tools"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,6 +670,11 @@ def get_audit_store(config_path: Path | None = None) -> AuditStore:
     return rt["audit_store"]
 
 
+def get_tool_registry(config_path: Path | None = None) -> ToolRegistry:
+    typed_cfg = _load_typed_config(config_path)
+    return _build_tool_registry_from_typed_config(typed_cfg)
+
+
 def run_startup_checks(config_path: Path | None = None) -> list[str]:
     """
     Run preflight validation checks and return a list of warning/error strings.
@@ -490,14 +688,14 @@ def run_startup_checks(config_path: Path | None = None) -> list[str]:
 
     Returns a list of human-readable issue strings (empty list = all checks passed).
     """
-    import shutil
     import subprocess  # noqa: S404 — fixed, trusted args only
 
     issues: list[str] = []
 
     # 1. Config validation
+    typed_cfg: PwnpilotConfig | None = None
     try:
-        _load_typed_config(config_path)
+        typed_cfg = _load_typed_config(config_path)
     except Exception as exc:
         issues.append(f"CONFIG: validation failed — {exc}")
 
@@ -540,15 +738,23 @@ def run_startup_checks(config_path: Path | None = None) -> list[str]:
             "(run 'pwnpilot keys --generate' to create one)"
         )
 
-    # 5. Plugin binary availability
-    _tool_binaries = {
-        "nmap": "nmap",
-        "nikto": "nikto",
-        "nuclei": "nuclei",
-        "whois": "whois",
-        "dns (dig)": "dig",
-    }
-    missing = [name for name, binary in _tool_binaries.items() if not shutil.which(binary)]
+    # 5. Plugin binary availability (derived from registry)
+    tool_binaries: dict[str, str] = {}
+    if typed_cfg is not None:
+        try:
+            registry = _build_tool_registry_from_typed_config(typed_cfg)
+            tool_binaries = registry.binary_requirements()
+        except Exception as exc:
+            issues.append(f"TOOLS: registry build failed — {exc}")
+
+    missing: list[str] = []
+    for name, binary in tool_binaries.items():
+        if not binary:
+            continue
+        if resolve_binary_for_tool(name, binary):
+            continue
+        candidates = candidate_binaries(name, binary)
+        missing.append(f"{name} (tried: {', '.join(candidates)})")
     if missing:
         issues.append(f"TOOLS: binaries not on PATH: {', '.join(missing)}")
 

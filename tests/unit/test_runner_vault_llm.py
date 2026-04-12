@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from pwnpilot.data.evidence_store import EvidenceStore
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.plugins.adapters.nmap import NmapAdapter
+from pwnpilot.plugins.adapters.shell import ShellAdapter
 from pwnpilot.plugins.runner import HaltedError, ToolRunner
 from pwnpilot.data.models import ActionRequest, ActionType, RiskLevel
 
@@ -94,6 +95,10 @@ class TestToolRunner:
         assert result.tool_name == "nmap"
         assert result.error_class is None
         assert result.parser_confidence > 0.5
+        assert result.stdout_evidence_id is not None
+        assert result.stderr_evidence_id is not None
+        assert result.stdout_evidence_path
+        assert result.stderr_evidence_path
 
     def test_string_command_raises_value_error(self, tmp_path):
         runner, _ = self._make_runner(tmp_path)
@@ -442,3 +447,58 @@ class TestToolRunnerErrorPaths:
 
         from pwnpilot.data.models import ErrorClass
         assert result.error_class == ErrorClass.PARSE_ERROR
+
+    def test_shell_adapter_executes_through_runner(self, tmp_path):
+        session = _session()
+        evidence_store = EvidenceStore(base_dir=tmp_path / "ev2", session=session)
+        runner = ToolRunner(
+            adapters={"shell": ShellAdapter()},
+            evidence_store=evidence_store,
+            kill_switch=KillSwitch(),
+        )
+        action = ActionRequest(
+            engagement_id=uuid4(),
+            action_type=ActionType.RECON_PASSIVE,
+            tool_name="shell",
+            params={"target": "localhost", "command": "whoami", "args": []},
+            risk_level=RiskLevel.LOW,
+        )
+
+        with mock.patch.object(runner, "_run_subprocess", return_value=(b"tester\n", b"", 0, False)):
+            result = runner.execute(action)
+
+        assert result.tool_name == "shell"
+        assert result.exit_code == 0
+        assert result.error_class is None
+
+    def test_shell_adapter_unsafe_mode_with_permission(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PWNPILOT_SHELL_ALLOW_UNSAFE", "1")
+        monkeypatch.setenv("PWNPILOT_SHELL_PERMISSION_TOKEN", "permit-123")
+
+        session = _session()
+        evidence_store = EvidenceStore(base_dir=tmp_path / "ev3", session=session)
+        runner = ToolRunner(
+            adapters={"shell": ShellAdapter()},
+            evidence_store=evidence_store,
+            kill_switch=KillSwitch(),
+        )
+        action = ActionRequest(
+            engagement_id=uuid4(),
+            action_type=ActionType.RECON_PASSIVE,
+            tool_name="shell",
+            params={
+                "target": "localhost",
+                "command": "python3",
+                "args": ["-V"],
+                "unsafe": True,
+                "permission_token": "permit-123",
+            },
+            risk_level=RiskLevel.LOW,
+        )
+
+        with mock.patch.object(runner, "_run_subprocess", return_value=(b"Python 3.11\n", b"", 0, False)):
+            result = runner.execute(action)
+
+        assert result.tool_name == "shell"
+        assert result.exit_code == 0
+        assert result.error_class is None

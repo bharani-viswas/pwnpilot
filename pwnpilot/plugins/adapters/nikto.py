@@ -5,16 +5,15 @@ Risk class: active_scan
 Input:  target host or URL, port, ssl, maxtime, tuning class
 Output: list of findings with OSVDB/CVE references
 
-Attempts to parse JSON output from ``nikto -Format json -output /dev/stdout``.
-Falls back to text-line parsing (lines starting with '+') for older Nikto builds
-that do not support JSON-to-stdout.
+Parses text output from Nikto (lines starting with '+').
+Note: Nikto 2.1.5 does not support -Format json; uses native stderr text output.
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
+from pwnpilot.plugins.parsers.contracts import normalize_execution_hint
 from pwnpilot.plugins.sdk import BaseAdapter, ParsedOutput, PluginManifest, ToolParams
 
 # Allow hostnames, IPs, and http(s) URLs — reject shell-special chars
@@ -31,8 +30,7 @@ class NiktoAdapter(BaseAdapter):
     """
     Adapter for Nikto web server scanner.
 
-    Uses ``-Format json -output /dev/stdout`` for structured output.
-    Falls back to text parsing when JSON is unavailable.
+    Uses native Nikto text output and deterministic local parsing.
     """
 
     _MANIFEST = PluginManifest(
@@ -114,14 +112,15 @@ class NiktoAdapter(BaseAdapter):
         )
 
     def build_command(self, params: ToolParams) -> list[str]:
-        """Build nikto command list — no shell interpolation (ADR-002)."""
+        """Build nikto command list — no shell interpolation (ADR-002).
+        
+        Note: Nikto 2.1.5 does not support -Format json; use text output (stderr).
+        """
         cmd = [
             "nikto",
             "-host", params.target,
             "-port", str(params.extra["port"]),
             "-maxtime", str(params.extra["maxtime"]),
-            "-Format", "json",
-            "-output", "/dev/stdout",
             "-nointeractive",
         ]
         if params.extra.get("ssl"):
@@ -132,6 +131,11 @@ class NiktoAdapter(BaseAdapter):
         return cmd
 
     def parse(self, stdout: bytes, stderr: bytes, exit_code: int) -> ParsedOutput:
+        """Parse Nikto text output from both stdout and stderr.
+
+        Nikto versions differ in where they emit output, so parse the combined
+        stream and classify lines deterministically.
+        """
         if not stdout and not stderr:
             return ParsedOutput(
                 parser_error="nikto produced no output",
@@ -139,59 +143,94 @@ class NiktoAdapter(BaseAdapter):
             )
 
         findings: list[dict[str, Any]] = []
-        raw = stdout.decode(errors="replace").strip()
+        execution_hints: list[dict[str, Any]] = []
 
-        # --- Attempt JSON parse (nikto -Format json) ---
-        try:
-            data = json.loads(raw)
-            for vuln in data.get("vulnerabilities", []):
-                osvdb = str(vuln.get("OSVDB", "0"))
-                ref = f"OSVDB-{osvdb}" if osvdb and osvdb != "0" else "nikto-finding"
-                findings.append(
-                    {
-                        "title": vuln.get("msg", ""),
-                        "url": vuln.get("url", ""),
-                        "method": vuln.get("method", "GET"),
-                        "osvdb": osvdb,
-                        "vuln_ref": ref,
-                        "severity": "medium",
-                    }
-                )
-            return ParsedOutput(
-                findings=findings,
-                new_findings_count=len(findings),
-                confidence=0.85 if findings else 0.6,
-                raw_summary=f"Nikto JSON scan: {len(findings)} finding(s)",
-            )
-        except (json.JSONDecodeError, KeyError):
-            pass
+        combined_text = "\n".join(
+            part for part in [stdout.decode(errors="replace"), stderr.decode(errors="replace")] if part
+        )
 
-        # --- Fallback: text output (lines starting with '+') ---
-        for line in (stdout + stderr).decode(errors="replace").splitlines():
+        for line in combined_text.splitlines():
             line = line.strip()
             if not line.startswith("+"):
                 continue
-            osvdb_match = _OSVDB_RE.search(line)
+
+            message = line.lstrip("+ ")
+            lower_message = message.lower()
+
+            # Detect tool errors as execution hints, not vulnerabilities
+            if "invalid output format" in lower_message:
+                execution_hints.append(
+                    normalize_execution_hint(
+                        code="output_format_invalid",
+                        message=message,
+                        severity="warning",
+                        recommended_action="Nikto does not support the requested output format; use native text parsing.",
+                    )
+                )
+                continue
+
+            if "error" in lower_message:
+                execution_hints.append(
+                    normalize_execution_hint(
+                        code="execution_error",
+                        message=message,
+                        severity="warning",
+                        recommended_action="Review nikto execution; tool may not have completed successfully.",
+                    )
+                )
+                continue
+
+            # Skip informational banner/progress lines to reduce noise.
+            if lower_message.startswith((
+                "target ip:",
+                "target hostname:",
+                "target port:",
+                "start time:",
+                "end time:",
+                "server:",
+                "no banner retrieved",
+                "no cgi directories found",
+            )):
+                continue
+
+            # Extract OSVDB reference and build finding
+            osvdb_match = _OSVDB_RE.search(message)
             ref = (
                 f"OSVDB-{osvdb_match.group(1)}" if osvdb_match else "nikto-finding"
             )
+
+            if not any(
+                marker in lower_message
+                for marker in (
+                    "osvdb-",
+                    "might be interesting",
+                    "contains",
+                    "header",
+                    "robots.txt",
+                    "file/dir",
+                    "returned a non-forbidden",
+                )
+            ):
+                continue
+
             findings.append(
                 {
-                    "title": line.lstrip("+ "),
+                    "title": message,
                     "vuln_ref": ref,
                     "severity": "medium",
                 }
             )
 
-        if not findings:
+        if not findings and not execution_hints:
             return ParsedOutput(
-                parser_error="nikto: no parseable findings in output",
-                confidence=0.3,
+                parser_error="nikto: no parseable findings or diagnostics in output",
+                confidence=0.2,
             )
 
         return ParsedOutput(
             findings=findings,
+            execution_hints=execution_hints,
             new_findings_count=len(findings),
-            confidence=0.7,
-            raw_summary=f"Nikto text parse: {len(findings)} finding(s)",
+            confidence=0.7 if findings else 0.5,
+            raw_summary=f"Nikto: {len(findings)} finding(s), {len(execution_hints)} hint(s)",
         )

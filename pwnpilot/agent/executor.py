@@ -16,6 +16,7 @@ import hashlib
 import json
 import time
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import structlog
@@ -31,12 +32,30 @@ from pwnpilot.data.models import (
     RiskLevel,
     ValidationResult,
 )
+from pwnpilot.plugins.parsers.contracts import (
+    canonicalize_finding,
+    infer_host_from_service,
+    infer_service_port,
+)
 
 log = structlog.get_logger(__name__)
 
 
 # Severity order from highest to lowest
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+
+
+def _service_host_fields(service: dict[str, Any], fallback_target: str) -> tuple[str, str | None]:
+    host = infer_host_from_service(service)
+    if host:
+        return str(host.get("ip_address") or ""), host.get("hostname")
+
+    parsed = urlparse(str(service.get("url") or fallback_target))
+    hostname = parsed.hostname or None
+    ip_address = hostname if hostname and hostname.replace(".", "").isdigit() else ""
+    if hostname == "localhost" and not ip_address:
+        ip_address = "127.0.0.1"
+    return ip_address, hostname
 
 
 def _normalize_params(params: dict[str, Any], tool_name: str) -> dict[str, Any]:
@@ -98,6 +117,7 @@ class ExecutorNode:
         audit_store: Any,
         finding_store: Any = None,
         recon_store: Any = None,
+        planner_available_tools: list[str] | None = None,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
@@ -105,6 +125,7 @@ class ExecutorNode:
         self._audit = audit_store
         self._finding_store = finding_store
         self._recon_store = recon_store
+        self._planner_available_tools = planner_available_tools or []
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -190,15 +211,169 @@ class ExecutorNode:
             # Halt the loop until the operator resolves the ticket
             return {**state, "kill_switch": True, "error": None}
 
+        self._audit_event(
+            state,
+            "ToolExecutionStarted",
+            {
+                "action_id": str(action.action_id),
+                "tool": action.tool_name,
+                "action_type": action.action_type.value,
+                "target": proposal.target,
+                "params": action.params,
+                "risk_level": (
+                    action.risk_level.value
+                    if hasattr(action.risk_level, "value")
+                    else str(action.risk_level)
+                ),
+            },
+        )
+
         # Execute tool
         try:
             result = self._runner.execute(action)
+        except (KeyError, FileNotFoundError) as exc:
+            available = list(self._planner_available_tools)
+            if not available and hasattr(self._runner, "available_tools"):
+                try:
+                    available = list(self._runner.available_tools)
+                except Exception:
+                    available = []
+
+            log.warning("executor.tool_unavailable", exc=str(exc), tool=action.tool_name)
+            self._audit_event(
+                state,
+                "ActionFailed",
+                {
+                    "action_id": str(action.action_id),
+                    "tool": action.tool_name,
+                    "target": proposal.target,
+                    "params": action.params,
+                    "error": str(exc),
+                },
+            )
+
+            updated_prev = list(state.get("previous_actions", []))
+            updated_prev.append(
+                {
+                    "action_id": str(action.action_id),
+                    "tool_name": action.tool_name,
+                    "action_type": action.action_type.value,
+                    "target": proposal.target,
+                    "error": "tool_not_available",
+                }
+            )
+
+            cooldowns = dict(state.get("temporarily_unavailable_tools", {}))
+            cooldowns[action.tool_name] = max(int(cooldowns.get(action.tool_name, 0)), 3)
+
+            updated_proposal = proposal_dict.copy()
+            updated_proposal["rejection_reason"] = (
+                f"Tool '{action.tool_name}' is not available on this system. "
+                f"Choose from available tools: {available}"
+            )
+
+            return {
+                **state,
+                "proposed_action": updated_proposal,
+                "validation_result": None,
+                "previous_actions": updated_prev,
+                "temporarily_unavailable_tools": cooldowns,
+                "error": None,
+            }
+        except ValueError as exc:
+            # Adapter parameter validation error - check if it's a permission request
+            error_msg = str(exc)
+            
+            # Special handling for shell command permission requests
+            if action.tool_name == "shell" and "not allow-listed" in error_msg.lower():
+                # Extract the command from error message or params
+                command = action.params.get("command", "unknown")
+                
+                log.info(
+                    "executor.permission_required",
+                    tool="shell",
+                    command=command,
+                )
+                
+                # Create approval ticket for permission to use this command
+                ticket = self._approval.create_ticket(
+                    action,
+                    rationale=f"Request to use shell command '{command}' which is not in default allow-list. "
+                              f"Operator permission required to proceed."
+                )
+                
+                log.info(
+                    "executor.permission_ticket_created",
+                    ticket_id=str(ticket.ticket_id),
+                    command=command,
+                )
+                
+                self._audit_event(
+                    state,
+                    "PermissionRequested",
+                    {
+                        "ticket_id": str(ticket.ticket_id),
+                        "action_id": str(action.action_id),
+                        "resource_type": "shell_command",
+                        "resource_identifier": command,
+                        "error": error_msg,
+                    },
+                )
+                
+                # Halt and await operator decision
+                return {**state, "kill_switch": True, "error": None}
+            
+            # Generic parameter validation error - ask planner to retry
+            log.warning("executor.param_validation_error", exc=error_msg, tool=action.tool_name)
+            self._audit_event(
+                state,
+                "ActionFailed",
+                {
+                    "action_id": str(action.action_id),
+                    "tool": action.tool_name,
+                    "target": proposal.target,
+                    "params": action.params,
+                    "error": "param_validation_failed",
+                    "details": error_msg,
+                },
+            )
+
+            updated_prev = list(state.get("previous_actions", []))
+            updated_prev.append(
+                {
+                    "action_id": str(action.action_id),
+                    "tool_name": action.tool_name,
+                    "action_type": action.action_type.value,
+                    "target": proposal.target,
+                    "error": "param_validation_failed",
+                }
+            )
+
+            updated_proposal = proposal_dict.copy()
+            updated_proposal["rejection_reason"] = (
+                f"Parameter validation failed for {action.tool_name}: {error_msg}. "
+                f"Please try different parameters."
+            )
+
+            return {
+                **state,
+                "proposed_action": updated_proposal,
+                "validation_result": None,
+                "previous_actions": updated_prev,
+                "error": None,
+            }
         except Exception as exc:
             log.error("executor.tool_error", exc=str(exc), tool=action.tool_name)
             self._audit_event(
                 state,
                 "ActionFailed",
-                {"action_id": str(action.action_id), "error": str(exc)},
+                {
+                    "action_id": str(action.action_id),
+                    "tool": action.tool_name,
+                    "target": proposal.target,
+                    "params": action.params,
+                    "error": str(exc),
+                },
             )
             return {**state, "error": f"Tool execution failed: {exc}"}
 
@@ -206,6 +381,7 @@ class ExecutorNode:
         new_evidence = result.parsed_output.get("new_findings_count", 0)
         streak = state.get("no_new_findings_streak", 0)
         streak = 0 if new_evidence > 0 else streak + 1
+        execution_hints = list(result.parsed_output.get("execution_hints", []))
 
         # Store findings and hosts from tool output (NEW: Feedback loop)
         if self._finding_store and self._recon_store:
@@ -213,8 +389,13 @@ class ExecutorNode:
                 # Extract and store findings
                 findings_list = result.parsed_output.get("findings", [])
                 for finding in findings_list:
+                    normalized = canonicalize_finding(
+                        finding,
+                        action.tool_name,
+                        proposal.target,
+                    )
                     # Convert severity string to enum
-                    severity_str = finding.get("severity", "medium").lower()
+                    severity_str = normalized.get("severity", "medium").lower()
                     try:
                         severity_enum = {
                             "info": RiskLevel.LOW,
@@ -238,29 +419,38 @@ class ExecutorNode:
                     
                     self._finding_store.upsert(
                         engagement_id=engagement_id,
-                        asset_ref=finding.get("target", proposal.target),
-                        title=finding.get("description", ""),
-                        vuln_ref=f"{action.tool_name}:{finding.get('type', 'unknown')}",
+                        asset_ref=normalized["asset_ref"],
+                        title=normalized["title"],
+                        vuln_ref=normalized["vuln_ref"],
                         tool_name=action.tool_name,
                         severity=severity,
-                        confidence=finding.get("confidence", 0.5),
+                        confidence=normalized.get("confidence", 0.5),
                         evidence_ids=[],
-                        remediation=finding.get("remediation", ""),
+                        remediation=normalized.get("remediation", ""),
                     )
 
                 # Extract and store hosts
                 hosts_list = result.parsed_output.get("hosts", [])
                 for host in hosts_list:
+                    ip_address = host.get("ip_address", host.get("ip", ""))
+                    if not ip_address and host.get("hostname") == "localhost":
+                        ip_address = "127.0.0.1"
+                    if not ip_address:
+                        continue
+
                     host_id = self._recon_store.upsert_host(
                         engagement_id=engagement_id,
-                        ip_address=host.get("ip_address", host.get("ip", "")),
+                        ip_address=ip_address,
                         hostname=host.get("hostname"),
-                        os_guess=host.get("os"),
+                        os_guess=host.get("os_guess", host.get("os")),
+                        status=host.get("status", "up"),
                     )
                     # Store services for this host
                     for port_info in host.get("ports", []):
                         port = port_info if isinstance(port_info, int) else port_info.get("port")
                         service_name = port_info.get("service") if isinstance(port_info, dict) else None
+                        if not port:
+                            continue
                         self._recon_store.upsert_service(
                             host_id=host_id,
                             engagement_id=engagement_id,
@@ -268,7 +458,43 @@ class ExecutorNode:
                             service_name=service_name,
                         )
 
-                log.info("executor.data_stored", findings_count=len(findings_list), hosts_count=len(hosts_list))
+                services_list = result.parsed_output.get("services", [])
+                for service in services_list:
+                    ip_address, hostname = _service_host_fields(service, proposal.target)
+                    if not ip_address and not hostname:
+                        continue
+                    if not ip_address and hostname == "localhost":
+                        ip_address = "127.0.0.1"
+                    if not ip_address:
+                        continue
+
+                    host_id = self._recon_store.upsert_host(
+                        engagement_id=engagement_id,
+                        ip_address=ip_address,
+                        hostname=hostname,
+                        status=service.get("status", "up"),
+                    )
+                    port = infer_service_port(service)
+                    if port is None:
+                        continue
+                    self._recon_store.upsert_service(
+                        host_id=host_id,
+                        engagement_id=engagement_id,
+                        port=port,
+                        protocol=service.get("protocol", "tcp"),
+                        service_name=service.get("service_name"),
+                        product=service.get("product"),
+                        version=service.get("version"),
+                        banner=service.get("banner"),
+                    )
+
+                log.info(
+                    "executor.data_stored",
+                    findings_count=len(findings_list),
+                    hosts_count=len(hosts_list),
+                    services_count=len(result.parsed_output.get("services", [])),
+                    execution_hints_count=len(execution_hints),
+                )
             except Exception as store_exc:
                 log.warning("executor.store_error", exc=str(store_exc))
                 # Don't fail the action if storage fails, just log it
@@ -282,7 +508,31 @@ class ExecutorNode:
                 "action_type": action.action_type.value,
                 "target": proposal.target,
                 "exit_code": result.exit_code,
+                "execution_hint_codes": [hint.get("code") for hint in execution_hints],
             }
+        )
+
+        self._audit_event(
+            state,
+            "ToolExecutionCompleted",
+            {
+                "action_id": str(action.action_id),
+                "tool": action.tool_name,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "stdout_hash": result.stdout_hash,
+                "stderr_hash": result.stderr_hash,
+                "stdout_evidence_id": str(result.stdout_evidence_id) if result.stdout_evidence_id else None,
+                "stderr_evidence_id": str(result.stderr_evidence_id) if result.stderr_evidence_id else None,
+                "stdout_evidence_path": result.stdout_evidence_path,
+                "stderr_evidence_path": result.stderr_evidence_path,
+                "parser_confidence": result.parser_confidence,
+                "error_class": (
+                    result.error_class.value if result.error_class else None
+                ),
+                "parsed_output": result.parsed_output,
+                "execution_hints": execution_hints,
+            },
         )
 
         self._audit_event(
@@ -292,6 +542,19 @@ class ExecutorNode:
                 "action_id": str(action.action_id),
                 "tool": action.tool_name,
                 "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "stdout_hash": result.stdout_hash,
+                "stderr_hash": result.stderr_hash,
+                "stdout_evidence_id": str(result.stdout_evidence_id) if result.stdout_evidence_id else None,
+                "stderr_evidence_id": str(result.stderr_evidence_id) if result.stderr_evidence_id else None,
+                "stdout_evidence_path": result.stdout_evidence_path,
+                "stderr_evidence_path": result.stderr_evidence_path,
+                "parser_confidence": result.parser_confidence,
+                "error_class": (
+                    result.error_class.value if result.error_class else None
+                ),
+                "parsed_output": result.parsed_output,
+                "execution_hints": execution_hints,
             },
         )
 
@@ -315,6 +578,7 @@ class ExecutorNode:
             "validation_result": None,
             "no_new_findings_streak": streak,
             "recon_summary": recon_summary,
+            "last_execution_hints": execution_hints,
             "error": None,
         }
         # Emit AgentInvoked for executor

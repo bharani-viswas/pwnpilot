@@ -13,7 +13,9 @@ It can escalate risk upward but NEVER downgrade below the proposal's estimated_r
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import re
 import time
 from typing import Any
 
@@ -31,6 +33,28 @@ _RISK_ORDER: dict[str, int] = {
     "high": 2,
     "critical": 3,
 }
+
+
+def _classify_target_type(target: str) -> str:
+    raw = (target or "").strip()
+    if not raw:
+        return "unknown"
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return "url"
+    if "/" in raw:
+        try:
+            ipaddress.ip_network(raw, strict=False)
+            return "cidr"
+        except Exception:
+            pass
+    try:
+        ipaddress.ip_address(raw)
+        return "ip"
+    except Exception:
+        pass
+    if re.match(r"^[a-zA-Z0-9.-]+$", raw):
+        return "domain"
+    return "unknown"
 
 
 class ValidatorNode:
@@ -76,6 +100,18 @@ class ValidatorNode:
             "proposal": proposal,
             "policy_context": self._policy_context,
         }
+
+        deterministic_error = self._deterministic_capability_check(proposal)
+        if deterministic_error:
+            log.warning("validator.capability_reject", reason=deterministic_error)
+            return {
+                **state,
+                "validation_result": {
+                    "verdict": "reject",
+                    "risk_override": None,
+                    "rationale": deterministic_error,
+                },
+            }
 
         try:
             raw_result = self._llm.validate(context)
@@ -129,6 +165,48 @@ class ValidatorNode:
         output = {**state, "validation_result": result.model_dump()}
         self._emit_agent_invoked(state, output, _input_hash, _t0)
         return output
+
+    def _deterministic_capability_check(self, proposal: dict[str, Any]) -> str | None:
+        available_tools = self._policy_context.get("available_tools") or []
+        tools_catalog = self._policy_context.get("tools_catalog") or []
+
+        tool_name = str(proposal.get("tool_name", ""))
+        if available_tools and tool_name not in available_tools:
+            return (
+                f"Tool '{tool_name}' is not enabled or trusted in this runtime. "
+                f"Choose from: {available_tools}"
+            )
+
+        if not tools_catalog:
+            return None
+
+        tool_meta = None
+        for item in tools_catalog:
+            if isinstance(item, dict) and item.get("tool_name") == tool_name:
+                tool_meta = item
+                break
+
+        if tool_meta is None:
+            return None
+
+        required = list(tool_meta.get("required_params", []))
+        params = proposal.get("params") if isinstance(proposal.get("params"), dict) else {}
+
+        missing = [p for p in required if p != "target" and p not in params]
+        if missing:
+            return f"Proposal missing required parameters for tool '{tool_name}': {missing}"
+
+        target = str(proposal.get("target", ""))
+        supported = list(tool_meta.get("supported_target_types", []))
+        if supported:
+            target_type = _classify_target_type(target)
+            if target_type not in supported and "unknown" not in supported:
+                return (
+                    f"Target type '{target_type}' is not supported by tool '{tool_name}'. "
+                    f"Supported target types: {supported}"
+                )
+
+        return None
 
     def _emit_agent_invoked(
         self,

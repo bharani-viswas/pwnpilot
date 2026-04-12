@@ -65,14 +65,17 @@ class ReportGenerator:
 
         findings = self._findings.findings_for_engagement(engagement_id)
         hosts = self._recon.hosts_for_engagement(engagement_id)
+        services = self._recon.services_for_engagement(engagement_id)
 
         bundle = {
             "engagement_id": str(engagement_id),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "findings_count": len(findings),
             "hosts_count": len(hosts),
+            "services_count": len(services),
             "findings": [f.model_dump(mode="json") for f in findings],
             "hosts": hosts,
+            "services": services,
             "schema_version": "v1",
         }
 
@@ -93,6 +96,7 @@ class ReportGenerator:
                 engagement_id=str(engagement_id),
                 findings=findings,
                 hosts=hosts,
+                services=services,
                 generated_at=datetime.now(timezone.utc).isoformat(),
             )
         except Exception:

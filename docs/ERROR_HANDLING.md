@@ -237,6 +237,20 @@ When adding new file input or parsing functionality:
 - [ ] Test that error messages include file path/context
 - [ ] Verify error messages suggest how to fix issues
 
+## Pattern: Missing Tool/Binary Recovery
+
+When execution fails because a tool binary is unavailable, recovery should be deterministic:
+
+1. Capture failure as `ActionFailed` with tool/target/params/error details.
+2. Inject a planner-facing `rejection_reason` that includes executable alternatives.
+3. Place the failing tool in `temporarily_unavailable_tools` cooldown (default 3 iterations).
+4. Ensure planner context includes the cooldown list and avoids those tools.
+5. Continue engagement with alternative executable tools instead of repeating the same failure.
+
+Important:
+- Do not auto-install missing tools inside the autonomous loop.
+- Installation is an explicit operator action for safety and auditability.
+
 ## Common Mistakes to Avoid
 
 1. **No early checks**: Don't skip the file existence/size checks and rely only on parsing errors

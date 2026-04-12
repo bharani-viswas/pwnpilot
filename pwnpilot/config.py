@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 
 class DatabaseConfig(BaseModel):
     url: str = Field(
-        default_factory=lambda: f"sqlite:///{Path.home() / '.pwnpilot' / 'pwnpilot.db'}",
+        default="sqlite:///pwnpilot.db",
         description="SQLAlchemy database URL",
     )
     pool_size: int = Field(default=5, ge=1, le=50)
@@ -123,7 +123,10 @@ class LLMConfig(BaseModel):
     @property
     def local_model(self) -> str:
         """Backward compatibility: maps to model_name"""
-        return self.model_name
+        model = self.model_name
+        if model.startswith("ollama/"):
+            return model.split("/", 1)[1]
+        return model
     
     @property
     def cloud_model(self) -> str:
@@ -175,6 +178,10 @@ class LoggingConfig(BaseModel):
         default="",
         description="Log file path (empty = stdout only)",
     )
+    stdout_format: str = Field(
+        default="console",
+        description="Stdout log format: console (human-readable) or json.",
+    )
     rotation_days: int = Field(default=30, ge=1, le=365)
 
     @field_validator("level")
@@ -185,10 +192,82 @@ class LoggingConfig(BaseModel):
             raise ValueError(f"Log level must be one of {allowed}, got {v!r}")
         return v.upper()
 
+    @field_validator("stdout_format")
+    @classmethod
+    def stdout_format_must_be_valid(cls, v: str) -> str:
+        raw = (v or "console").strip().lower()
+        allowed = {"console", "json"}
+        if raw not in allowed:
+            raise ValueError(f"stdout_format must be one of {allowed}, got {v!r}")
+        return raw
+
 
 class EngagementDefaults(BaseModel):
     valid_hours: int = Field(default=24, ge=1, le=720)
     operator_id: str = Field(default="operator")
+
+
+class ToolsConfig(BaseModel):
+    enabled_tools: list[str] = Field(
+        default_factory=list,
+        description="Optional allowlist of tool names. Empty means all discovered tools.",
+    )
+    disabled_tools: list[str] = Field(
+        default_factory=list,
+        description="Optional denylist of tool names.",
+    )
+    discovery_mode: str = Field(
+        default="package",
+        description="Tool discovery mode: package, entrypoints, package_and_entrypoints.",
+    )
+    plugin_package: str = Field(
+        default="pwnpilot.plugins.adapters",
+        description="Python package used for first-party adapter discovery.",
+    )
+    entrypoint_group: str = Field(
+        default="pwnpilot.plugins",
+        description="Python entry point group for third-party plugins.",
+    )
+    trust_mode: str = Field(
+        default="first_party_only",
+        description="Trust policy: first_party_only, allow_trusted_third_party, strict_signed_all.",
+    )
+    allow_unsigned_first_party: bool = Field(
+        default=True,
+        description="Allow unsigned first-party adapters when trust_mode is not strict.",
+    )
+    static_fallback_when_empty: bool = Field(
+        default=False,
+        description="If true, use built-in static adapters when registry resolves no enabled tools.",
+    )
+    memory_limit_mb: int = Field(
+        default=2048,
+        ge=256,
+        le=16384,
+        description="Maximum virtual memory per tool subprocess (MB). Default 2048MB. Increase for memory-intensive tools like Nuclei (min 2GB recommended).",
+    )
+    cpu_limit_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description="Maximum CPU time per tool subprocess (seconds). Default 300s (5 minutes).",
+    )
+
+    @field_validator("discovery_mode")
+    @classmethod
+    def discovery_mode_must_be_valid(cls, v: str) -> str:
+        allowed = {"package", "entrypoints", "package_and_entrypoints"}
+        if v not in allowed:
+            raise ValueError(f"discovery_mode must be one of {allowed}, got {v!r}")
+        return v
+
+    @field_validator("trust_mode")
+    @classmethod
+    def trust_mode_must_be_valid(cls, v: str) -> str:
+        allowed = {"first_party_only", "allow_trusted_third_party", "strict_signed_all"}
+        if v not in allowed:
+            raise ValueError(f"trust_mode must be one of {allowed}, got {v!r}")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +285,7 @@ class PwnpilotConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     engagement: EngagementDefaults = Field(default_factory=EngagementDefaults)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     model_config = {"extra": "ignore"}  # tolerate unknown top-level keys
 
@@ -232,6 +312,15 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
             raw.setdefault(section, {})[field] = value
         elif len(parts) == 1:
             raw[parts[0]] = value
+
+    # Backward compatibility aliases for v1 config keys.
+    llm_cfg = raw.get("llm")
+    if isinstance(llm_cfg, dict):
+        if "local_model" in llm_cfg and "model_name" not in llm_cfg:
+            llm_cfg["model_name"] = llm_cfg["local_model"]
+        if "cloud_model" in llm_cfg and "fallback_model_name" not in llm_cfg:
+            llm_cfg["fallback_model_name"] = llm_cfg["cloud_model"]
+
     return raw
 
 
@@ -250,7 +339,8 @@ def load_config(config_path: Path | None = None) -> PwnpilotConfig:
     """
     raw: dict[str, Any] = {}
 
-    candidates = ([config_path] if config_path else []) + _CONFIG_SEARCH_PATHS
+    # If explicit path is provided and missing, do not silently fall back to cwd/home.
+    candidates = [config_path] if config_path else _CONFIG_SEARCH_PATHS
     for path in candidates:
         if path and path.exists() and path.is_file():
             with path.open() as fh:

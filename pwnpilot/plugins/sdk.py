@@ -63,6 +63,7 @@ class ParsedOutput(BaseModel):
     hosts: list[dict[str, Any]] = []
     services: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
+    execution_hints: list[dict[str, Any]] = []
     raw_summary: str = ""
     new_findings_count: int = 0
     confidence: float = 0.5

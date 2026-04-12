@@ -8,6 +8,8 @@ import pytest
 from pwnpilot.plugins.adapters.nikto import NiktoAdapter
 from pwnpilot.plugins.adapters.nmap import NmapAdapter
 from pwnpilot.plugins.adapters.nuclei import NucleiAdapter
+from pwnpilot.plugins.adapters.gobuster import GobusterAdapter
+from pwnpilot.plugins.adapters.shell import ShellAdapter
 from pwnpilot.plugins.adapters.searchsploit import SearchsploitAdapter
 from pwnpilot.plugins.adapters.sqlmap import SqlmapAdapter
 from pwnpilot.plugins.adapters.whatweb import WhatWebAdapter
@@ -117,6 +119,11 @@ class TestNucleiContract:
         result = self.adapter.parse(line.encode(), b"", 0)
         assert len(result.findings) == 1
         assert result.findings[0]["vuln_ref"] == "CVE-2024-0001"
+
+    def test_parse_empty_output_exit_zero_is_no_findings(self):
+        result = self.adapter.parse(b"", b"", 0)
+        assert result.parser_error is None
+        assert result.new_findings_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -236,30 +243,30 @@ class TestNiktoContract:
         cmd = self.adapter.build_command(params)
         assert "-ssl" in cmd
 
-    def test_parse_json_output(self):
-        data = json.dumps({
-            "vulnerabilities": [
-                {
-                    "id": "1",
-                    "OSVDB": "3093",
-                    "url": "/admin/",
-                    "method": "GET",
-                    "msg": "Admin directory found",
-                }
-            ]
-        })
-        result = self.adapter.parse(data.encode(), b"", 0)
-        assert len(result.findings) == 1
-        assert result.findings[0]["vuln_ref"] == "OSVDB-3093"
-
-    def test_parse_text_output_fallback(self):
-        text = (
-            b"+ Server: Apache/2.4\n"
+    def test_parse_text_output_from_mixed_streams(self):
+        """Nikto findings may appear on stdout while warnings remain on stderr."""
+        stdout = (
+            b"+ Server: No banner retrieved\n"
             b"+ OSVDB-3092: /admin/ might be interesting\n"
-            b"+ The anti-clickjacking X-Frame-Options header is not present.\n"
+            b"+ File/dir '/ftp/' in robots.txt returned a non-forbidden or redirect HTTP code (200)\n"
         )
-        result = self.adapter.parse(text, b"", 0)
-        assert len(result.findings) >= 1
+        stderr = b"+ ERROR: Host maximum execution time of 300 seconds reached\n"
+        result = self.adapter.parse(stdout, stderr, 0)
+        assert len(result.findings) == 2
+        assert any("OSVDB-3092" in str(f) for f in result.findings)
+        assert result.execution_hints[0]["code"] == "execution_error"
+
+    def test_parse_error_as_execution_hint(self):
+        """Tool errors should be execution hints, not fake findings."""
+        text = (
+            b"+ ERROR: Invalid output format\n"
+            b"+ ERROR: Host maximum execution time reached\n"
+        )
+        result = self.adapter.parse(b"", text, 0)
+        assert len(result.findings) == 0
+        assert len(result.execution_hints) == 2
+        assert result.execution_hints[0]["code"] == "output_format_invalid"
+        assert result.execution_hints[1]["code"] == "execution_error"
 
     def test_parse_no_output_returns_error(self):
         result = self.adapter.parse(b"", b"", 0)
@@ -499,3 +506,193 @@ class TestSearchsploitContract:
     def test_parse_invalid_json_returns_error(self):
         result = self.adapter.parse(b"NOT JSON", b"", 0)
         assert result.parser_error is not None
+
+
+# ---------------------------------------------------------------------------
+# Gobuster adapter
+# ---------------------------------------------------------------------------
+
+
+class TestGobusterContract:
+    def setup_method(self):
+        self.adapter = GobusterAdapter()
+
+    def test_manifest_fields_present(self):
+        m = self.adapter.manifest
+        assert m.name == "gobuster"
+        assert m.risk_class == "active_scan"
+
+    def test_valid_dir_params_accepted(self):
+        params = self.adapter.validate_params({"target": "https://example.com"})
+        assert params.target == "https://example.com"
+        assert params.extra["mode"] == "dir"
+
+    def test_valid_dns_params_accepted(self):
+        params = self.adapter.validate_params(
+            {"target": "example.com", "mode": "dns"}
+        )
+        assert params.target == "example.com"
+        assert params.extra["mode"] == "dns"
+
+    def test_invalid_dir_target_rejected(self):
+        with pytest.raises(ValueError):
+            self.adapter.validate_params({"target": "example.com", "mode": "dir"})
+
+    def test_invalid_dns_target_rejected(self):
+        with pytest.raises(ValueError):
+            self.adapter.validate_params(
+                {"target": "https://example.com", "mode": "dns"}
+            )
+
+    def test_build_command_dir(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "https://example.com",
+                "mode": "dir",
+                "extensions": "php,txt",
+            }
+        )
+        cmd = self.adapter.build_command(params)
+        assert isinstance(cmd, list)
+        assert cmd[0] == "gobuster"
+        assert "-m" in cmd
+        assert "dir" in cmd
+        assert "-u" in cmd
+        assert "-x" in cmd
+        assert "-to" in cmd
+        assert "-np" in cmd
+        assert "-q" in cmd
+
+    def test_build_command_dns(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "example.com",
+                "mode": "dns",
+            }
+        )
+        cmd = self.adapter.build_command(params)
+        assert cmd[0] == "gobuster"
+        assert "-m" in cmd
+        assert "dns" in cmd
+        assert "-d" in cmd
+
+    def test_parse_dir_output(self):
+        out = b"/admin (Status: 301) [Size: 0]\n/images (Status: 200) [Size: 1234]\n"
+        result = self.adapter.parse(out, b"", 0)
+        assert len(result.findings) == 2
+        assert result.findings[0]["vuln_ref"] == "gobuster:path-discovery"
+
+    def test_parse_dns_output(self):
+        out = b"Found: api.example.com\nFound: dev.example.com\n"
+        result = self.adapter.parse(out, b"", 0)
+        assert len(result.findings) == 2
+        assert result.findings[0]["vuln_ref"] == "gobuster:dns-discovery"
+
+    def test_parse_nonzero_exit_code_returns_error(self):
+        result = self.adapter.parse(b"", b"error", 2)
+        assert result.parser_error is not None
+
+
+# ---------------------------------------------------------------------------
+# Shell adapter
+# ---------------------------------------------------------------------------
+
+
+class TestShellContract:
+    def setup_method(self):
+        self.adapter = ShellAdapter()
+
+    def test_manifest_fields_present(self):
+        m = self.adapter.manifest
+        assert m.name == "shell"
+        assert m.risk_class == "recon_passive"
+
+    def test_valid_params_accepted(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "localhost",
+                "command": "ls",
+                "args": ["-la", "/tmp"],
+            }
+        )
+        assert params.target == "localhost"
+        assert params.extra["command"] == "ls"
+
+    def test_non_allowlisted_command_rejected(self):
+        with pytest.raises(ValueError):
+            self.adapter.validate_params(
+                {
+                    "target": "localhost",
+                    "command": "rm",
+                    "args": ["-rf", "/"],
+                }
+            )
+
+    def test_unsafe_mode_without_permission_rejected(self):
+        with pytest.raises(ValueError):
+            self.adapter.validate_params(
+                {
+                    "target": "localhost",
+                    "command": "rm",
+                    "args": ["-rf", "/tmp/poc"],
+                    "unsafe": True,
+                }
+            )
+
+    def test_unsafe_mode_with_permission_allows_non_allowlisted_command(self, monkeypatch):
+        monkeypatch.setenv("PWNPILOT_SHELL_ALLOW_UNSAFE", "1")
+        monkeypatch.setenv("PWNPILOT_SHELL_PERMISSION_TOKEN", "permit-123")
+
+        params = self.adapter.validate_params(
+            {
+                "target": "localhost",
+                "command": "python3",
+                "args": ["-c", "print(1)"],
+                "unsafe": True,
+                "permission_token": "permit-123",
+            }
+        )
+        assert params.extra["unsafe"] is True
+        assert params.extra["command"] == "python3"
+
+    def test_unsafe_mode_with_wrong_token_rejected(self, monkeypatch):
+        monkeypatch.setenv("PWNPILOT_SHELL_ALLOW_UNSAFE", "1")
+        monkeypatch.setenv("PWNPILOT_SHELL_PERMISSION_TOKEN", "permit-123")
+
+        with pytest.raises(ValueError):
+            self.adapter.validate_params(
+                {
+                    "target": "localhost",
+                    "command": "python3",
+                    "args": ["-V"],
+                    "unsafe": True,
+                    "permission_token": "wrong-token",
+                }
+            )
+
+    def test_unsafe_arg_rejected(self):
+        with pytest.raises(ValueError):
+            self.adapter.validate_params(
+                {
+                    "target": "localhost",
+                    "command": "ls",
+                    "args": ["/tmp;rm"],
+                }
+            )
+
+    def test_build_command_returns_list(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "localhost",
+                "command": "whoami",
+                "args": [],
+            }
+        )
+        cmd = self.adapter.build_command(params)
+        assert isinstance(cmd, list)
+        assert cmd[0] == "whoami"
+
+    def test_parse_output(self):
+        result = self.adapter.parse(b"line1\nline2\n", b"", 0)
+        assert result.findings
+        assert result.findings[0]["vuln_ref"] == "shell:command-output"

@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from pwnpilot.plugins.parsers.contracts import normalize_execution_hint
 from pwnpilot.plugins.sdk import BaseAdapter, ParsedOutput, PluginManifest, ToolParams
 
 # Allow valid http(s) URLs only
@@ -157,6 +158,17 @@ class SqlmapAdapter(BaseAdapter):
 
         text = (stdout + stderr).decode(errors="replace")
         findings: list[dict[str, Any]] = []
+        execution_hints: list[dict[str, Any]] = []
+
+        if "there were no forms found" in text.lower():
+            execution_hints.append(
+                normalize_execution_hint(
+                    code="no_forms_detected",
+                    message="sqlmap did not detect HTML forms at the target URL.",
+                    severity="info",
+                    recommended_action="Prefer API-aware or direct-parameter testing instead of repeating form discovery.",
+                )
+            )
 
         # Extract injectable parameter findings
         for m in _INJECTABLE_RE.finditer(text):
@@ -202,6 +214,7 @@ class SqlmapAdapter(BaseAdapter):
 
         return ParsedOutput(
             findings=findings,
+            execution_hints=execution_hints,
             new_findings_count=sum(
                 1 for f in findings if f.get("severity") != "info"
             ),

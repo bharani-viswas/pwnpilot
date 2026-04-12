@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
+from uuid import UUID
 
 import pytest
 
@@ -42,12 +43,31 @@ def _minimal_typed_config(tmp_path: Path):
         llm=MagicMock(
             local_url="http://localhost:11434",
             local_model="llama3",
+            model_name="ollama/llama3",
+            api_key="",
+            api_base_url="",
+            fallback_model_name="gpt-4o-mini",
+            fallback_api_key="",
+            fallback_api_base_url="",
+            cloud_allowed=False,
+            timeout_seconds=30,
+            max_retries=3,
         ),
         storage=MagicMock(
             evidence_dir=str(tmp_path / "evidence"),
             report_dir=str(tmp_path / "reports"),
         ),
         database=MagicMock(url=f"sqlite:///{tmp_path}/integration.db"),
+        tools=MagicMock(
+            trust_mode="first_party_only",
+            allow_unsigned_first_party=True,
+            plugin_package="pwnpilot.plugins.adapters",
+            entrypoint_group="pwnpilot.plugins",
+            discovery_mode="package",
+            enabled_tools=[],
+            disabled_tools=[],
+            static_fallback_when_empty=False,
+        ),
     )
 
 
@@ -172,6 +192,35 @@ class TestKillSwitchAuditIntegration:
         # Verify audit store is functional (can query by engagement_id)
         events = list(audit_store.events_for_engagement(uuid4()))
         assert isinstance(events, list)  # empty list for unknown ID
+
+    def test_runtime_emits_plugin_load_audit_events(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PWNPILOT_DB_URL", f"sqlite:///{tmp_path}/pl.db")
+        (tmp_path / "evidence").mkdir()
+
+        with patch("pwnpilot.runtime._load_config", return_value=_minimal_config(tmp_path)):
+            with patch("pwnpilot.runtime._load_typed_config", return_value=_minimal_typed_config(tmp_path)):
+                from pwnpilot.runtime import _build_runtime
+                rt = _build_runtime()
+
+        events = list(rt["audit_store"].events_for_engagement(UUID(int=0)))
+        assert any(e.event_type == "PluginLoad" for e in events)
+
+    def test_static_fallback_when_registry_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PWNPILOT_DB_URL", f"sqlite:///{tmp_path}/pl2.db")
+        (tmp_path / "evidence").mkdir()
+
+        typed = _minimal_typed_config(tmp_path)
+        typed.tools.trust_mode = "strict_signed_all"
+        typed.tools.allow_unsigned_first_party = False
+        typed.tools.static_fallback_when_empty = True
+
+        with patch("pwnpilot.runtime._load_config", return_value=_minimal_config(tmp_path)):
+            with patch("pwnpilot.runtime._load_typed_config", return_value=typed):
+                from pwnpilot.runtime import _build_runtime
+                rt = _build_runtime()
+
+        assert "nmap" in rt["adapters"]
+        assert "gobuster" in rt["adapters"]
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from rich.table import Table
 
 from pwnpilot import __version__
 from pwnpilot.config import load_config
+from pwnpilot.observability.logging_setup import configure_logging_from_config
 
 app = typer.Typer(
     name="pwnpilot",
@@ -37,6 +39,12 @@ app = typer.Typer(
 )
 console = Console()
 log = structlog.get_logger(__name__)
+
+plugins_app = typer.Typer(
+    help="Plugin registry inspection commands.",
+    add_completion=False,
+)
+app.add_typer(plugins_app, name="plugins")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +61,29 @@ def cmd_version() -> None:
 # ---------------------------------------------------------------------------
 # Start
 # ---------------------------------------------------------------------------
+
+
+def _render_preflight(preflight: dict[str, object]) -> None:
+    family = str(preflight.get("target_family", "unknown"))
+    console.print(f"[bold cyan]Target family:[/bold cyan] {family}")
+
+    table = Table(title="Preflight Sequence and Tool Availability")
+    table.add_column("Step", style="cyan")
+    table.add_column("Preferred", style="green")
+    table.add_column("Available", style="green")
+    table.add_column("Missing", style="yellow")
+
+    for step in preflight.get("sequence", []):
+        if not isinstance(step, dict):
+            continue
+        table.add_row(
+            str(step.get("name", "")),
+            ", ".join(step.get("preferred_tools", [])),
+            ", ".join(step.get("preferred_available", [])),
+            ", ".join(step.get("preferred_missing", [])),
+        )
+
+    console.print(table)
 
 
 @app.command("start")
@@ -76,7 +107,7 @@ def cmd_start(
     NEW: Use --roe-file for ROE-based engagement creation (recommended).
     LEGACY: Use --cidr/--domain/--url/--roe-hash for direct scope specification.
     """
-    from pwnpilot.runtime import create_and_run_engagement
+    from pwnpilot.runtime import create_and_run_engagement, get_engagement_preflight
     from pwnpilot.data.roe_validator import validate_roe_file
     from pwnpilot.agent.roe_interpreter import ROEInterpreter
     from pwnpilot.control.roe_approval import ApprovalWorkflow
@@ -198,6 +229,64 @@ def cmd_start(
     console.print(f"[bold green]Starting engagement:[/bold green] {name}")
     if dry_run:
         console.print("[yellow]DRY RUN: policy simulation only, no tool execution.[/yellow]")
+
+    preflight = get_engagement_preflight(
+        scope_cidrs=scope_cidr,
+        scope_domains=scope_domain,
+        scope_urls=scope_url,
+        config_path=config_file,
+    )
+    _render_preflight(preflight)
+
+    missing = preflight.get("missing_recommended_tools", [])
+    missing_tools = [str(t) for t in missing] if isinstance(missing, list) else []
+    if missing_tools:
+        console.print(
+            "[yellow]Missing recommended tools:[/yellow] " + ", ".join(sorted(missing_tools))
+        )
+        install_now = typer.confirm(
+            "Install missing recommended tools before starting?",
+            default=False,
+        )
+        if install_now:
+            installer = Path(__file__).resolve().parents[1] / "scripts" / "install_security_tools.sh"
+            if installer.exists():
+                run_installer = typer.confirm(
+                    "Run automated installer now (sudo required)?",
+                    default=False,
+                )
+                if run_installer:
+                    result = subprocess.run(
+                        ["sudo", "bash", str(installer)],
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        console.print(
+                            "[yellow]Installer did not complete successfully. Continuing with available tools.[/yellow]"
+                        )
+                    preflight = get_engagement_preflight(
+                        scope_cidrs=scope_cidr,
+                        scope_domains=scope_domain,
+                        scope_urls=scope_url,
+                        config_path=config_file,
+                    )
+                    _render_preflight(preflight)
+            else:
+                console.print(
+                    "[yellow]Installer script not found. Install tools manually, then rerun start if desired.[/yellow]"
+                )
+        else:
+            console.print(
+                "[yellow]Proceeding with currently available tools as requested.[/yellow]"
+            )
+
+    if scope_url and not scope_cidr and not scope_domain:
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        if any(any(host in str(url) for host in local_hosts) for url in scope_url):
+            console.print(
+                "[yellow]Scope warning:[/yellow] URL-only local scope can require host-equivalence checks for tools like nmap. "
+                "Consider adding loopback CIDRs or localhost domain scope when appropriate."
+            )
 
     try:
         engagement_id = create_and_run_engagement(
@@ -576,6 +665,42 @@ def cmd_check(
     raise typer.Exit(code=1)
 
 
+@plugins_app.command("list")
+def cmd_plugins_list(
+    config_file: Optional[Path] = typer.Option(None, "--config", help="Config YAML path"),
+    show_disabled: bool = typer.Option(False, "--show-disabled", help="Include disabled/rejected tools"),
+) -> None:
+    """Show effective tool catalog from the plugin registry."""
+    from pwnpilot.runtime import get_tool_registry
+
+    registry = get_tool_registry(config_path=config_file)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Tool")
+    table.add_column("Enabled")
+    table.add_column("Risk")
+    table.add_column("Binary")
+    table.add_column("Source")
+    table.add_column("Trust")
+    table.add_column("Reason")
+
+    rows = registry.tools
+    for tool_name in sorted(rows.keys()):
+        desc = rows[tool_name]
+        if not show_disabled and not desc.enabled:
+            continue
+        table.add_row(
+            tool_name,
+            "yes" if desc.enabled else "no",
+            desc.risk_class,
+            desc.binary_name or "-",
+            desc.source,
+            desc.trust_status,
+            desc.trust_reason or "-",
+        )
+
+    console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # ROE Commands (Phase 5-6)
 # ---------------------------------------------------------------------------
@@ -698,4 +823,10 @@ def cmd_roe_export(
 
 
 def main() -> None:
+    try:
+        cfg = load_config()
+        configure_logging_from_config(getattr(cfg, "logging", None))
+    except Exception:
+        # Fall back to defaults if config is unavailable during CLI startup.
+        configure_logging_from_config(None)
     app()

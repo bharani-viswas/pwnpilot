@@ -93,7 +93,7 @@ class NucleiAdapter(BaseAdapter):
             "-u", params.target,
             "-severity", params.extra["severity"],
             "-rate-limit", str(params.extra["rate_limit"]),
-            "-json",        # JSONL output for streaming parse
+            "-jsonl",        # JSONL output for streaming parse
             "-silent",
             "-no-color",
         ]
@@ -105,10 +105,26 @@ class NucleiAdapter(BaseAdapter):
         return cmd
 
     def parse(self, stdout: bytes, stderr: bytes, exit_code: int) -> ParsedOutput:
-        if exit_code not in (0, 1) or not stdout:
+        if exit_code not in (0, 1):
             return ParsedOutput(
                 parser_error=f"nuclei exited with code {exit_code}",
                 confidence=0.0,
+            )
+
+        if not stdout:
+            return ParsedOutput(
+                findings=[],
+                execution_hints=[
+                    {
+                        "code": "no_matches",
+                        "message": "Nuclei completed with no template matches.",
+                        "severity": "info",
+                        "recommended_action": "Pivot to a different tool family or broader recon strategy instead of repeating identical nuclei scans.",
+                    }
+                ],
+                raw_summary="nuclei completed with no matches",
+                new_findings_count=0,
+                confidence=0.6,
             )
 
         findings = []

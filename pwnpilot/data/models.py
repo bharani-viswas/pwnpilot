@@ -126,6 +126,10 @@ class ToolExecutionResult(BaseModel):
     duration_ms: int
     stdout_hash: str
     stderr_hash: str
+    stdout_evidence_id: UUID | None = None
+    stderr_evidence_id: UUID | None = None
+    stdout_evidence_path: str | None = None
+    stderr_evidence_path: str | None = None
     parsed_output: dict[str, Any] = Field(default_factory=dict)
     parser_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     error_class: ErrorClass | None = None
