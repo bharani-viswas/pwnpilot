@@ -293,10 +293,13 @@ set -e
 
 case "$1" in
     remove)
-        # Normal removal: clean up installation directory
+        # Normal removal: clean up installation directory and CLI wrapper
         if [ -d /opt/pwnpilot ]; then
             rm -rf /opt/pwnpilot
         fi
+        # Remove CLI wrapper from PATH (both possible locations)
+        rm -f /usr/bin/pwnpilot 2>/dev/null || true
+        rm -f /usr/local/bin/pwnpilot 2>/dev/null || true
         # Remove systemd service file
         if [ -f /etc/systemd/system/pwnpilot.service ]; then
             rm -f /etc/systemd/system/pwnpilot.service
@@ -317,6 +320,9 @@ case "$1" in
         if [ -d /var/log/pwnpilot ]; then
             rm -rf /var/log/pwnpilot
         fi
+        # Remove CLI wrapper from PATH (both possible locations)
+        rm -f /usr/bin/pwnpilot 2>/dev/null || true
+        rm -f /usr/local/bin/pwnpilot 2>/dev/null || true
         # Remove systemd service file
         if [ -f /etc/systemd/system/pwnpilot.service ]; then
             rm -f /etc/systemd/system/pwnpilot.service
