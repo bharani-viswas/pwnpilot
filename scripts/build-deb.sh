@@ -251,6 +251,51 @@ systemctl disable pwnpilot 2>/dev/null || true
 EOF
 chmod 755 "$BUILD_DIR/$PACKAGE_NAME/DEBIAN/prerm"
 
+# Create post-remove script (cleanup after package removal)
+cat > "$BUILD_DIR/$PACKAGE_NAME/DEBIAN/postrm" << 'EOF'
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove)
+        # Normal removal: clean up installation directory
+        if [ -d /opt/pwnpilot ]; then
+            rm -rf /opt/pwnpilot
+        fi
+        # Remove systemd service file
+        if [ -f /etc/systemd/system/pwnpilot.service ]; then
+            rm -f /etc/systemd/system/pwnpilot.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        ;;
+    purge)
+        # Purge: remove all files including configuration and data
+        if [ -d /opt/pwnpilot ]; then
+            rm -rf /opt/pwnpilot
+        fi
+        if [ -d /etc/pwnpilot ]; then
+            rm -rf /etc/pwnpilot
+        fi
+        if [ -d /var/lib/pwnpilot ]; then
+            rm -rf /var/lib/pwnpilot
+        fi
+        if [ -d /var/log/pwnpilot ]; then
+            rm -rf /var/log/pwnpilot
+        fi
+        # Remove systemd service file
+        if [ -f /etc/systemd/system/pwnpilot.service ]; then
+            rm -f /etc/systemd/system/pwnpilot.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        # Remove system user (if not in use)
+        if id pwnpilot &>/dev/null; then
+            userdel pwnpilot 2>/dev/null || true
+        fi
+        ;;
+esac
+EOF
+chmod 755 "$BUILD_DIR/$PACKAGE_NAME/DEBIAN/postrm"
+
 # Build the .deb package
 echo "Building .deb package..."
 cd "$BUILD_DIR"
