@@ -134,14 +134,6 @@ class SqliteCheckpointer(InMemorySaver, AbstractContextManager):
     def _init_db(self) -> None:
         conn = self._connection()
         conn.executescript(_DDL)
-        
-        # Migrate old schema: add type_str column to lg_checkpoint_writes if it doesn't exist
-        try:
-            conn.execute("ALTER TABLE lg_checkpoint_writes ADD COLUMN type_str TEXT NOT NULL DEFAULT 'json'")
-            log.info("checkpointer.schema_migration", action="added_type_str_column")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                log.debug("checkpointer.schema_check", msg=str(e))
 
     def _reload_from_db(self) -> None:
         """Reload all persisted checkpoints into the in-memory dictionaries."""
@@ -155,53 +147,22 @@ class SqliteCheckpointer(InMemorySaver, AbstractContextManager):
             tid, ns, ch, ver, type_str, data = row
             self.blobs[(tid, ns, ch, ver)] = (type_str, bytes(data))
 
-        # Reload writes - try new schema first, fall back to old schema for backward compatibility
-        try:
-            cursor = conn.execute(
-                "SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx, "
-                "channel, type_str, value_data, task_path "
-                "FROM lg_checkpoint_writes"
-            )
-            for tid, ns, cid, task_id, widx, ch, type_str, val, tpath in cursor:
-                key = (tid, ns, cid)
-                entry = self.writes.setdefault(key, {})
-                try:
-                    # Use stored type_str for deserialization
-                    entry[(task_id, widx)] = (task_id, ch, self.serde.loads_typed((type_str, bytes(val))), tpath)
-                except (UnicodeDecodeError, ValueError):
-                    # If deserialization fails with the provided type_str, try 'json' first, then fallback
-                    try:
-                        entry[(task_id, widx)] = (task_id, ch, self.serde.loads_typed(("json", bytes(val))), tpath)
-                    except Exception:
-                        log.warning("checkpointer.deserialization_failed", 
-                                    thread_id=tid, channel=ch, type_str=type_str)
-                        # Skip this corrupted entry
-                        pass
-        except (sqlite3.OperationalError, ValueError) as e:
-            # Fall back to old schema without type_str column
-            if "no such column: type_str" in str(e) or "not enough values" in str(e):
-                log.debug("checkpointer.legacy_schema", msg="Using old schema without type_str")
-                cursor = conn.execute(
-                    "SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx, "
-                    "channel, value_data, task_path "
-                    "FROM lg_checkpoint_writes"
-                )
-                for tid, ns, cid, task_id, widx, ch, val, tpath in cursor:
-                    key = (tid, ns, cid)
-                    entry = self.writes.setdefault(key, {})
-                    # Fall back to using channel as type_str (old behavior)
-                    try:
-                        entry[(task_id, widx)] = (task_id, ch, self.serde.loads_typed((ch, bytes(val))), tpath)
-                    except NotImplementedError:
-                        # If channel is not a valid type_str, assume 'json'
-                        try:
-                            entry[(task_id, widx)] = (task_id, ch, self.serde.loads_typed(("json", bytes(val))), tpath)
-                        except Exception:
-                            log.warning("checkpointer.legacy_deserialization_failed",
-                                        thread_id=tid, channel=ch)
-                            pass
-            else:
-                raise
+        # Reload writes using the new schema with proper type_str tracking
+        for row in conn.execute(
+            "SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx, "
+            "channel, type_str, value_data, task_path "
+            "FROM lg_checkpoint_writes"
+        ):
+            tid, ns, cid, task_id, widx, ch, type_str, val, tpath = row
+            key = (tid, ns, cid)
+            entry = self.writes.setdefault(key, {})
+            try:
+                # Use stored type_str for proper deserialization
+                entry[(task_id, widx)] = (task_id, ch, self.serde.loads_typed((type_str, bytes(val))), tpath)
+            except Exception as e:
+                # Log but skip corrupted entries during development
+                log.warning("checkpointer.corrupted_entry_skipped", 
+                            thread_id=tid, channel=ch, type_str=type_str, error=str(e))
 
         # Reload checkpoints
         for row in conn.execute(
