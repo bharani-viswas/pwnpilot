@@ -23,7 +23,8 @@ from uuid import UUID
 
 import structlog
 
-from pwnpilot.agent.state import AgentState
+from pwnpilot.agent.state import AgentState, CompletionState
+from pwnpilot.observability.tracing import tracer
 from pwnpilot.reporting.readiness_policy import ReportReadinessPolicy
 from pwnpilot.reporting.run_health import evaluate_run_health
 
@@ -43,11 +44,13 @@ class ReporterNode:
         audit_store: Any,
         output_dir: Path,
         readiness_policy: ReportReadinessPolicy | None = None,
+        event_bus: Any | None = None,
     ) -> None:
         self._generator = report_generator
         self._audit = audit_store
         self._output_dir = output_dir
         self._readiness_policy = readiness_policy or ReportReadinessPolicy()
+        self._event_bus = event_bus
 
     def __call__(self, state: AgentState) -> AgentState:
         engagement_id = UUID(state["engagement_id"])
@@ -69,14 +72,29 @@ class ReporterNode:
         }
 
         try:
-            bundle_path, summary_path = self._generator.build_bundle(
-                engagement_id=engagement_id,
-                output_dir=self._output_dir,
-                                run_metadata=run_metadata,
-            )
+            with tracer.span(
+                "reporter.build_bundle",
+                engagement_id=str(engagement_id),
+            ) as _span:
+                bundle_path, summary_path = self._generator.build_bundle(
+                    engagement_id=engagement_id,
+                    output_dir=self._output_dir,
+                                    run_metadata=run_metadata,
+                )
+                _span.set_attribute("bundle_path", str(bundle_path))
         except Exception as exc:
             log.error("reporter.build_failed", exc=str(exc))
-            return {**state, "error": f"Report generation failed: {exc}"}
+            self._emit_finalization_failed(state, str(exc))
+            self._record_finalization_metric(state, success=False)
+            return {
+                **state,
+                "error": f"Report generation failed: {exc}",
+                "completion_state": CompletionState.FAILED.value,
+                "finalization_failed": True,
+                "finalization_failure_reason": str(exc),
+            }
+
+        self._record_finalization_metric(state, success=True)
 
         self._audit_event(
             state,
@@ -103,6 +121,7 @@ class ReporterNode:
             "readiness_gate_results": run_metadata["readiness_gate_results"],
             "degradation_reasons": run_metadata["degradation_reasons"],
             "termination_reason": run_metadata["termination_reason"],
+            "completion_state": CompletionState.FINALIZED.value,
         }
         duration_ms = round((time.monotonic() - _t0) * 1000, 2)
         output_hash = hashlib.sha256(
@@ -134,3 +153,33 @@ class ReporterNode:
             )
         except Exception as exc:
             log.error("reporter.audit_write_failed", exc=str(exc))
+
+    def _record_finalization_metric(self, state: AgentState, success: bool) -> None:
+        """Update run-quality metrics for report finalization."""
+        try:
+            from pwnpilot.observability.metrics import metrics_registry
+            m = metrics_registry.get(str(state.get("engagement_id", "")))
+            if m is not None:
+                m.record_report_finalization(success)
+        except Exception:
+            pass
+
+    def _emit_finalization_failed(self, state: AgentState, reason: str) -> None:
+        """Emit a REPORT_FINALIZATION_FAILED execution event and audit record."""
+        from pwnpilot.agent.event_bus import ExecutionEvent
+        from pwnpilot.data.models import ExecutionEventType
+
+        engagement_id = UUID(state["engagement_id"])
+        self._audit_event(state, "ReportFinalizationFailed", {"reason": reason})
+
+        if self._event_bus is not None:
+            try:
+                event = ExecutionEvent(
+                    engagement_id=engagement_id,
+                    event_type=ExecutionEventType.REPORT_FINALIZATION_FAILED,
+                    actor="reporter",
+                    payload={"reason": reason},
+                )
+                self._event_bus.publish(engagement_id, event)
+            except Exception as exc:
+                log.error("reporter.event_bus_failed", exc=str(exc))

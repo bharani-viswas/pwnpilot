@@ -7,6 +7,12 @@ Reads from AgentState:
 
 Writes to AgentState:
   last_result, evidence_ids, no_new_findings_streak
+  active_action_id, active_tool_name, active_tool_command (live visibility)
+
+v2 additions:
+  - Sets active_action_id/active_tool_name/active_tool_command before execution.
+  - Emits executor.policy_checked and executor.recovery_hint events via event bus.
+  - Clears active_action fields on completion.
 
 This is the ONLY agent that calls the Policy Engine and the Tool Runner.
 """
@@ -28,11 +34,14 @@ from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.models import (
     ActionRequest,
     ActionType,
+    ExecutionEvent,
+    ExecutionEventType,
     PolicyVerdict,
     PlannerProposal,
     RiskLevel,
     ValidationResult,
 )
+from pwnpilot.observability.tracing import tracer
 from pwnpilot.plugins.parsers.contracts import (
     canonicalize_finding,
     infer_host_from_service,
@@ -258,6 +267,9 @@ class ExecutorNode:
 
     Converts the validated PlannerProposal into a typed ActionRequest, evaluates it
     through the Policy Engine, and calls the tool runner on approval.
+
+    v2: Sets active_action fields in state for live visibility.
+        Emits policy check and recovery hint events via event bus.
     """
 
     def __init__(
@@ -273,6 +285,7 @@ class ExecutorNode:
         target_family: str = "unknown",
         target_resolver: TargetResolver | None = None,
         capability_registry: Any | None = None,
+        event_bus: object | None = None,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
@@ -285,6 +298,7 @@ class ExecutorNode:
         self._target_family = str(target_family or "unknown")
         self._target_resolver = target_resolver
         self._capability_registry = capability_registry
+        self._event_bus = event_bus  # ExecutionEventBus | None
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -372,6 +386,21 @@ class ExecutorNode:
         # Policy Engine evaluation
         decision = self._policy.evaluate(action)
 
+        # Emit policy check event
+        self._emit_event(ExecutionEvent(
+            engagement_id=engagement_id,
+            action_id=action.action_id,
+            event_type=ExecutionEventType.EXECUTOR_POLICY_CHECKED,
+            tool_name=action.tool_name,
+            actor="executor",
+            payload={
+                "verdict": decision.verdict.value,
+                "reason": decision.reason,
+                "gate_type": decision.gate_type.value,
+                "risk_level": effective_risk.value if hasattr(effective_risk, "value") else str(effective_risk),
+            },
+        ))
+
         if decision.verdict == PolicyVerdict.DENY:
             log.warning(
                 "executor.action_denied",
@@ -387,7 +416,6 @@ class ExecutorNode:
                     "gate": decision.gate_type.value,
                 },
             )
-            # Inject rejection reason so Planner can try something different
             updated_proposal = proposal_dict.copy()
             updated_proposal["rejection_reason"] = decision.reason
             if self._metrics:
@@ -416,8 +444,13 @@ class ExecutorNode:
                     "action_id": str(action.action_id),
                 },
             )
-            # Halt the loop until the operator resolves the ticket
             return {**state, "kill_switch": True, "error": None}
+
+        # Set active action fields for live visibility
+        command_hint = " ".join(
+            str(v) for v in (action.params.get("cmd", action.params.get("command", [proposal.target])) or [])
+            if str(v)
+        )
 
         self._audit_event(
             state,
@@ -437,9 +470,21 @@ class ExecutorNode:
             },
         )
 
-        # Execute tool
+        # Execute tool (active_action_id set before, cleared after)
+        active_state_patch: dict[str, Any] = {
+            "active_action_id": str(action.action_id),
+            "active_tool_name": action.tool_name,
+            "active_tool_command": command_hint,
+        }
+
         try:
-            result = self._runner.execute(action)
+            with tracer.span(
+                "executor.tool_run",
+                engagement_id=str(state.get("engagement_id", "")),
+                tool=action.tool_name,
+                action_id=str(action.action_id),
+            ):
+                result = self._runner.execute(action)
         except (KeyError, FileNotFoundError) as exc:
             duration_ms = round((time.monotonic() - _t0) * 1000, 2)
             available = list(self._planner_available_tools)
@@ -463,6 +508,24 @@ class ExecutorNode:
                 },
             )
 
+            rejection_reason = (
+                f"Tool '{action.tool_name}' is not available on this system. "
+                f"Choose from available tools: {available}"
+            )
+            # Emit recovery hint event
+            self._emit_event(ExecutionEvent(
+                engagement_id=engagement_id,
+                action_id=action.action_id,
+                event_type=ExecutionEventType.EXECUTOR_RECOVERY_HINT,
+                tool_name=action.tool_name,
+                actor="executor",
+                payload={
+                    "hint_code": "tool_not_available",
+                    "hint_detail": rejection_reason,
+                    "available_tools": available,
+                },
+            ))
+
             updated_prev = list(state.get("previous_actions", []))
             updated_prev.append(
                 {
@@ -479,10 +542,7 @@ class ExecutorNode:
             cooldowns[action.tool_name] = max(int(cooldowns.get(action.tool_name, 0)), 3)
 
             updated_proposal = proposal_dict.copy()
-            updated_proposal["rejection_reason"] = (
-                f"Tool '{action.tool_name}' is not available on this system. "
-                f"Choose from available tools: {available}"
-            )
+            updated_proposal["rejection_reason"] = rejection_reason
 
             if self._metrics:
                 self._metrics.record_nonproductive_cycle()
@@ -490,11 +550,15 @@ class ExecutorNode:
 
             return {
                 **state,
+                **active_state_patch,
                 "proposed_action": updated_proposal,
                 "validation_result": None,
                 "previous_actions": updated_prev,
                 "temporarily_unavailable_tools": cooldowns,
                 "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
+                "active_action_id": None,
+                "active_tool_name": None,
+                "active_tool_command": None,
                 "error": None,
             }
         except ValueError as exc:
@@ -852,8 +916,29 @@ class ExecutorNode:
             "nonproductive_cycle_streak": 0,
             "recon_summary": recon_summary,
             "last_execution_hints": execution_hints,
+            # Clear active action fields after completion
+            "active_action_id": None,
+            "active_tool_name": None,
+            "active_tool_command": None,
             "error": None,
         }
+
+        # Emit recovery hints for planner consumption
+        for hint in execution_hints:
+            hint_code = str(hint.get("code", "")).strip()
+            if hint_code:
+                self._emit_event(ExecutionEvent(
+                    engagement_id=engagement_id,
+                    action_id=action.action_id,
+                    event_type=ExecutionEventType.EXECUTOR_RECOVERY_HINT,
+                    tool_name=action.tool_name,
+                    actor="executor",
+                    payload={
+                        "hint_code": hint_code,
+                        "hint_detail": hint.get("detail", ""),
+                    },
+                ))
+
         # Emit AgentInvoked for executor
         duration_ms = round((time.monotonic() - _t0) * 1000, 2)
         output_hash = hashlib.sha256(
@@ -885,3 +970,11 @@ class ExecutorNode:
             )
         except Exception as exc:
             log.error("executor.audit_write_failed", exc=str(exc))
+
+    def _emit_event(self, event: ExecutionEvent) -> None:
+        """Publish event to the bus if one is wired."""
+        if self._event_bus is not None:
+            try:
+                self._event_bus.publish(event)  # type: ignore[attr-defined]
+            except Exception as exc:
+                log.warning("executor.event_emit_failed", exc=str(exc), event_type=event.event_type.value)

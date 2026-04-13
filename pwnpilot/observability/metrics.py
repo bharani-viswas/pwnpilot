@@ -85,6 +85,12 @@ class EngagementMetrics:
         default_factory=dict, init=False, repr=False
     )
 
+    # --- v2 run-quality counters ---
+    _operator_intervention_count: int = field(default=0, init=False, repr=False)
+    _report_finalization_successes: int = field(default=0, init=False, repr=False)
+    _report_finalization_failures: int = field(default=0, init=False, repr=False)
+    _replay_event_count: int = field(default=0, init=False, repr=False)
+
     _lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -155,6 +161,24 @@ class EngagementMetrics:
         with self._lock:
             self._loop_break_events[key] = self._loop_break_events.get(key, 0) + 1
 
+    def record_operator_intervention(self) -> None:
+        """Record one operator intervention (directive submitted, approval, etc.)."""
+        with self._lock:
+            self._operator_intervention_count += 1
+
+    def record_report_finalization(self, success: bool) -> None:
+        """Record the outcome of a report finalization attempt."""
+        with self._lock:
+            if success:
+                self._report_finalization_successes += 1
+            else:
+                self._report_finalization_failures += 1
+
+    def record_replay_event(self) -> None:
+        """Increment the count of events captured for replay."""
+        with self._lock:
+            self._replay_event_count += 1
+
     def record_action_outcome(
         self,
         tool_name: str,
@@ -199,6 +223,22 @@ class EngagementMetrics:
     @property
     def approval_count(self) -> int:
         return self._approval_count
+
+    @property
+    def operator_intervention_count(self) -> int:
+        return self._operator_intervention_count
+
+    @property
+    def closure_reliability(self) -> float | None:
+        """Ratio of successful report finalizations to total attempts (v2)."""
+        total = self._report_finalization_successes + self._report_finalization_failures
+        if total == 0:
+            return None
+        return round(self._report_finalization_successes / total, 3)
+
+    @property
+    def replay_event_count(self) -> int:
+        return self._replay_event_count
 
     @property
     def tool_invocation_counts(self) -> dict[str, int]:
@@ -269,6 +309,20 @@ class EngagementMetrics:
                 "report_trigger_reasons": dict(self._report_trigger_reasons),
                 "loop_break_events": dict(self._loop_break_events),
                 "tool_stats": tool_stats,
+                # v2 run-quality metrics
+                "operator_intervention_count": self._operator_intervention_count,
+                "report_finalization_successes": self._report_finalization_successes,
+                "report_finalization_failures": self._report_finalization_failures,
+                "closure_reliability": (
+                    round(
+                        self._report_finalization_successes
+                        / (self._report_finalization_successes + self._report_finalization_failures),
+                        3,
+                    )
+                    if (self._report_finalization_successes + self._report_finalization_failures) > 0
+                    else None
+                ),
+                "replay_event_count": self._replay_event_count,
             }
 
     def export(self) -> dict[str, Any]:

@@ -7,6 +7,8 @@ Architecture:
 - A checkpoint record is written every CHECKPOINT_INTERVAL events for O(chunk) verification.
 - Verification replays each 500-event segment independently and can be done in parallel.
 
+v2: Accepts ExecutionEvent objects via ``append_execution_event``.
+    Supports querying the v2 event timeline for replay.
 In v1. the backing store is SQLite via SQLAlchemy.  The session is injected at
 construction time so the caller controls the DB engine.
 """
@@ -23,7 +25,7 @@ import structlog
 from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, event
 from sqlalchemy.orm import DeclarativeBase, Session
 
-from pwnpilot.data.models import AuditEvent
+from pwnpilot.data.models import AuditEvent, ExecutionEvent
 
 log = structlog.get_logger(__name__)
 
@@ -142,6 +144,39 @@ class AuditStore:
             sequence=seq,
         )
         return event_obj
+
+    def append_execution_event(self, execution_event: ExecutionEvent) -> AuditEvent:
+        """
+        Persist a v2 ExecutionEvent as an audit chain entry.
+
+        This is the preferred write path for Phase A+ events emitted by the
+        event bus / runner / executor.
+        """
+        payload = execution_event.model_dump(mode="json", exclude={"event_id", "schema_version"})
+        return self.append(
+            engagement_id=execution_event.engagement_id,
+            actor=execution_event.actor,
+            event_type=execution_event.event_type.value,
+            payload=payload,
+        )
+
+    def execution_events_for_engagement(
+        self, engagement_id: UUID
+    ) -> Iterator[dict]:
+        """
+        Yield raw event dicts for v2 execution event types only, in sequence order.
+        Used by ReplayService and export paths.
+        """
+        from pwnpilot.data.models import ExecutionEventType  # local import to avoid circular
+        v2_types = {et.value for et in ExecutionEventType}
+        for audit_event in self.events_for_engagement(engagement_id):
+            if audit_event.event_type in v2_types:
+                yield {
+                    "event_type": audit_event.event_type,
+                    "timestamp": audit_event.timestamp.isoformat(),
+                    "actor": audit_event.actor,
+                    **audit_event.payload,
+                }
 
     def verify_chain(self, engagement_id: UUID) -> bool:
         """

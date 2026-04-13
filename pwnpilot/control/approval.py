@@ -18,18 +18,29 @@ from typing import Callable
 from uuid import UUID
 
 import structlog
-
 from pwnpilot.data.models import (
     ActionRequest,
     ActionType,
     ApprovalStatus,
     ApprovalTicket,
+    OperatorDecision,
+    OperatorDecisionType,
     RiskLevel,
 )
 
 log = structlog.get_logger(__name__)
 
 DEFAULT_TICKET_TTL_SECONDS: int = 3600  # 1 hour
+
+
+def _approval_status_to_decision_type(status: ApprovalStatus) -> OperatorDecisionType:
+    """Map ApprovalStatus to the corresponding OperatorDecisionType."""
+    _map = {
+        ApprovalStatus.APPROVED: OperatorDecisionType.APPROVE,
+        ApprovalStatus.DENIED: OperatorDecisionType.DENY,
+        ApprovalStatus.DEFERRED: OperatorDecisionType.DEFER,
+    }
+    return _map.get(status, OperatorDecisionType.APPROVE)
 
 
 class TicketNotFoundError(Exception):
@@ -55,11 +66,13 @@ class ApprovalService:
         ttl_seconds: int = DEFAULT_TICKET_TTL_SECONDS,
         persist_fn: Callable[[ApprovalTicket], None] | None = None,
         load_fn: Callable[[], list[ApprovalTicket]] | None = None,
+        decision_store=None,
     ) -> None:
         self._ttl = timedelta(seconds=ttl_seconds)
         self._persist = persist_fn
         self._tickets: dict[UUID, ApprovalTicket] = {}
         self._lock = threading.Lock()
+        self._decision_store = decision_store
 
         # Reload pending tickets from persistent store on startup
         if load_fn:
@@ -166,6 +179,28 @@ class ApprovalService:
 
         if self._persist:
             self._persist(updated)
+
+        # Record unified v2 OperatorDecision
+        if self._decision_store is not None:
+            try:
+                decision_type = _approval_status_to_decision_type(new_status)
+                decision = OperatorDecision(
+                    engagement_id=updated.engagement_id,
+                    decision_type=decision_type,
+                    scope=f"action:{updated.action_id}",
+                    rationale=reason or f"Ticket {ticket_id} {new_status.value} by {resolved_by}",
+                    actor=resolved_by,
+                    action_id=updated.action_id,
+                    ticket_id=updated.ticket_id,
+                    downstream_effect={
+                        "tool_name": updated.tool_name,
+                        "risk_level": updated.risk_level.value,
+                        "action_type": updated.action_type.value,
+                    },
+                )
+                self._decision_store.record(decision)
+            except Exception as exc:
+                log.error("approval.decision_record_failed", error=str(exc))
 
         log.info(
             "approval.ticket_resolved",

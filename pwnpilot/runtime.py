@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,11 @@ from sqlalchemy.pool import QueuePool
 
 from pwnpilot.agent.checkpointer import SqliteCheckpointer
 from pwnpilot.config import PwnpilotConfig, load_config as _pydantic_load_config
+from pwnpilot.agent.event_bus import ExecutionEventBus, event_bus as _global_event_bus
 from pwnpilot.agent.executor import ExecutorNode
 from pwnpilot.agent.planner import PlannerNode
 from pwnpilot.agent.reporter import ReporterNode
-from pwnpilot.agent.state import AgentState
+from pwnpilot.agent.state import AgentState, CompletionState, OperatorMode, make_initial_state
 from pwnpilot.agent.supervisor import Supervisor, build_graph
 from pwnpilot.agent.validator import ValidatorNode
 from pwnpilot.control.approval import ApprovalService
@@ -196,7 +198,179 @@ def _agent_runtime_settings(typed_cfg: Any) -> dict[str, Any]:
         "per_step_budget": int(getattr(agent_cfg, "per_step_budget", 3)),
         "adaptive_cooldown_enabled": bool(getattr(agent_cfg, "adaptive_cooldown_enabled", True)),
         "adaptive_cooldown_max": int(getattr(agent_cfg, "adaptive_cooldown_max", 6)),
+        "max_pv_cycles_without_executor": int(
+            getattr(agent_cfg, "max_planner_validator_cycles_without_executor", 40)
+        ),
+        "max_consecutive_rejects_per_reason": int(
+            getattr(agent_cfg, "max_consecutive_rejects_per_reason", 12)
+        ),
+        "max_autonomous_runtime_seconds": int(
+            getattr(agent_cfg, "max_autonomous_runtime_seconds", 3600)
+        ),
     }
+
+
+def _emit_terminal_lifecycle_events(
+    audit_store: AuditStore,
+    engagement_id: UUID,
+    final_state: AgentState | None,
+    postmortem_artifact_path: str | None = None,
+) -> None:
+    """Write deterministic terminal engagement/report lifecycle audit events."""
+    state = final_state or {}
+    completion_state = str(state.get("completion_state", "")).strip() or None
+    error_text = str(state.get("error", "")).strip()
+    termination_reason = str(state.get("termination_reason", "")).strip() or None
+    report_complete = bool(state.get("report_complete", False))
+    finalization_failed = bool(state.get("finalization_failed", False))
+
+    engagement_failed = bool(
+        error_text
+        or finalization_failed
+        or completion_state == CompletionState.FAILED.value
+    )
+    engagement_event = "EngagementFailed" if engagement_failed else "EngagementCompleted"
+    try:
+        audit_store.append(
+            engagement_id=engagement_id,
+            actor="system",
+            event_type=engagement_event,
+            payload={
+                "engagement_id": str(engagement_id),
+                "termination_reason": termination_reason,
+                "error": error_text or None,
+                "completion_state": completion_state,
+                "finalization_failed": finalization_failed,
+            },
+        )
+    except Exception as exc:
+        log.error("runtime.terminal_event_write_failed", exc=str(exc), event_type=engagement_event)
+
+    if report_complete:
+        return
+
+    try:
+        audit_store.append(
+            engagement_id=engagement_id,
+            actor="system",
+            event_type="ReportGenerationFailed",
+            payload={
+                "engagement_id": str(engagement_id),
+                "reason": error_text or termination_reason or "report_not_generated",
+                "postmortem_artifact_path": postmortem_artifact_path,
+            },
+        )
+    except Exception as exc:
+        log.error("runtime.report_outcome_event_write_failed", exc=str(exc))
+
+
+def _normalize_terminal_state(
+    state: AgentState | None,
+    default_termination_reason: str | None = None,
+    default_error: str | None = None,
+) -> AgentState:
+    """Return a terminal-ready state with deterministic completion markers."""
+    normalized: AgentState = dict(state or {})
+
+    if default_termination_reason and not normalized.get("termination_reason"):
+        normalized["termination_reason"] = default_termination_reason
+    if default_error and not normalized.get("error"):
+        normalized["error"] = default_error
+
+    report_complete = bool(normalized.get("report_complete", False))
+    completion_state = str(normalized.get("completion_state", "")).strip()
+    if completion_state not in {
+        CompletionState.PENDING.value,
+        CompletionState.FINALIZED.value,
+        CompletionState.FAILED.value,
+    }:
+        completion_state = ""
+
+    if report_complete:
+        normalized["completion_state"] = CompletionState.FINALIZED.value
+        normalized["finalization_failed"] = False
+        normalized["finalization_failure_reason"] = None
+    else:
+        normalized["completion_state"] = CompletionState.FAILED.value
+        normalized["finalization_failed"] = True
+        if not normalized.get("finalization_failure_reason"):
+            normalized["finalization_failure_reason"] = (
+                str(normalized.get("error") or "").strip()
+                or str(normalized.get("termination_reason") or "").strip()
+                or "report_not_generated"
+            )
+        if completion_state == CompletionState.PENDING.value:
+            normalized["completion_state"] = CompletionState.FAILED.value
+
+    return normalized
+
+
+def _persist_postmortem_artifact(
+    audit_store: AuditStore,
+    output_dir: Path,
+    engagement_id: UUID,
+    final_state: AgentState | None,
+) -> str | None:
+    """Persist a compact terminal snapshot for forensic/debug reporting."""
+    state = final_state or {}
+    should_persist = bool(
+        state.get("error")
+        or state.get("finalization_failed")
+        or not state.get("report_complete", False)
+    )
+    if not should_persist:
+        return None
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        recent_events = list(audit_store.events_for_engagement(engagement_id))[-50:]
+        artifact_path = output_dir / f"postmortem_{engagement_id}.json"
+        payload = {
+            "engagement_id": str(engagement_id),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "error": state.get("error"),
+            "termination_reason": state.get("termination_reason"),
+            "completion_state": state.get("completion_state"),
+            "finalization_failed": bool(state.get("finalization_failed", False)),
+            "finalization_failure_reason": state.get("finalization_failure_reason"),
+            "report_complete": bool(state.get("report_complete", False)),
+            "report_trigger_reason": state.get("report_trigger_reason"),
+            "stall_state": state.get("stall_state"),
+            "loop_state": {
+                "iteration_count": state.get("iteration_count", 0),
+                "no_new_findings_streak": state.get("no_new_findings_streak", 0),
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0),
+                "planner_validator_cycle_streak": state.get("planner_validator_cycle_streak", 0),
+                "reject_reason_streak_count": state.get("reject_reason_streak_count", 0),
+                "last_reject_reason_fingerprint": state.get("last_reject_reason_fingerprint"),
+            },
+            "last_result": state.get("last_result"),
+            "last_execution_hints": state.get("last_execution_hints", []),
+            "recent_audit_events": [
+                {
+                    "timestamp": evt.timestamp.isoformat(),
+                    "actor": evt.actor,
+                    "event_type": evt.event_type,
+                    "payload": evt.payload,
+                }
+                for evt in recent_events
+            ],
+        }
+        artifact_path.write_text(json.dumps(payload, indent=2, default=str))
+        audit_store.append(
+            engagement_id=engagement_id,
+            actor="system",
+            event_type="PostmortemArtifactGenerated",
+            payload={"path": str(artifact_path), "event_count": len(recent_events)},
+        )
+        return str(artifact_path)
+    except Exception as exc:
+        log.warning(
+            "runtime.postmortem_artifact_failed",
+            engagement_id=str(engagement_id),
+            exc=str(exc),
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +440,10 @@ def _build_runtime(
     finding_store = FindingStore(session)
     from pwnpilot.data.permission_store import PermissionStore
     permission_store = PermissionStore(session)
+    from pwnpilot.data.retrieval_store import RetrievalStore
+    retrieval_store = RetrievalStore(session)
+    from pwnpilot.data.operator_decision_store import OperatorDecisionStore
+    operator_decision_store = OperatorDecisionStore(session)
 
     # Governance — kill switch wired to audit store for KillSwitchTriggered events
     def _kill_switch_audit(reason: str) -> None:
@@ -323,13 +501,18 @@ def _build_runtime(
     tools_cfg = getattr(typed_cfg, "tools", None)
     mem_limit_mb = int(getattr(tools_cfg, "memory_limit_mb", 2048)) if tools_cfg else 2048
     cpu_limit_sec = int(getattr(tools_cfg, "cpu_limit_seconds", 300)) if tools_cfg else 300
-    
+
+    # v2: Wire event bus — tool runner and executor emit to it; audit store persists events.
+    engagement_event_bus = ExecutionEventBus()
+    engagement_event_bus.set_audit_store(audit_store)
+
     tool_runner = ToolRunner(
         adapters=adapters,
         evidence_store=evidence_store,
         kill_switch=kill_switch,
-        mem_limit=mem_limit_mb * 1024 * 1024,  # Convert MB to bytes
+        mem_limit=mem_limit_mb * 1024 * 1024,
         cpu_limit=cpu_limit_sec,
+        event_bus=engagement_event_bus,
     )
 
     planner_available_tools = _compute_executable_tool_names(tool_registry)
@@ -362,19 +545,21 @@ def _build_runtime(
         max_retries=typed_cfg.llm.max_retries,
     )
 
-    # Approval service — wired to DB for crash durability
+    # Approval service — wired to DB for crash durability, v2 decisions recorded
     approval_store = ApprovalStore(session)
     approval_service = ApprovalService(
         persist_fn=approval_store.upsert,
         load_fn=approval_store.load_pending,
+        decision_store=operator_decision_store,
     )
 
-    # Report generator
+    # Report generator — v2 includes timeline and operator decisions
     report_generator = ReportGenerator(
         finding_store=finding_store,
         recon_store=recon_store,
         evidence_store=evidence_store,
         audit_store=audit_store,
+        operator_decision_store=operator_decision_store,
     )
 
     return {
@@ -383,11 +568,14 @@ def _build_runtime(
         "evidence_store": evidence_store,
         "recon_store": recon_store,
         "finding_store": finding_store,
+        "retrieval_store": retrieval_store,
         "permission_store": permission_store,
+        "operator_decision_store": operator_decision_store,
         "kill_switch": kill_switch,
         "adapters": adapters,
         "tool_registry": tool_registry,
         "tool_runner": tool_runner,
+        "event_bus": engagement_event_bus,
         "planner_available_tools": planner_available_tools,
         "planner_tools_catalog": planner_tools_catalog,
         "capability_registry": capability_registry,
@@ -418,7 +606,14 @@ def create_and_run_engagement(
     max_iterations: int = 50,
     config_path: Path | None = None,
     dry_run: bool = False,
+    event_subscriber: object | None = None,
 ) -> str:
+    """Start and run a full engagement.
+
+    *event_subscriber* — optional callable(ExecutionEvent) -> None.  When
+    provided it is subscribed to all events for this engagement so callers (e.g.
+    the CLI) can print live output without coupling to the TUI.
+    """
     rt = _build_runtime(config_path)
 
     now = datetime.now(timezone.utc)
@@ -443,6 +638,11 @@ def create_and_run_engagement(
         sim = SimulationEngine(eng_svc)
         log.info("runtime.dry_run_enabled", engagement_id=str(engagement.engagement_id))
         return str(engagement.engagement_id)
+
+    # Wire optional live-output subscriber (e.g. CLI stdout handler) before the
+    # graph starts so no events are missed.
+    if event_subscriber is not None:
+        rt["event_bus"].subscribe(engagement.engagement_id, event_subscriber)  # type: ignore[attr-defined]
 
     # Build agent nodes
     agent_settings = _agent_runtime_settings(rt["typed_cfg"])
@@ -485,6 +685,7 @@ def create_and_run_engagement(
         },
         audit_store=rt["audit_store"],
         metrics=metrics,
+        event_bus=rt["event_bus"],
     )
     executor = ExecutorNode(
         policy_engine=policy_engine,
@@ -498,6 +699,7 @@ def create_and_run_engagement(
         target_family="multi_scope",
         target_resolver=rt["target_resolver"],
         capability_registry=rt["capability_registry"],
+        event_bus=rt["event_bus"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -506,6 +708,7 @@ def create_and_run_engagement(
         report_generator=rt["report_generator"],
         audit_store=rt["audit_store"],
         output_dir=output_dir,
+        event_bus=rt["event_bus"],
     )
 
     db_path = Path(
@@ -522,32 +725,14 @@ def create_and_run_engagement(
         checkpointer=checkpointer,
     )
 
-    initial_state: AgentState = {
-        "engagement_id": str(engagement.engagement_id),
-        "iteration_count": 0,
-        "max_iterations": max_iterations,
-        "no_new_findings_streak": 0,
-        "nonproductive_cycle_streak": 0,
-        "recon_summary": {},
-        "previous_actions": [],
-        "temporarily_unavailable_tools": {},
-        "proposed_action": None,
-        "validation_result": None,
-        "last_result": None,
-        "evidence_ids": [],
-        "kill_switch": False,
-        "report_complete": False,
-        "report_trigger_reason": None,
-        "stall_state": "none",
-        "termination_reason": None,
-        "run_verdict": None,
-        "readiness_gate_results": {},
-        "degradation_reasons": [],
-        "last_rejection_code": "",
-        "last_rejection_class": "",
-        "rejection_repeat_count": 0,
-        "error": None,
-    }
+    initial_state: AgentState = make_initial_state(
+        engagement_id=str(engagement.engagement_id),
+        max_iterations=max_iterations,
+        max_pv_cycles_without_executor=agent_settings["max_pv_cycles_without_executor"],
+        max_consecutive_rejects_per_reason=agent_settings["max_consecutive_rejects_per_reason"],
+        max_autonomous_runtime_seconds=agent_settings["max_autonomous_runtime_seconds"],
+        operator_mode=OperatorMode.AUTONOMOUS,
+    )
 
     rt["audit_store"].append(
         engagement_id=engagement.engagement_id,
@@ -556,7 +741,41 @@ def create_and_run_engagement(
         payload={"engagement_id": str(engagement.engagement_id), "name": name},
     )
 
-    final_state = supervisor.run(initial_state, thread_id=str(engagement.engagement_id))
+    final_state: AgentState | None = None
+    runtime_exception: Exception | None = None
+    try:
+        final_state = supervisor.run(initial_state, thread_id=str(engagement.engagement_id))
+    except Exception as exc:
+        runtime_exception = exc
+        log.exception(
+            "runtime.engagement_run_failed",
+            engagement_id=str(engagement.engagement_id),
+            exc=str(exc),
+        )
+    finally:
+        normalized_state = _normalize_terminal_state(
+            final_state,
+            default_termination_reason=(
+                "unhandled_runtime_exception" if runtime_exception else "terminal_exit"
+            ),
+            default_error=(str(runtime_exception) if runtime_exception else None),
+        )
+        postmortem_path = _persist_postmortem_artifact(
+            rt["audit_store"],
+            output_dir,
+            engagement.engagement_id,
+            normalized_state,
+        )
+        _emit_terminal_lifecycle_events(
+            rt["audit_store"],
+            engagement.engagement_id,
+            normalized_state,
+            postmortem_artifact_path=postmortem_path,
+        )
+        final_state = normalized_state
+
+    if runtime_exception is not None:
+        raise runtime_exception
 
     if final_state.get("report_trigger_reason"):
         metrics.record_report_trigger(str(final_state.get("report_trigger_reason")))
@@ -675,6 +894,7 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         },
         audit_store=rt["audit_store"],
         metrics=metrics,
+        event_bus=rt["event_bus"],
     )
     executor = ExecutorNode(
         policy_engine=policy_engine,
@@ -695,6 +915,7 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         report_generator=rt["report_generator"],
         audit_store=rt["audit_store"],
         output_dir=output_dir,
+        event_bus=rt["event_bus"],
     )
 
     graph = build_graph(planner, validator, executor, reporter, checkpointer=checkpointer)
@@ -705,7 +926,37 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
     )
 
     # Invoke with None: LangGraph resumes from the last checkpoint
-    final_state = supervisor.run(None, thread_id=thread_id)  # type: ignore[arg-type]
+    final_state: AgentState | None = None
+    runtime_exception: Exception | None = None
+    try:
+        final_state = supervisor.run(None, thread_id=thread_id)  # type: ignore[arg-type]
+    except Exception as exc:
+        runtime_exception = exc
+        log.exception("runtime.resume_run_failed", engagement_id=thread_id, exc=str(exc))
+    finally:
+        normalized_state = _normalize_terminal_state(
+            final_state,
+            default_termination_reason=(
+                "unhandled_runtime_exception" if runtime_exception else "terminal_exit"
+            ),
+            default_error=(str(runtime_exception) if runtime_exception else None),
+        )
+        postmortem_path = _persist_postmortem_artifact(
+            rt["audit_store"],
+            output_dir,
+            engagement_id,
+            normalized_state,
+        )
+        _emit_terminal_lifecycle_events(
+            rt["audit_store"],
+            engagement_id,
+            normalized_state,
+            postmortem_artifact_path=postmortem_path,
+        )
+        final_state = normalized_state
+
+    if runtime_exception is not None:
+        raise runtime_exception
 
     if final_state and final_state.get("report_trigger_reason"):
         metrics.record_report_trigger(str(final_state.get("report_trigger_reason")))

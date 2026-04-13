@@ -1,12 +1,17 @@
 """
 Tool Runner — executes adapter commands in a hardened, isolated subprocess context.
 
-Isolation (v1):
+Isolation:
 - subprocess.run with explicit list (no shell=True) — ADR-002, ADR-007
 - Process group timeout enforced by SIGKILL
 - Resource limits via resource module (CPU time, memory)
 - stdout/stderr streamed in 64 KB chunks to evidence store (never buffered in memory)
 - 256 MB evidence size cap per action
+
+v2 additions:
+- Emits canonical ExecutionEvents via the event bus:
+    action.started, tool.output_chunk, action.completed, action.failed
+- ToolRunner accepts an optional event_bus for live output delivery.
 
 ADR-007: raises ValueError if build_command() returns a string (structural enforcement)
 """
@@ -29,9 +34,12 @@ from pwnpilot.data.evidence_store import EvidenceStore
 from pwnpilot.data.models import (
     ActionRequest,
     ErrorClass,
+    ExecutionEvent,
+    ExecutionEventType,
     FailureReason,
     OutcomeStatus,
     ToolExecutionResult,
+    ToolOutputChunk,
 )
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.plugins.binaries import candidate_binaries, resolve_binary_for_tool
@@ -40,11 +48,14 @@ from pwnpilot.plugins.sdk import BaseAdapter
 log = structlog.get_logger(__name__)
 
 _CHUNK_SIZE: int = 64 * 1024
-_DEFAULT_CPU_LIMIT: int = 300       # seconds (should be overridden by config)
-_DEFAULT_MEM_LIMIT: int = 2 * 1024 * 1024 * 1024  # 2 GB virtual memory (should be overridden by config)
-_DEFAULT_TIMEOUT: int = 300         # wall-clock seconds
+_DEFAULT_CPU_LIMIT: int = 300
+_DEFAULT_MEM_LIMIT: int = 2 * 1024 * 1024 * 1024  # 2 GB
+_DEFAULT_TIMEOUT: int = 300
 
 _MAX_LOG_PREVIEW: int = 2048
+# Maximum total bytes of live-output chunks buffered per action to prevent
+# memory exhaustion on very long-running tools.
+_MAX_LIVE_OUTPUT_BYTES: int = 256 * 1024  # 256 KB per stream
 
 
 def _preview_bytes(data: bytes, max_chars: int = _MAX_LOG_PREVIEW) -> str:
@@ -174,6 +185,8 @@ class ToolRunner:
     """
     Executes tool adapters in isolated subprocesses with resource limits and evidence
     capture.
+
+    v2: Emits ExecutionEvents via *event_bus* if provided.
     """
 
     def __init__(
@@ -185,6 +198,7 @@ class ToolRunner:
         mem_limit: int = _DEFAULT_MEM_LIMIT,
         timeout: int = _DEFAULT_TIMEOUT,
         max_workers: int = 4,
+        event_bus: object | None = None,
     ) -> None:
         self._adapters = adapters
         self._evidence = evidence_store
@@ -193,6 +207,7 @@ class ToolRunner:
         self._mem_limit = mem_limit
         self._timeout = timeout
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._event_bus = event_bus  # ExecutionEventBus | None
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,6 +217,12 @@ class ToolRunner:
         """
         Validate, build, and execute the tool command for the given ActionRequest.
         Streams output to the evidence store.  Returns ToolExecutionResult.
+
+        Emits ExecutionEvents:
+          - action.started    — before subprocess launch
+          - tool.output_chunk — for each chunk of stdout/stderr (if bus wired)
+          - action.completed  — on success / degraded
+          - action.failed     — on hard failure
         """
         if self._kill_switch.is_set():
             raise HaltedError("Kill switch is active; refusing to spawn subprocess.")
@@ -221,11 +242,27 @@ class ToolRunner:
                 "It MUST return list[str] (ADR-007)."
             )
 
-        # Resolve binary per-OS to handle tool naming differences across environments.
+        # Resolve binary per-OS
         if cmd:
             resolved = resolve_binary_for_tool(action.tool_name, str(cmd[0]))
             if resolved:
                 cmd[0] = resolved
+
+        command_str = " ".join(str(c) for c in cmd)
+
+        # Emit action.started
+        self._emit(ExecutionEvent(
+            engagement_id=action.engagement_id,
+            action_id=action.action_id,
+            event_type=ExecutionEventType.ACTION_STARTED,
+            tool_name=action.tool_name,
+            command=command_str,
+            payload={
+                "risk_level": action.risk_level.value,
+                "action_type": action.action_type.value,
+                "target": action.params.get("target", ""),
+            },
+        ))
 
         log.info(
             "runner.executing",
@@ -240,6 +277,7 @@ class ToolRunner:
         stdout_bytes, stderr_bytes, exit_code, timed_out = self._run_subprocess(
             cmd,
             action.tool_name,
+            action,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -297,6 +335,28 @@ class ToolRunner:
             }
         )
 
+        # Emit action.completed or action.failed
+        completion_event_type = (
+            ExecutionEventType.ACTION_FAILED
+            if outcome_status == OutcomeStatus.FAILED
+            else ExecutionEventType.ACTION_COMPLETED
+        )
+        self._emit(ExecutionEvent(
+            engagement_id=action.engagement_id,
+            action_id=action.action_id,
+            event_type=completion_event_type,
+            tool_name=action.tool_name,
+            command=command_str,
+            payload={
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "outcome_status": outcome_status.value,
+                "failure_reasons": [r.value for r in failure_reasons],
+                "parser_confidence": parsed.confidence,
+                "timed_out": timed_out,
+            },
+        ))
+
         log.info(
             "runner.complete",
             tool=action.tool_name,
@@ -315,8 +375,8 @@ class ToolRunner:
             parsed_output=_redact_sensitive(result.parsed_output),
             parser_confidence=result.parser_confidence,
             error_class=(result.error_class.value if result.error_class else None),
-              outcome_status=result.outcome_status.value,
-              failure_reasons=[reason.value for reason in result.failure_reasons],
+            outcome_status=result.outcome_status.value,
+            failure_reasons=[reason.value for reason in result.failure_reasons],
         )
         return result
 
@@ -329,23 +389,64 @@ class ToolRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _emit(self, event: ExecutionEvent) -> None:
+        """Publish event to the bus if one is wired."""
+        if self._event_bus is not None:
+            try:
+                self._event_bus.publish(event)  # type: ignore[attr-defined]
+            except Exception as exc:
+                log.warning("runner.event_emit_failed", exc=str(exc), event_type=event.event_type.value)
+
+    def _emit_output_chunks(
+        self,
+        action: ActionRequest,
+        stream: str,
+        data: bytes,
+    ) -> None:
+        """Emit tool.output_chunk events for each _CHUNK_SIZE segment of *data*."""
+        if self._event_bus is None or not data:
+            return
+        total = 0
+        seq = 0
+        for offset in range(0, len(data), _CHUNK_SIZE):
+            chunk_data = data[offset : offset + _CHUNK_SIZE]
+            total += len(chunk_data)
+            truncated = total >= _MAX_LIVE_OUTPUT_BYTES
+            self._emit(ExecutionEvent(
+                engagement_id=action.engagement_id,
+                action_id=action.action_id,
+                event_type=ExecutionEventType.TOOL_OUTPUT_CHUNK,
+                tool_name=action.tool_name,
+                payload={
+                    "stream": stream,
+                    "data": chunk_data.decode(errors="replace"),
+                    "sequence": seq,
+                    "truncated": truncated,
+                },
+            ))
+            seq += 1
+            if truncated:
+                break
+
     def _run_subprocess(
         self,
         cmd: list[str],
         tool_name: str,
+        action: ActionRequest,
     ) -> tuple[bytes, bytes, int, bool]:
         """
         Run *cmd* as a subprocess with resource limits.
         Returns (stdout, stderr, exit_code, timed_out).
+        Streams tool.output_chunk events in real-time as output arrives.
         """
+        import threading
+
         def _preexec() -> None:
-            # Set resource limits for the child process
             try:
                 resource.setrlimit(resource.RLIMIT_CPU, (self._cpu_limit, self._cpu_limit))
                 resource.setrlimit(resource.RLIMIT_AS, (self._mem_limit, self._mem_limit))
             except Exception:
                 pass
-            # New process group so we can SIGKILL all children
             os.setsid()
 
         try:
@@ -364,15 +465,63 @@ class ToolRunner:
                 "Ensure a compatible binary is installed (run install_security_tools.sh)."
             ) from exc
 
+        stdout_buf: list[bytes] = []
+        stderr_buf: list[bytes] = []
+        # Per-stream byte counters — each stream tracks its own live-output budget
+        live_counter: dict[str, int] = {"stdout": 0, "stderr": 0}
+        counter_lock = threading.Lock()
+
+        def _drain(pipe: object, buf: list[bytes], stream: str) -> None:
+            """Read *pipe* in _CHUNK_SIZE increments, buffer and emit events live."""
+            seq = 0
+            while True:
+                chunk = pipe.read(_CHUNK_SIZE)  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                buf.append(chunk)
+                if self._event_bus is not None:
+                    with counter_lock:
+                        sent = live_counter[stream]
+                        remaining = _MAX_LIVE_OUTPUT_BYTES - sent
+                        if remaining <= 0:
+                            seq += 1
+                            continue
+                        data_slice = chunk[:remaining]
+                        live_counter[stream] += len(data_slice)
+                        truncated = live_counter[stream] >= _MAX_LIVE_OUTPUT_BYTES
+                    self._emit(ExecutionEvent(
+                        engagement_id=action.engagement_id,
+                        action_id=action.action_id,
+                        event_type=ExecutionEventType.TOOL_OUTPUT_CHUNK,
+                        tool_name=action.tool_name,
+                        payload={
+                            "stream": stream,
+                            "data": data_slice.decode(errors="replace"),
+                            "sequence": seq,
+                            "truncated": truncated,
+                        },
+                    ))
+                seq += 1
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_buf, "stdout"), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_buf, "stderr"), daemon=True)
+        t_out.start()
+        t_err.start()
+
         timed_out = False
-        try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=self._timeout)
-        except subprocess.TimeoutExpired:
+        t_out.join(timeout=self._timeout)
+        t_err.join(timeout=self._timeout)
+        if t_out.is_alive() or t_err.is_alive():
             timed_out = True
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout_bytes, stderr_bytes = proc.communicate()
+            t_out.join()
+            t_err.join()
+
+        proc.wait()
+        stdout_bytes = b"".join(stdout_buf)
+        stderr_bytes = b"".join(stderr_buf)
 
         return stdout_bytes, stderr_bytes, proc.returncode or 0, timed_out

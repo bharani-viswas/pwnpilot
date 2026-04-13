@@ -32,7 +32,7 @@ from uuid import UUID, uuid4
 import structlog
 
 from pwnpilot.agent.roe_interpreter import ExtractedPolicy, InterpretationResult
-from pwnpilot.data.models import AuditEvent
+from pwnpilot.data.models import AuditEvent, OperatorDecision, OperatorDecisionType
 
 log = structlog.get_logger(__name__)
 
@@ -118,6 +118,7 @@ class ApprovalWorkflow:
         self,
         audit_fn=None,
         session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
+        decision_store=None,
     ):
         """
         Initialize approval workflow.
@@ -125,10 +126,12 @@ class ApprovalWorkflow:
         Args:
             audit_fn: Callback function for audit logging (takes AuditEvent)
             session_ttl_seconds: Session timeout in seconds (default 900 = 15 min)
+            decision_store: Optional OperatorDecisionStore for persisting v2 decisions
         """
         self._audit_fn = audit_fn
         self._session_ttl = session_ttl_seconds
         self._sessions: dict[str, ApprovalSession] = {}
+        self._decision_store = decision_store
         self._logger = logging.getLogger("pwnpilot.approval")
 
     # ------------------------------------------------------------------
@@ -466,6 +469,35 @@ class ApprovalWorkflow:
                 "confidence_score": interpretation_result.confidence_score,
             },
         )
+
+        # Emit unified v2 OperatorDecision record
+        if self._decision_store is not None:
+            try:
+                roe_id = record.approval_id
+                decision = OperatorDecision(
+                    engagement_id=session.engagement_id,
+                    decision_type=OperatorDecisionType.ROE_APPROVAL,
+                    scope=f"roe:{roe_id}",
+                    rationale=(
+                        f"ROE policies approved by {session.user} via sudo verification "
+                        f"(confidence={interpretation_result.confidence_score:.2f})"
+                    ),
+                    actor=session.user,
+                    roe_id=roe_id,
+                    downstream_effect={
+                        "session_id": session.session_id,
+                        "confidence_score": interpretation_result.confidence_score,
+                        "password_verified": session.password_verified,
+                        "constraint_count": len(
+                            interpretation_result.extracted_policy.constraints
+                            if hasattr(interpretation_result.extracted_policy, "constraints")
+                            else []
+                        ),
+                    },
+                )
+                self._decision_store.record(decision)
+            except Exception as exc:
+                log.error("roe_approval.decision_record_failed", error=str(exc))
 
         return record
 

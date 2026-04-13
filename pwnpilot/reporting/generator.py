@@ -36,11 +36,13 @@ class ReportGenerator:
         recon_store: ReconStore,
         evidence_store: EvidenceStore,
         audit_store: AuditStore,
+        operator_decision_store: "Any | None" = None,
     ) -> None:
         self._findings = finding_store
         self._recon = recon_store
         self._evidence = evidence_store
         self._audit = audit_store
+        self._decision_store = operator_decision_store
         self._jinja = jinja2.Environment(
             loader=jinja2.FileSystemLoader(str(_TEMPLATE_DIR)),
             autoescape=False,
@@ -70,6 +72,24 @@ class ReportGenerator:
 
         metadata = run_metadata or {}
 
+        # v2 timeline — execution events from audit store
+        event_timeline: list[dict[str, Any]] = []
+        try:
+            event_timeline = list(self._audit.execution_events_for_engagement(engagement_id))
+        except Exception:
+            pass
+
+        # v2 operator decisions
+        operator_decisions: list[dict[str, Any]] = []
+        if self._decision_store is not None:
+            try:
+                operator_decisions = [
+                    d.model_dump(mode="json")
+                    for d in self._decision_store.decisions_for_engagement(engagement_id)
+                ]
+            except Exception:
+                pass
+
         bundle = {
             "engagement_id": str(engagement_id),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -83,7 +103,9 @@ class ReportGenerator:
             "readiness_gate_results": metadata.get("readiness_gate_results", {}),
             "degradation_reasons": metadata.get("degradation_reasons", []),
             "termination_reason": metadata.get("termination_reason"),
-            "schema_version": "v1",
+            "event_timeline": event_timeline,
+            "operator_decisions": operator_decisions,
+            "schema_version": "v2",
         }
 
         bundle_path = output_dir / f"report_{engagement_id}.json"

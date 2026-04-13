@@ -1,7 +1,14 @@
 """
 Canonical Pydantic v2 data models for the pwnpilot framework.
 
-All models carry schema_version = "v1" for forward-compatibility and migration support.
+schema_version "v2" — breaking cutover, no backward compatibility.
+
+v2 additions:
+  - ExecutionEventType / ExecutionEvent: canonical live execution events.
+  - OperatorDecisionType / OperatorDecision: unified approval decision model.
+  - OperatorDirective: typed operator directive contract.
+  - ReplaySnapshot: replay-ready run snapshot.
+  - ToolOutputChunk: live stdout/stderr stream chunk.
 """
 from __future__ import annotations
 
@@ -26,6 +33,61 @@ class ActionType(str, Enum):
     EXPLOIT = "exploit"
     POST_EXPLOIT = "post_exploit"
     DATA_EXFIL = "data_exfil"
+
+
+# ---------------------------------------------------------------------------
+# v2 execution event types
+# ---------------------------------------------------------------------------
+
+
+class ExecutionEventType(str, Enum):
+    # Runner lifecycle
+    ACTION_STARTED = "action.started"
+    TOOL_OUTPUT_CHUNK = "tool.output_chunk"
+    ACTION_COMPLETED = "action.completed"
+    ACTION_FAILED = "action.failed"
+
+    # Executor lifecycle
+    EXECUTOR_POLICY_CHECKED = "executor.policy_checked"
+    EXECUTOR_RECOVERY_HINT = "executor.recovery_hint"
+
+    # Operator control
+    OPERATOR_DIRECTIVE_SUBMITTED = "operator.directive_submitted"
+    OPERATOR_MODE_CHANGED = "operator.mode_changed"
+    OPERATOR_MESSAGE_SENT = "operator.message_sent"
+
+    # Approval events
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_RESOLVED = "approval.resolved"
+
+    # Report / finalization
+    REPORT_FINALIZATION_STARTED = "report.finalization_started"
+    REPORT_FINALIZATION_FAILED = "report.finalization_failed"
+    REPORT_FINALIZED = "report.finalized"
+
+    # Replay / export
+    REPLAY_SNAPSHOT_GENERATED = "replay.snapshot_generated"
+    ENGAGEMENT_EXPORT_GENERATED = "engagement.export_generated"
+
+    # Memory / repetition
+    REPETITION_DETECTED = "repetition.detected"
+    VALIDATOR_REJECTED = "validator.rejected"
+    FINDING_PERSISTED = "finding.persisted"
+    RETRIEVAL_CONTEXT_REFRESHED = "retrieval.context_refreshed"
+
+
+# ---------------------------------------------------------------------------
+# Operator decision types (unified)
+# ---------------------------------------------------------------------------
+
+
+class OperatorDecisionType(str, Enum):
+    APPROVE = "approve"
+    DENY = "deny"
+    DEFER = "defer"
+    ESCALATE = "escalate"
+    POLICY_EXCEPTION = "policy_exception"
+    ROE_APPROVAL = "roe_approval"
 
 
 class RiskLevel(str, Enum):
@@ -381,3 +443,127 @@ class ROEApprovalRecord(BaseModel):
     schema_version: str = "v1"
     
     model_config = {"frozen": True}
+
+
+# ---------------------------------------------------------------------------
+# v2 ExecutionEvent — canonical live execution event
+# ---------------------------------------------------------------------------
+
+
+class ExecutionEvent(BaseModel):
+    """
+    Canonical v2 execution event.
+
+    Emitted by ToolRunner and ExecutorNode; consumed by the event bus,
+    audit store, TUI, CLI live-output, replay, and export paths.
+    """
+    event_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    action_id: UUID | None = None
+    event_type: ExecutionEventType
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    tool_name: str | None = None
+    command: str | None = None
+    actor: str = "system"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    schema_version: str = "v2"
+
+
+# ---------------------------------------------------------------------------
+# v2 ToolOutputChunk — live stdout/stderr stream segment
+# ---------------------------------------------------------------------------
+
+
+class ToolOutputChunk(BaseModel):
+    """
+    A single chunk of live stdout/stderr output from a running tool.
+    Buffered per-action with truncation policy (see ToolOutputStream).
+    """
+    chunk_id: UUID = Field(default_factory=uuid4)
+    action_id: UUID
+    engagement_id: UUID
+    stream: str  # "stdout" | "stderr"
+    data: str    # UTF-8 decoded chunk (with replacement for invalid bytes)
+    sequence: int
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    truncated: bool = False
+    schema_version: str = "v2"
+
+
+# ---------------------------------------------------------------------------
+# v2 OperatorDirective — typed operator intent contract
+# ---------------------------------------------------------------------------
+
+
+class OperatorDirective(BaseModel):
+    """
+    Typed operator directive consumed by planner and validator.
+    Every field is optional; only supplied fields alter behavior.
+    """
+    directive_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    submitted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    operator_id: str
+
+    # Intent fields consumed by planner
+    objective: str | None = None
+    requested_focus: str | None = None
+    constraints: list[str] = Field(default_factory=list)
+    paused_tool_families: list[str] = Field(default_factory=list)
+    notes: str | None = None
+
+    schema_version: str = "v2"
+
+
+# ---------------------------------------------------------------------------
+# v2 OperatorDecision — unified approval/denial/deferral model
+# ---------------------------------------------------------------------------
+
+
+class OperatorDecision(BaseModel):
+    """
+    Unified operator decision model for runtime approvals, ROE approvals,
+    policy exceptions, and deferred decisions.
+
+    Replaces the parallel ApprovalTicket and ROEApprovalRecord models
+    for all operator-facing decision flows.
+    """
+    decision_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    decision_type: OperatorDecisionType
+    scope: str  # e.g. "action:<action_id>", "roe:<roe_id>", "tool_family:<name>"
+    rationale: str
+    actor: str
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expiry: datetime | None = None
+    downstream_effect: dict[str, Any] = Field(default_factory=dict)
+    action_id: UUID | None = None     # link to specific action if applicable
+    roe_id: UUID | None = None        # link to ROE if applicable
+    ticket_id: UUID | None = None     # link to originating approval ticket if applicable
+    schema_version: str = "v2"
+
+    model_config = {"frozen": True}
+
+
+# ---------------------------------------------------------------------------
+# v2 ReplaySnapshot — replay-ready run state
+# ---------------------------------------------------------------------------
+
+
+class ReplaySnapshot(BaseModel):
+    """
+    Snapshot of a completed or in-progress engagement for replay/export.
+    Sourced from audit events, evidence, metrics, and approval decisions.
+    """
+    snapshot_id: UUID = Field(default_factory=uuid4)
+    engagement_id: UUID
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Timeline of all ExecutionEvents in sequence order
+    event_timeline: list[dict[str, Any]] = Field(default_factory=list)
+    # All operator decisions
+    operator_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    # Planner rejection summary
+    planner_rejections: list[dict[str, Any]] = Field(default_factory=list)
+    # Run-level metadata (verdict, health, finalization status)
+    run_metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: str = "v2"

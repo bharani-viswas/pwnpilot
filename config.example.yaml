@@ -146,6 +146,18 @@ agent:
   # Maximum iterations (planning cycles) per engagement
   # Lower = faster termination, higher = deeper assessment
   max_iterations: 50
+
+  # Hard cap for consecutive planner->validator cycles without executor progress.
+  # Prevents long reject/replan churn loops.
+  max_planner_validator_cycles_without_executor: 40
+
+  # Hard cap for repeated validator rejects with the same reason code/class.
+  # Forces deterministic termination instead of infinite retrying.
+  max_consecutive_rejects_per_reason: 12
+
+  # Hard wall-clock cap for autonomous runs (seconds).
+  # Reporter is triggered when this budget is exceeded.
+  max_autonomous_runtime_seconds: 3600
   
   # Convergence threshold: consecutive cycles with no new findings
   # When reached, assessment auto-terminates (enables cost control)

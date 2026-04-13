@@ -254,6 +254,117 @@ class TestPlannerNode:
         assert result["proposed_action"]["tool_name"] == "nmap"
         assert result["temporarily_unavailable_tools"]["gobuster"] == 2
 
+    def test_reflector_pivot_on_reject_churn(self):
+        class ReflectPivotLLM:
+            def plan(self, context: dict) -> dict:
+                return {
+                    "action_type": "recon_passive",
+                    "tool_name": "nikto",
+                    "target": "http://target.local",
+                    "params": {},
+                    "rationale": "Initial retry",
+                    "estimated_risk": "low",
+                }
+
+            def reflect(self, context: dict) -> dict:
+                return {
+                    "decision": "pivot",
+                    "rationale": "Switch tool family.",
+                    "candidate_tools": ["nmap"],
+                }
+
+        planner = PlannerNode(
+            llm_router=ReflectPivotLLM(),
+            engagement_summary={"engagement_id": str(uuid4())},
+            available_tools=["nikto", "nmap"],
+            tools_catalog=[
+                {
+                    "tool_name": "nikto",
+                    "risk_class": "recon_passive",
+                    "required_params": ["target"],
+                    "supported_target_types": ["url"],
+                },
+                {
+                    "tool_name": "nmap",
+                    "risk_class": "recon_passive",
+                    "required_params": ["target"],
+                    "supported_target_types": ["url", "ip", "domain"],
+                },
+            ],
+        )
+
+        state = {
+            **_base_state(),
+            "reject_reason_streak_count": 6,
+            "validation_result": {
+                "verdict": "reject",
+                "rejection_reason_code": "TOOL_NOT_ENABLED",
+                "rejection_class": "capability",
+                "rationale": "tool unavailable",
+            },
+            "proposed_action": {
+                "action_type": "recon_passive",
+                "tool_name": "nikto",
+                "target": "http://target.local",
+                "params": {},
+                "rationale": "retry",
+                "estimated_risk": "low",
+            },
+        }
+
+        result = planner(state)
+        assert result["proposed_action"]["tool_name"] == "nmap"
+        assert not result.get("force_report", False)
+
+    def test_reflector_terminate_on_reject_churn(self):
+        class ReflectTerminateLLM:
+            def plan(self, context: dict) -> dict:
+                return {
+                    "action_type": "recon_passive",
+                    "tool_name": "nikto",
+                    "target": "http://target.local",
+                    "params": {},
+                    "rationale": "Initial retry",
+                    "estimated_risk": "low",
+                }
+
+            def reflect(self, context: dict) -> dict:
+                return {
+                    "decision": "terminate",
+                    "rationale": "Repeated policy dead-end.",
+                    "termination_reason": "reflector_terminate",
+                }
+
+        planner = PlannerNode(
+            llm_router=ReflectTerminateLLM(),
+            engagement_summary={"engagement_id": str(uuid4())},
+            available_tools=["nikto", "nmap"],
+            tools_catalog=[],
+        )
+
+        state = {
+            **_base_state(),
+            "reject_reason_streak_count": 7,
+            "validation_result": {
+                "verdict": "reject",
+                "rejection_reason_code": "TOOL_NOT_ENABLED",
+                "rejection_class": "capability",
+                "rationale": "tool unavailable",
+            },
+            "proposed_action": {
+                "action_type": "recon_passive",
+                "tool_name": "nikto",
+                "target": "http://target.local",
+                "params": {},
+                "rationale": "retry",
+                "estimated_risk": "low",
+            },
+        }
+
+        result = planner(state)
+        assert result.get("force_report") is True
+        assert result.get("termination_reason") == "reflector_terminate"
+
 
 # ---------------------------------------------------------------------------
 # Validator node

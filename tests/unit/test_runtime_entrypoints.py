@@ -101,6 +101,7 @@ def test_create_and_run_engagement_full_path(monkeypatch, tmp_path: Path) -> Non
         "finding_store": object(),
         "recon_store": object(),
         "tool_runner": object(),
+        "event_bus": object(),
         "approval_service": object(),
         "report_generator": object(),
         "kill_switch": object(),
@@ -179,6 +180,7 @@ def test_resume_engagement_success_path(monkeypatch, tmp_path: Path) -> None:
         "target_resolver": object(),
         "runtime_mode": "headless",
         "has_display": False,
+        "event_bus": object(),
     }
 
     monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: fake_rt)

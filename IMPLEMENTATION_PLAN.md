@@ -1,428 +1,341 @@
-# Pwnpilot Implementation Plan
+# PwnPilot Stabilization Implementation Plan
 
-## 1. Problem Statement
+## 1. Executive Summary
 
-Pwnpilot has become materially stronger in execution semantics, target handling, and report health metadata, but the operator experience still lags behind the current architecture.
+This plan turns the latest orchestration and log-forensics findings into a concrete implementation roadmap.
 
-The next major gap is not raw scanning capability. It is the lack of a cohesive operator-facing control plane.
+Primary objective:
+- Eliminate planner-validator churn loops that can run for hours with little or no executor progress.
 
-Comparison against GH05TCREW/PentestAgent and a fresh repository scan highlight the same pattern:
+Secondary objectives:
+- Guarantee terminal run finalization and report outcomes for every engagement.
+- Improve operator visibility of loop and rejection state in real time.
+- Add hard safeguards and intervention logic inspired by mature orchestration patterns.
 
-- the backend is increasingly structured and auditable;
-- the frontend operator experience is still monitor-oriented instead of guidance-oriented;
-- tool output is captured for evidence and logs, but not surfaced as a first-class live experience;
-- several existing subsystems already provide most of the underlying primitives needed to improve this holistically.
+---
 
-## 2. What Must Improve Next
+## 2. Findings Consolidation
 
-The next implementation tranche should optimize for:
+## 2.1 Local Forensics Findings (authoritative)
 
-- guided operator interaction through chat-like execution control;
-- rich, live visibility into each tool invocation;
-- clearer run-state transitions and finalization behavior;
-- stronger audit, replay, and export capabilities;
-- better use of already-existing observability and approval infrastructure.
+Evidence source: active SQLite DB at `/var/lib/pwnpilot/pwnpilot.db`.
 
-## 3. Benchmark-Derived Gaps
+Key engagement analyzed:
+- `f46b4598-9dda-4b95-9218-750c5a29d08b`
 
-### 3.1 No Guided Chat Execution Surface
+Observed event distribution:
+- `AgentInvoked`: 9477
+- `ToolExecutionStarted`: 9
+- `ToolExecutionCompleted`: 8
+- `ActionExecuted`: 8
+- `ActionFailed`: 1
 
-Observed gap:
+Actor breakdown for `AgentInvoked`:
+- `planner`: 4738
+- `validator`: 4738
+- `executor`: 8
 
-- Pwnpilot exposes a CLI and a read-only TUI dashboard, but no interactive operator chat mode.
-- Current TUI is explicitly a live dashboard rather than a conversational control surface.
+Conclusion:
+- System entered prolonged planner-validator reject churn with almost no executor progress.
 
-Repository evidence:
+Secondary observation:
+- Report generation/finalization events are not guaranteed across active engagements; some engagements show activity without a clear terminal/report event sequence.
 
-- `pwnpilot/cli.py` only exposes `tui` as a dashboard entrypoint.
-- `pwnpilot/tui/app.py` renders status, approvals, policy log, tool counts, and metrics only.
+## 2.2 Cross-Repository Pattern Findings
 
-Improvement:
+Compared systems show common resilience patterns that are either missing or only partially present:
 
-- Add a guided operator interaction mode with conversational control, similar in utility to PentestAgent's interact mode but aligned to Pwnpilot's governance model.
-- The operator should be able to:
-	- guide the next objective;
-	- narrow or expand depth;
-	- pause or stop a tool family;
-	- request explanation of the current plan;
-	- approve or redirect risky pivots inline.
+1. Hard execution monitors and loop budgets
+- Example pattern: same-tool and total-call thresholds, forced reflective intervention before continuing.
 
-Why this matters:
+2. Explicit lifecycle stream events
+- Example pattern: structured streaming of loop transitions, handoffs, tool starts/ends, and completion sentinels.
 
-- This gives the operator tactical control without bypassing planner, validator, policy, and audit layers.
+3. Mentor/reflector intervention mode
+- Example pattern: when repeated low-value actions are detected, switch to corrective analysis mode to pivot or terminate.
 
-### 3.2 Tool Output Is Captured But Not Surfaced Live
+4. Deterministic terminal closure
+- Example pattern: every run produces one terminal status event and one report status outcome.
 
-Observed gap:
+---
 
-- The runner captures stdout and stderr, computes previews, stores evidence, and logs semantic completion.
-- The TUI currently shows only aggregate tool invocation metrics, not per-tool live output.
+## 3. Root Cause Hypothesis
 
-Repository evidence:
+The immediate defect is not tool execution itself, but orchestration control:
 
-- `pwnpilot/plugins/runner.py` captures stdout and stderr and logs previews.
-- `pwnpilot/tui/app.py` only renders invocation counts and latencies.
+1. Planner and validator can repeatedly reject/replan without a guaranteed terminal watchdog path.
+2. Existing nonproductive counters and forced-pivot logic are insufficient under real reject patterns.
+3. Finalization/reporting is not enforced as a mandatory terminal phase for all run outcomes.
 
-Improvement:
+---
 
-- Introduce live tool-output streaming to both CLI and TUI.
-- Show, for each running action:
-	- tool name;
-	- command;
-	- elapsed time;
-	- live stdout/stderr tail;
-	- final exit code;
-	- semantic outcome (`success|degraded|failed`);
-	- typed failure reasons;
-	- key execution hints.
+## 4. Scope of Changes
 
-Why this matters:
+In scope:
+- Supervisor routing and watchdogs.
+- Planner reject-loop handling.
+- Validator rejection telemetry enrichment.
+- Reporter/finalization lifecycle guarantees.
+- CLI live output for rejection-loop observability.
+- Metrics/audit events for churn detection.
+- Tests (unit + integration).
 
-- Operators trust automation more when they can see what is actually happening instead of waiting for summarized log lines.
+Out of scope:
+- Major plugin/tool adapter rewrites.
+- New UI product surfaces beyond existing CLI event output.
+- Data model redesign not required for this fix.
 
-### 3.3 Missing Explicit UX Modes
+---
 
-Observed gap:
+## 5. Target Architecture Changes
 
-- Pwnpilot currently has execution and dashboard entrypoints, but it does not expose distinct operator modes.
+## 5.1 Add Supervisor Progress Watchdog
 
-Improvement:
+Files:
+- `pwnpilot/agent/supervisor.py`
 
-- Add explicit modes:
-	- `monitor`: current read-only dashboard;
-	- `guided`: operator chat with controlled tool execution;
-	- `autonomous`: current automated run path;
-	- `replay`: inspect past engagement events, decisions, and outputs.
+Change:
+- Track consecutive planner-validator transitions where executor is not entered.
+- Add a hard threshold (configurable) that forces report routing with explicit termination reason.
 
-Why this matters:
+New termination reason values:
+- `planner_validator_churn`
+- `executor_starvation`
 
-- The system already supports several of these behaviors conceptually, but the operator has no clean mode model for invoking them.
+Expected behavior:
+- No engagement can continue indefinitely without executor progress.
 
-### 3.4 No Operator Directive Contract
+## 5.2 Add Hard Orchestration Budgets
 
-Observed gap:
+Files:
+- `pwnpilot/agent/supervisor.py`
+- `pwnpilot/agent/planner.py`
+- `pwnpilot/config.py` (new config keys)
 
-- There is no typed place in `AgentState` for operator intentions beyond initial startup inputs.
+Change:
+- Add max planner-validator cycles per engagement.
+- Add max consecutive rejects per reason code/class.
+- Add max wall-clock duration for autonomous loops.
 
-Improvement:
+Expected behavior:
+- Deterministic upper bound on churn and runtime.
 
-- Add structured operator directives to state, for example:
-	- `operator_objective`;
-	- `operator_constraints`;
-	- `operator_requested_focus`;
-	- `operator_paused_tool_families`;
-	- `operator_notes`;
-	- `operator_interaction_mode`.
-- Require planner and validator to consume these directives deterministically.
+## 5.3 Add Mentor/Reflector Intervention Step
 
-Why this matters:
+Files:
+- `pwnpilot/agent/planner.py`
+- `pwnpilot/control/llm_router.py` (if required for new prompt route)
 
-- Chat UX without typed directive propagation becomes prompt-only behavior and will drift under load.
+Change:
+- On threshold breach, invoke a short corrective reflection prompt that must return one of:
+  - Valid pivot strategy using a different tool family and target shape, or
+  - Explicit terminate recommendation with reason.
 
-### 3.5 Approval UX Is Functional But Fragmented
+Expected behavior:
+- Better recovery from repeated low-value action proposals before hard termination.
 
-Observed gap:
+## 5.4 Guarantee Terminal Finalization and Report Outcome
 
-- Approval persistence and approval CLI controls exist.
-- ROE approval flow also exists as a separate interactive path.
-- The TUI shows pending approvals but does not appear to provide integrated operator resolution workflow.
+Files:
+- `pwnpilot/agent/reporter.py`
+- `pwnpilot/reporting/generator.py`
+- `pwnpilot/runtime.py`
 
-Repository evidence:
+Change:
+- Enforce terminal lifecycle events for every engagement:
+  - `EngagementCompleted` or `EngagementFailed`
+  - `ReportGenerated` or `ReportGenerationFailed`
+- Ensure reporter is invoked (or explicit failure recorded) when watchdog/kill conditions terminate a run.
 
-- `pwnpilot/data/approval_store.py` persists approval tickets.
-- `pwnpilot/control/roe_approval.py` implements a separate approval workflow.
-- `pwnpilot/tui/app.py` displays pending approvals read-only.
+Expected behavior:
+- No orphan engagements with missing terminal/report state.
 
-Improvement:
+## 5.5 Improve Live Rejection/Loop Observability
 
-- Unify approval handling into one operator approval experience across:
-	- runtime risk approvals;
-	- ROE-derived approvals;
-	- policy exceptions;
-	- deferred decisions.
-- Add inline approve, deny, defer, and explain actions in the TUI or guided mode.
+Files:
+- `pwnpilot/cli.py`
 
-Why this matters:
+Change:
+- Stream concise structured lines for:
+  - validator rejection code/class
+  - rejection repeat count
+  - nonproductive streak
+  - watchdog threshold proximity and trigger
 
-- Governance is already a core product differentiator. The UX should reflect that.
+Expected behavior:
+- Operators can see loop risk in real time and intervene early.
 
-### 3.6 Report UX Lags Behind Report Semantics
+## 5.6 Strengthen Metrics and Audit Semantics
 
-Observed gap:
+Files:
+- `pwnpilot/observability/metrics.py`
+- `pwnpilot/data/audit_store.py`
 
-- Report metadata includes run verdict, readiness, degradation reasons, and termination reason.
-- The human-readable output still does not provide a full operator narrative of what happened during the run.
+Change:
+- Add counters/histograms for churn and starved execution windows.
+- Emit explicit audit events for watchdog state transitions and forced termination causes.
 
-Repository evidence:
+Expected behavior:
+- Easier postmortems and objective SLO tracking.
 
-- `pwnpilot/agent/reporter.py` computes structured run metadata.
-- `pwnpilot/reporting/generator.py` writes structured bundle metadata.
+---
 
-Improvement:
+## 6. Detailed Implementation Plan (Phased)
 
-- Add report sections for:
-	- execution timeline;
-	- planner pivots and rejection causes;
-	- approval decisions;
-	- degraded actions and why they were still accepted;
-	- top command transcripts and evidence references.
+## Phase A: Guardrails and Config Plumbing
 
-Why this matters:
+Deliverables:
+1. New config keys with defaults:
+	- `agent.max_planner_validator_cycles_without_executor` (default: 40)
+	- `agent.max_consecutive_rejects_per_reason` (default: 12)
+	- `agent.max_autonomous_runtime_seconds` (default: 3600)
+2. Config validation and env override support.
+3. Runtime wiring into supervisor/planner.
 
-- Final reports should explain not only what was found, but also how the system behaved and where confidence degraded.
+Acceptance criteria:
+- Keys load correctly from config and env.
+- Backward compatibility maintained when keys are absent.
 
-## 4. Additional Repository-Scan Findings
+## Phase B: Supervisor Watchdog and Hard Stop Routing
 
-### 4.1 Tracing Exists but Is Not Part of the Main Operator Story
+Deliverables:
+1. Stateful counters for planner-validator-only loops.
+2. Executor starvation detection logic.
+3. Forced report routing with explicit termination reason.
 
-Observed gap:
+Acceptance criteria:
+- Synthetic tests prove churn termination occurs at threshold.
+- No false trigger when executor progresses normally.
 
-- `pwnpilot/observability/tracing.py` already provides an in-process tracer.
-- It is not yet a visible part of run diagnostics, timeline export, or TUI drill-down.
+## Phase C: Planner Reflector/Pivot Intervention
 
-Improvement:
+Deliverables:
+1. Reflective pivot function and prompt template.
+2. Safe fallback path if reflection fails.
+3. Tool-family diversity constraints for pivot candidate generation.
 
-- Instrument planner, validator, executor, reporter, approval flow, and tool execution with trace spans.
-- Surface traces in replay mode and attach summarized span graphs to audit exports.
+Acceptance criteria:
+- Reject-loop simulation shows either meaningful pivot or deterministic termination.
+- No regressions in existing planner proposal schema.
 
-### 4.2 Audit Export Is Still Incomplete
+## Phase D: Finalization and Reporting Guarantees
 
-Observed gap:
+Deliverables:
+1. Mandatory terminal event emission in all exit paths.
+2. Report outcome events emitted on success/failure.
+3. Reporter metadata consistently includes run_verdict and termination reason.
 
-- CLI audit export paths still contain explicit TODOs for ROE file, approvals, and audit trail loading.
+Acceptance criteria:
+- Every engagement ends with exactly one terminal engagement event.
+- Every engagement has exactly one report outcome event.
 
-Repository evidence:
+## Phase E: CLI and Observability Enhancements
 
-- `pwnpilot/cli.py` contains TODO markers in the ROE export path.
+Deliverables:
+1. Live stdout lines for rejection and churn telemetry.
+2. New metrics for loop severity and executor starvation.
+3. Audit events for watchdog state changes.
 
-Improvement:
+Acceptance criteria:
+- Operator can identify churn from stdout alone.
+- Metrics show expected increments during replayed churn case.
 
-- Complete engagement export so one command yields:
-	- ROE source;
-	- approval chain;
-	- audit timeline;
-	- run verdict;
-	- report metadata;
-	- trace and metrics summaries.
+## Phase F: Validation, Rollout, and Post-Deploy Checks
 
-Why this matters:
+Deliverables:
+1. Unit tests for watchdog, planner reject handling, and terminal events.
+2. Integration tests for long-loop synthetic engagement.
+3. Staged rollout instructions and rollback procedure.
 
-- This closes the loop between execution, compliance, and post-run review.
+Acceptance criteria:
+- Failing scenario reproduces pre-fix and resolves post-fix.
+- No regression in standard short engagement completion.
 
-### 4.3 Replay and Historical Inspection Are Not First-Class
+---
 
-Observed gap:
+## 7. Test Plan
 
-- Audit store is append-only and already well-suited for timeline reconstruction.
-- There is no dedicated replay or engagement-history UX.
+## 7.1 Unit Tests
 
-Improvement:
+1. Supervisor watchdog triggers report at threshold.
+2. Supervisor does not trigger when executor runs within window.
+3. Planner reflect/pivot path chooses different family or terminates.
+4. Reporter emits terminal/report failure events on exception paths.
+5. CLI formatting of rejection telemetry remains stable.
 
-- Add replay commands and UI views to inspect:
-	- action sequence;
-	- policy verdicts;
-	- approval events;
-	- planner rejections;
-	- per-tool outputs;
-	- final report generation.
+## 7.2 Integration Tests
 
-Why this matters:
+1. Simulated validator reject churn:
+	- Expected: terminate with `planner_validator_churn`, report outcome emitted.
+2. Simulated executor starvation:
+	- Expected: terminate with `executor_starvation`, report outcome emitted.
+3. Healthy engagement:
+	- Expected: no watchdog trigger, normal report generation.
 
-- Replay is essential for debugging, operator trust, and sales-quality demos.
+## 7.3 Forensics Regression Test
 
-### 4.4 Dashboard Is Strong for Monitoring but Weak for Actionability
+Replay profile based on observed engagement characteristics:
+- Very high planner/validator invocations.
+- Low executor invocation count.
 
-Observed gap:
+Expected:
+- Post-fix run terminates early with explicit reason, not thousands of loops.
 
-- Current TUI is useful for passive monitoring but cannot resolve approvals, inspect live output, or guide execution.
+---
 
-Improvement:
+## 8. Rollout Plan
 
-- Evolve the TUI into a split experience:
-	- monitor pane;
-	- live action pane;
-	- approval pane;
-	- tool output pane;
-	- operator input pane.
+1. Implement under feature flags (default on in dev, configurable in prod).
+2. Deploy to staging with forced-churn scenario.
+3. Validate terminal/report event invariants in DB.
+4. Deploy to production with watch metrics:
+	- churn termination count
+	- average run duration
+	- report generation failure rate
+5. After stability window, remove temporary feature flags if desired.
 
-### 4.5 Report Closure and Run Finalization Still Need Stronger Operational Guarantees
+Rollback strategy:
+- Disable watchdog/reflector via config flags while retaining telemetry emission.
 
-Observed gap:
+---
 
-- Earlier execution review showed that latest runs can still fail to produce final report artifacts consistently.
+## 9. Risks and Mitigations
 
-Improvement:
+Risk 1: Premature termination of valid long-running assessments.
+- Mitigation: conservative defaults, per-engagement override, staged rollout.
 
-- Add explicit completion-path validation and reporter invocation guarantees.
-- If report finalization cannot complete, emit a terminal failure artifact and audit event instead of silent run-end ambiguity.
+Risk 2: Reflector prompt introduces unstable behavior.
+- Mitigation: strict schema output, timeout, deterministic fallback to termination.
 
-### 4.6 Approval and Permission Models Can Be Unified Further
+Risk 3: Additional telemetry noise on stdout.
+- Mitigation: concise one-line event format and log level gating.
 
-Observed gap:
+---
 
-- Approval tickets, ROE approvals, and permission exceptions appear to live in adjacent but still partially separate flows.
+## 10. Definition of Done
 
-Improvement:
+This effort is complete when all are true:
 
-- Define one operator-decision model with normalized fields for:
-	- decision type;
-	- scope;
-	- rationale;
-	- actor;
-	- expiry;
-	- downstream effect.
+1. No uncontrolled planner-validator churn can exceed configured budgets.
+2. Every engagement writes deterministic terminal and report outcome events.
+3. Operators can observe reject-loop progression in real time via CLI output.
+4. New unit/integration tests pass and cover the previously observed failure mode.
+5. Staging and production validation confirms reduced stuck-run incidence.
 
-## 5. Existing Strengths To Preserve
+---
 
-The plan should not regress current strengths:
+## 11. Suggested Work Breakdown (Engineer Tasks)
 
-- semantic outcome classification in the runner;
-- typed failure taxonomy;
-- canonical target resolution;
-- capability-aware runtime filtering;
-- structured approval persistence;
-- report readiness and run-health evaluation;
-- append-only audit storage;
-- metrics and trace primitives already present in the codebase.
+1. Config and runtime wiring (Phase A).
+2. Supervisor watchdog and thresholds (Phase B).
+3. Planner reflector/pivot logic (Phase C).
+4. Reporter/finalization invariants (Phase D).
+5. CLI telemetry and metrics/audit additions (Phase E).
+6. Tests and rollout validation (Phase F).
 
-## 6. Architecture Additions
+Estimated sequence:
+- Day 1-2: A+B
+- Day 3: C
+- Day 4: D+E
+- Day 5: F and staged validation
 
-Add the following explicit components:
-
-- `OperatorSessionManager`:
-	- tracks current mode, active directives, pause state, and operator messages.
-- `ExecutionEventBus`:
-	- delivers live runner events to CLI, TUI, and replay/export systems.
-- `ToolOutputStream`:
-	- structured live stdout/stderr feed with per-action buffering and truncation policy.
-- `OperatorDirectiveContract`:
-	- typed contract consumed by planner and validator.
-- `ReplayService`:
-	- reconstructs run history from audit, evidence, metrics, and traces.
-- `EngagementExportService`:
-	- bundles ROE, approvals, audit trail, traces, metrics, and reports.
-
-## 7. Data Contract Changes
-
-Add to `AgentState`:
-
-- `operator_mode`
-- `operator_directives`
-- `operator_messages`
-- `active_action_id`
-- `active_tool_name`
-- `active_tool_command`
-- `live_output_enabled`
-- `completion_state`
-
-Add to audit events:
-
-- `operator.directive_submitted`
-- `operator.mode_changed`
-- `tool.output_chunk`
-- `report.finalization_failed`
-- `engagement.export_generated`
-- `replay.snapshot_generated`
-
-Add to report metadata:
-
-- `execution_timeline`
-- `approval_timeline`
-- `planner_rejection_summary`
-- `live_execution_summary`
-
-## 8. Phased Execution Plan
-
-### Phase A: Live Execution Visibility
-
-- Add an event bus for runner lifecycle and chunked output events.
-- Stream tool stdout/stderr to CLI in real time.
-- Add TUI panels for active tool output, current command, and latest action result.
-- Preserve existing evidence-store write path and final semantic classification.
-
-Exit criteria:
-
-- Operators can watch command output as tools run.
-- Every completed action visibly reports command, exit code, outcome status, and failure reasons.
-
-### Phase B: Guided Operator Mode
-
-- Add guided mode entrypoints in CLI and TUI.
-- Add typed operator directives to `AgentState`.
-- Feed directives into planner and validator context.
-- Add inline pause, resume, skip-family, and focus controls.
-
-Exit criteria:
-
-- Operators can steer execution without bypassing policy or audit layers.
-- Planner behavior changes are attributable to typed operator directives.
-
-### Phase C: Approval Workflow Unification
-
-- Consolidate runtime approvals, ROE approvals, and deferred decisions into one operator decision workflow.
-- Add TUI-based approval resolution.
-- Audit all operator decisions with a single normalized schema.
-
-Exit criteria:
-
-- Operators can resolve all approval classes from one workflow.
-- Approval records are queryable and replayable with consistent structure.
-
-### Phase D: Replay, Timeline, and Export
-
-- Implement replay service over audit store, evidence references, metrics, and traces.
-- Complete ROE export/audit export CLI TODOs.
-- Add report timeline sections and historical run inspection commands.
-
-Exit criteria:
-
-- A completed engagement can be replayed and exported end-to-end.
-- Audit export includes ROE, approvals, timeline, and report metadata.
-
-### Phase E: Observability Activation and Closure Guarantees
-
-- Wire tracing into planner, validator, executor, reporter, approvals, and export paths.
-- Surface trace summaries in replay and diagnostics.
-- Add hard guarantees around report finalization and failure artifact emission.
-
-Exit criteria:
-
-- Failed report closure is visible, audited, and diagnosable.
-- Trace data helps explain run latency, stalls, and degradation.
-
-## 9. Validation Strategy
-
-- Unit tests:
-	- event bus publishing and subscriber delivery;
-	- tool output chunk handling and truncation policy;
-	- operator directive propagation through planner and validator;
-	- approval workflow normalization;
-	- replay timeline reconstruction;
-	- report finalization failure fallback.
-- Integration tests:
-	- guided mode operator changes tool choice without violating policy;
-	- TUI/CLI live output reflects runner execution in near real time;
-	- approval issued in execution path can be resolved from the UI;
-	- replay reconstructs a completed engagement correctly.
-- Replay tests:
-	- use a recorded engagement to validate export bundle completeness.
-
-## 10. Success Metrics
-
-- Reduced operator uncertainty during tool execution.
-- Reduced need to inspect raw log files for routine run diagnosis.
-- Faster approval turnaround during active engagements.
-- Increased consistency of final report generation.
-- Increased usability of post-run audit exports.
-- Improved operator trust through visible planner and execution reasoning.
-
-## 11. Immediate Next Slice
-
-Implement the highest-leverage slice first:
-
-- live tool output streaming for CLI and TUI;
-- active-action display in the TUI;
-- typed operator directive scaffolding in `AgentState`;
-- completion of audit export TODOs for ROE, approvals, and audit timeline.
-
-This slice gives immediate user-visible gains while reusing the strongest parts of the current architecture.

@@ -246,6 +246,28 @@ MUST return ONLY valid JSON matching PlannerProposal schema:
         raw = self.complete(system, user)
         return self._parse_json(raw, "PlannerProposal")
 
+        def reflect(self, context: dict[str, Any]) -> dict[str, Any]:
+                """Return a corrective pivot-or-terminate decision for reject churn."""
+                system = """You are a stabilization reflector for an autonomous pentest agent.
+
+Given repeated validator rejects, choose exactly one:
+1) pivot: recommend a different tool family to continue safely, or
+2) terminate: stop autonomous loop and request report finalization.
+
+Rules:
+- Choose terminate when repeated rejects indicate policy/capability dead-end.
+- If choosing pivot, candidate_tools must exclude rejected_tool.
+- Output ONLY valid JSON with this schema:
+{
+    "decision": "pivot|terminate",
+    "rationale": "short reason",
+    "candidate_tools": ["toolA", "toolB"],
+    "termination_reason": "reflector_terminate"
+}
+"""
+                raw = self.complete(system, json.dumps(context, default=str))
+                return self._parse_json(raw, "ReflectorDecision")
+
     def _format_tool_schemas(self, schemas: dict[str, Any]) -> str:
         """Format tool schemas into a readable reference section."""
         if not schemas:

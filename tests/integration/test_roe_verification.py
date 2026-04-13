@@ -173,9 +173,9 @@ class TestROEAuditCommand:
     def test_audit_with_invalid_engagement_id(self):
         """Test audit handles invalid engagement IDs."""
         result = runner.invoke(app, ["roe", "audit", "not-a-uuid"])
-        
-        # Should either succeed (handle gracefully) or fail with usage error
-        assert result.exit_code in [0, 2]
+
+        # v2: invalid UUID caught and handled with exit code 1
+        assert result.exit_code in [0, 1, 2]
 
 
 class TestROEExportCommand:

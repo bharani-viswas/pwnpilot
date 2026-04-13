@@ -62,6 +62,81 @@ def cmd_version() -> None:
 # Start
 # ---------------------------------------------------------------------------
 
+_SEPARATOR = "─" * 72
+
+
+def _make_live_output_handler() -> object:
+    """Return a callable that prints execution events as plain human-readable text.
+
+    Design rationale (from hackingBuddyGPT / CAI research):
+    - Print the command being run so the operator sees what's executing.
+    - Stream stdout/stderr as raw text so they can follow tool progress live.
+    - Print a brief result line when the action finishes (outcome + exit code).
+    No JSON, no structured formatting — just readable terminal output.
+    """
+    from pwnpilot.data.models import ExecutionEventType
+
+    def _handler(event: object) -> None:
+        et = getattr(event, "event_type", None)
+        payload: dict = getattr(event, "payload", None) or {}
+        tool = getattr(event, "tool_name", "") or ""
+        cmd = getattr(event, "command", "") or ""
+
+        if et == ExecutionEventType.ACTION_STARTED:
+            sys.stdout.write(f"\n{_SEPARATOR}\n")
+            sys.stdout.write(f"[>] {tool}")
+            if cmd:
+                sys.stdout.write(f"  {cmd}")
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        elif et == ExecutionEventType.TOOL_OUTPUT_CHUNK:
+            stream = payload.get("stream", "stdout")
+            data = payload.get("data", "")
+            if data:
+                # Prefix stderr chunks so operator can distinguish them
+                prefix = "[stderr] " if stream == "stderr" else ""
+                lines = data.splitlines(keepends=True)
+                for line in lines:
+                    sys.stdout.write(prefix + line)
+                if data and not data.endswith("\n"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+
+        elif et in (ExecutionEventType.ACTION_COMPLETED, ExecutionEventType.ACTION_FAILED):
+            exit_code = payload.get("exit_code", "?")
+            outcome = payload.get("outcome_status", "unknown")
+            duration_ms = payload.get("duration_ms", 0)
+            color_start = "\033[32m" if et == ExecutionEventType.ACTION_COMPLETED else "\033[31m"
+            color_end = "\033[0m"
+            sys.stdout.write(
+                f"{color_start}[done]{color_end} {tool} — "
+                f"exit {exit_code} — {outcome} — {duration_ms}ms\n"
+            )
+            sys.stdout.flush()
+
+        elif et == ExecutionEventType.VALIDATOR_REJECTED:
+            code = payload.get("rejection_reason_code", "VALIDATOR_REJECT")
+            cls = payload.get("rejection_class", "policy")
+            streak = payload.get("nonproductive_cycle_streak", "?")
+            rationale = str(payload.get("rationale", "")).strip()
+            summary = rationale[:200] + ("..." if len(rationale) > 200 else "")
+            sys.stdout.write(
+                f"[reject] code={code} class={cls} streak={streak}"
+            )
+            if summary:
+                sys.stdout.write(f" — {summary}")
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        elif et == ExecutionEventType.EXECUTOR_RECOVERY_HINT:
+            hint = payload.get("hint", "")
+            if hint:
+                sys.stdout.write(f"[hint] {hint}\n")
+                sys.stdout.flush()
+
+    return _handler
+
 
 def _render_preflight(preflight: dict[str, object]) -> None:
     family = str(preflight.get("target_family", "unknown"))
@@ -300,6 +375,7 @@ def cmd_start(
             max_iterations=max_iterations,
             config_path=config_file,
             dry_run=dry_run,
+            event_subscriber=_make_live_output_handler(),
         )
         console.print(f"\n[green]Engagement complete:[/green] {engagement_id}")
     except Exception as exc:
@@ -757,65 +833,125 @@ def cmd_roe_verify(
 def cmd_roe_list(
     engagement_id: Optional[str] = typer.Option(None, "--engagement", "-e", help="Filter by engagement ID"),
     active_only: bool = typer.Option(True, "--all", help="Show inactive ROE files"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
-    """List approved ROE files and their approval status."""
-    # This would query the database in a real implementation
-    console.print("[bold cyan]ROE Files[/bold cyan]")
+    """List approved ROE decisions for an engagement."""
+    from pwnpilot.runtime import get_db_session
+    from pwnpilot.data.operator_decision_store import OperatorDecisionStore
+    from pwnpilot.data.models import OperatorDecisionType
+
+    console.print("[bold cyan]ROE Approvals[/bold cyan]")
     table = Table(show_header=True, header_style="bold")
-    table.add_column("ROE ID")
-    table.add_column("Filename")
-    table.add_column("Uploaded By")
-    table.add_column("Status")
-    table.add_column("Uploaded At")
-    
-    # TODO: Query ROEFile and ROEApprovalRecord from database
-    console.print("[yellow]No ROE files available (database not connected).[/yellow]")
+    table.add_column("Decision ID")
+    table.add_column("Engagement ID")
+    table.add_column("Actor")
+    table.add_column("Scope")
+    table.add_column("Decided At")
+
+    try:
+        session = get_db_session(config_path=config_file)
+        store = OperatorDecisionStore(session)
+        if engagement_id:
+            decisions = list(store.decisions_by_type(UUID(engagement_id), OperatorDecisionType.ROE_APPROVAL))
+        else:
+            console.print("[yellow]Specify --engagement to list ROE approvals for a specific engagement.[/yellow]")
+            return
+        for d in decisions:
+            table.add_row(
+                str(d.decision_id)[:8],
+                str(d.engagement_id)[:8],
+                d.actor,
+                d.scope,
+                d.decided_at.isoformat() if d.decided_at else "",
+            )
+        console.print(table)
+        if not decisions:
+            console.print("[yellow]No ROE approvals found.[/yellow]")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1)
 
 
 @roe_app.command("audit")
 def cmd_roe_audit(
     engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Show approval and audit trail for an engagement."""
-    from pwnpilot.data.models import ROEApprovalRecord
-    
+    from pwnpilot.runtime import get_db_session
+    from pwnpilot.data.audit_store import AuditStore
+    from pwnpilot.data.operator_decision_store import OperatorDecisionStore
+
     console.print(f"[bold cyan]Audit Trail for Engagement:[/bold cyan] {engagement_id}")
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Timestamp")
-    table.add_column("User")
-    table.add_column("Event")
-    table.add_column("Details")
-    
-    # TODO: Query AuditEvent records for engagement_id
-    console.print(table)
-    console.print("[yellow]No audit records available (database not connected).[/yellow]")
+
+    try:
+        session = get_db_session(config_path=config_file)
+        audit_store = AuditStore(session)
+        decision_store = OperatorDecisionStore(session)
+
+        # Audit events table
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Timestamp")
+        table.add_column("Actor")
+        table.add_column("Event")
+        table.add_column("Details")
+        events = list(audit_store.events_for_engagement(UUID(engagement_id)))
+        for ev in events:
+            table.add_row(
+                str(ev.get("created_at", ""))[:19],
+                str(ev.get("actor", "")),
+                str(ev.get("event_type", "")),
+                str(ev.get("payload", ""))[:80],
+            )
+        console.print(table)
+
+        # Operator decisions summary
+        decisions = list(decision_store.decisions_for_engagement(UUID(engagement_id)))
+        if decisions:
+            console.print(f"\n[bold]Operator Decisions:[/bold] {len(decisions)}")
+            dtable = Table(show_header=True, header_style="bold")
+            dtable.add_column("Type")
+            dtable.add_column("Scope")
+            dtable.add_column("Actor")
+            dtable.add_column("Decided At")
+            for d in decisions:
+                dtable.add_row(
+                    d.decision_type.value,
+                    d.scope,
+                    d.actor,
+                    d.decided_at.isoformat() if d.decided_at else "",
+                )
+            console.print(dtable)
+        else:
+            console.print("[yellow]No operator decisions found.[/yellow]")
+
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1)
 
 
 @roe_app.command("export")
 def cmd_roe_export(
     engagement_id: str = typer.Argument(..., help="Engagement UUID"),
     output: Path = typer.Option(None, "--output", "-o", help="Export file path (default: roe-audit-{engagement_id}.json)"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Export audit report with ROE, approval chain, and timeline."""
-    import json
-    
+    from pwnpilot.runtime import get_db_session
+    from pwnpilot.data.audit_store import AuditStore
+    from pwnpilot.data.operator_decision_store import OperatorDecisionStore
+    from pwnpilot.services.export_service import ExportService
+
     output_path = output or Path(f"roe-audit-{engagement_id}.json")
-    
-    # TODO: Gather ROE file content, approval records, audit trail
-    audit_report = {
-        "engagement_id": engagement_id,
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "roe_file": None,  # TODO: Load from database
-        "approvals": [],  # TODO: Load approval records
-        "audit_trail": [],  # TODO: Load audit events
-    }
-    
     try:
-        with open(output_path, "w") as f:
-            json.dump(audit_report, f, indent=2, default=str)
-        console.print(f"[green]✓ Audit report exported:[/green] {output_path}")
-    except Exception as e:
-        console.print(f"[red]Error exporting report:[/red] {e}")
+        session = get_db_session(config_path=config_file)
+        audit_store = AuditStore(session)
+        decision_store = OperatorDecisionStore(session)
+        svc = ExportService(audit_store=audit_store, operator_decision_store=decision_store)
+        written = svc.export(UUID(engagement_id), output_path=output_path)
+        console.print(f"[green]✓ Audit report exported:[/green] {written}")
+    except Exception as exc:
+        console.print(f"[red]Error exporting report:[/red] {exc}")
         raise typer.Exit(code=1)
 
 

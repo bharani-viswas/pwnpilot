@@ -1,28 +1,15 @@
 """
-Textual TUI — Live engagement dashboard for the pwnpilot framework.
+Textual TUI v2 — Live engagement dashboard + guided operator interface.
+
+v2 changes:
+- Added LiveActionPanel: shows active tool name, command, elapsed time, and live output.
+- Added OperatorInputPanel: guided mode operator input box.
+- ApprovalsPanel supports approve/deny actions (inline resolution).
+- All panels are subscribable to the ExecutionEventBus for real-time updates.
 
 Run with:
     pwnpilot tui  (via CLI)
     python -m pwnpilot.tui.app  (direct)
-
-The TUI provides a read-only, auto-refreshing view of:
-  - Active engagement status (iteration, kill switch state, last action)
-  - Pending approval tickets
-  - Policy deny event log
-  - Per-tool invocation table
-  - Observability metrics summary
-
-The TUI talks to the process-local MetricsRegistry and, when a database
-path is available, to the SQLite stores for live data.
-
-Architecture
-------------
-- ``TUIDashboard(App)`` is the root Textual application.
-- Panel widgets are ``Static``-derived classes that implement ``refresh_data()``.
-- A ``PeriodicRefresh`` worker triggers a re-render every ``REFRESH_INTERVAL_S``
-  seconds; no external event bus is required.
-- All DB reads are done on the main thread (SQLite is synchronous, reads are fast
-  enough at default refresh rates).
 """
 from __future__ import annotations
 
@@ -40,6 +27,7 @@ from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     Label,
     Log,
     ProgressBar,
@@ -49,19 +37,24 @@ from textual.widgets import (
 from pwnpilot.observability.metrics import EngagementMetrics, metrics_registry
 
 REFRESH_INTERVAL_S = 2.0
-APP_TITLE = "pwnpilot — Live Engagement Dashboard"
+APP_TITLE = "pwnpilot v2 — Live Engagement Dashboard"
 APP_CSS = """
 Screen {
     layout: vertical;
 }
 
 #top-row {
-    height: 30%;
+    height: 25%;
     layout: horizontal;
 }
 
 #mid-row {
-    height: 35%;
+    height: 30%;
+    layout: horizontal;
+}
+
+#live-row {
+    height: 25%;
     layout: horizontal;
 }
 
@@ -86,11 +79,14 @@ Screen {
 #approvals-panel { width: 60%; }
 #policy-log { width: 50%; }
 #tools-table { width: 50%; }
+#live-action-panel { width: 60%; }
+#operator-input-panel { width: 40%; }
 #metrics-panel { width: 100%; }
 
 .ok { color: $success; }
 .warn { color: $warning; }
 .error { color: $error; }
+.active { color: $accent; }
 """
 
 
@@ -267,16 +263,110 @@ class MetricsSummaryPanel(Static):
 
 
 # ---------------------------------------------------------------------------
+# v2 Live action pane  — shows current running tool, command, and output tail
+# ---------------------------------------------------------------------------
+
+
+class LiveActionPanel(Static):
+    """
+    Shows the currently-executing tool name, command, elapsed time, and
+    a rolling tail of the last N lines of stdout/stderr.
+
+    Updated via push_event() called from event bus subscriber.
+    """
+
+    DEFAULT_CSS = """
+    LiveActionPanel { height: 100%; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("LIVE ACTION", classes="panel-title")
+        yield Label("No active action", id="live-tool")
+        yield Label("Command: —", id="live-command")
+        yield Label("Elapsed: —  |  Status: idle", id="live-status")
+        yield Log(id="live-output", auto_scroll=True, max_lines=100)
+
+    def set_active(self, tool_name: str, command: str) -> None:
+        self.query_one("#live-tool", Label).update(f"Tool: {tool_name}")
+        self.query_one("#live-command", Label).update(f"Command: {command[:120]}")
+        self.query_one("#live-status", Label).update("Status: running")
+        self.query_one("#live-output", Log).clear()
+
+    def append_output(self, stream: str, data: str) -> None:
+        log_widget = self.query_one("#live-output", Log)
+        prefix = "[stdout]" if stream == "stdout" else "[stderr]"
+        for line in data.splitlines():
+            log_widget.write_line(f"{prefix} {line}")
+
+    def set_completed(self, exit_code: int, outcome: str, duration_ms: int) -> None:
+        color = "ok" if outcome == "success" else ("warn" if outcome == "degraded" else "error")
+        self.query_one("#live-status", Label).update(
+            f"Status: {outcome}  exit={exit_code}  {duration_ms}ms"
+        )
+
+    def clear(self) -> None:
+        self.query_one("#live-tool", Label).update("No active action")
+        self.query_one("#live-command", Label).update("Command: —")
+        self.query_one("#live-status", Label).update("Elapsed: —  |  Status: idle")
+        self.query_one("#live-output", Log).clear()
+
+
+# ---------------------------------------------------------------------------
+# v2 Operator input pane  — guided mode chat input
+# ---------------------------------------------------------------------------
+
+
+class OperatorInputPanel(Static):
+    """
+    Operator input widget for guided mode.
+    Allows the operator to type directives and submit them to the session manager.
+    """
+
+    DEFAULT_CSS = """
+    OperatorInputPanel { height: 100%; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("OPERATOR GUIDANCE", classes="panel-title")
+        yield Label("Mode: autonomous", id="op-mode")
+        yield Log(id="op-chat", auto_scroll=True, max_lines=50)
+        yield Input(placeholder="Enter directive (guided mode)…", id="op-input")
+
+    def set_mode(self, mode: str) -> None:
+        self.query_one("#op-mode", Label).update(f"Mode: {mode}")
+
+    def append_message(self, role: str, content: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        log_widget = self.query_one("#op-chat", Log)
+        log_widget.write_line(f"[{ts}] [{role}] {content[:200]}")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text:
+            return
+        self.append_message("operator", text)
+        event.input.clear()
+        # The parent app handles the actual directive submission
+        self.post_message(OperatorDirectiveMessage(text))
+
+
+class OperatorDirectiveMessage:
+    """Internal message: operator submitted a directive from the input panel."""
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+# ---------------------------------------------------------------------------
 # Root application
 # ---------------------------------------------------------------------------
 
 
 class TUIDashboard(App[None]):
     """
-    Textual TUI dashboard for the pwnpilot framework.
+    Textual TUI dashboard v2 for the pwnpilot framework.
 
-    Accepts an optional ``engagement_id`` kwarg to lock display to a specific
-    engagement.  If omitted, it shows the most-recently-active engagement.
+    v2: Adds LiveActionPanel and OperatorInputPanel.
+    Subscribes to ExecutionEventBus when engagement_id + event_bus are provided.
     """
 
     TITLE = APP_TITLE
@@ -284,6 +374,7 @@ class TUIDashboard(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("g", "toggle_guided", "Guided Mode"),
         Binding("?", "help", "Help"),
     ]
 
@@ -293,12 +384,16 @@ class TUIDashboard(App[None]):
         self,
         engagement_id: str | None = None,
         refresh_interval: float = REFRESH_INTERVAL_S,
+        event_bus: object | None = None,
+        operator_session: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._engagement_id = engagement_id
         self._refresh_interval = refresh_interval
         self._pending_approvals: list[dict[str, Any]] = []
+        self._event_bus = event_bus
+        self._operator_session = operator_session
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -308,12 +403,69 @@ class TUIDashboard(App[None]):
         with Horizontal(id="mid-row"):
             yield PolicyLogPanel(classes="panel", id="policy-log")
             yield ToolsTablePanel(classes="panel", id="tools-table")
+        with Horizontal(id="live-row"):
+            yield LiveActionPanel(classes="panel", id="live-action-panel")
+            yield OperatorInputPanel(classes="panel", id="operator-input-panel")
         with Horizontal(id="bottom-row"):
             yield MetricsSummaryPanel(classes="panel", id="metrics-panel")
         yield Footer()
 
     def on_mount(self) -> None:
         self.set_interval(self._refresh_interval, self._do_refresh)
+        # Subscribe to event bus for real-time updates
+        if self._event_bus is not None and self._engagement_id:
+            try:
+                from uuid import UUID
+                self._event_bus.subscribe(  # type: ignore[attr-defined]
+                    UUID(self._engagement_id), self._handle_execution_event
+                )
+            except Exception:
+                pass
+
+    def on_unmount(self) -> None:
+        if self._event_bus is not None and self._engagement_id:
+            try:
+                from uuid import UUID
+                self._event_bus.unsubscribe(  # type: ignore[attr-defined]
+                    UUID(self._engagement_id), self._handle_execution_event
+                )
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Event bus handler
+    # ------------------------------------------------------------------
+
+    def _handle_execution_event(self, event: Any) -> None:
+        """Receive live ExecutionEvents from the event bus (called from any thread)."""
+        from pwnpilot.data.models import ExecutionEventType
+        et = event.event_type
+        if et == ExecutionEventType.ACTION_STARTED:
+            self.call_from_thread(
+                self.query_one(LiveActionPanel).set_active,
+                event.tool_name or "unknown",
+                event.command or "",
+            )
+        elif et == ExecutionEventType.TOOL_OUTPUT_CHUNK:
+            payload = event.payload or {}
+            self.call_from_thread(
+                self.query_one(LiveActionPanel).append_output,
+                payload.get("stream", "stdout"),
+                payload.get("data", ""),
+            )
+        elif et in (ExecutionEventType.ACTION_COMPLETED, ExecutionEventType.ACTION_FAILED):
+            payload = event.payload or {}
+            self.call_from_thread(
+                self.query_one(LiveActionPanel).set_completed,
+                payload.get("exit_code", 0),
+                payload.get("outcome_status", "unknown"),
+                payload.get("duration_ms", 0),
+            )
+        elif et == ExecutionEventType.OPERATOR_MODE_CHANGED:
+            new_mode = event.payload.get("new_mode", "unknown")
+            self.call_from_thread(
+                self.query_one(OperatorInputPanel).set_mode, new_mode
+            )
 
     # ------------------------------------------------------------------
     # Refresh callbacks
@@ -341,9 +493,26 @@ class TUIDashboard(App[None]):
     def action_refresh(self) -> None:
         self._do_refresh()
 
+    def action_toggle_guided(self) -> None:
+        """Toggle between guided and autonomous mode."""
+        if self._operator_session is not None:
+            try:
+                from pwnpilot.agent.state import OperatorMode
+                current = self._operator_session.mode  # type: ignore[attr-defined]
+                new_mode = (
+                    OperatorMode.GUIDED
+                    if current == OperatorMode.AUTONOMOUS
+                    else OperatorMode.AUTONOMOUS
+                )
+                self._operator_session.set_mode(new_mode)  # type: ignore[attr-defined]
+                self.query_one(OperatorInputPanel).set_mode(new_mode.value)
+                self.notify(f"Operator mode: {new_mode.value}", title="Mode Changed")
+            except Exception as exc:
+                self.notify(f"Mode switch failed: {exc}", severity="error")
+
     def action_help(self) -> None:
         self.notify(
-            "Keybindings: [q] Quit  [r] Refresh  [?] Help",
+            "Keybindings: [q] Quit  [r] Refresh  [g] Toggle Guided Mode  [?] Help",
             title="Help",
         )
 
@@ -375,6 +544,21 @@ class TUIDashboard(App[None]):
         ]
         self.query_one(ApprovalsPanel).refresh_data(self._pending_approvals)
 
+    # ------------------------------------------------------------------
+    # Operator input handling
+    # ------------------------------------------------------------------
+
+    def on_operator_directive_message(self, message: OperatorDirectiveMessage) -> None:
+        """Handle operator directive submitted from the input panel."""
+        if self._operator_session is not None:
+            try:
+                self._operator_session.submit_directive_from_dict(  # type: ignore[attr-defined]
+                    objective=message.text
+                )
+                self.query_one(OperatorInputPanel).append_message("system", f"Directive queued: {message.text[:80]}")
+            except Exception as exc:
+                self.query_one(OperatorInputPanel).append_message("error", str(exc))
+
 
 # ---------------------------------------------------------------------------
 # Standalone entry point
@@ -384,11 +568,15 @@ class TUIDashboard(App[None]):
 def run_dashboard(
     engagement_id: str | None = None,
     refresh_interval: float = REFRESH_INTERVAL_S,
+    event_bus: object | None = None,
+    operator_session: object | None = None,
 ) -> None:
     """Launch the TUI dashboard synchronously (blocks until user quits)."""
     app = TUIDashboard(
         engagement_id=engagement_id,
         refresh_interval=refresh_interval,
+        event_bus=event_bus,
+        operator_session=operator_session,
     )
     app.run()
 

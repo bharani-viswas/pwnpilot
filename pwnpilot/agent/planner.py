@@ -3,9 +3,18 @@ Planner Agent — decides the next action given current engagement state.
 
 Reads from AgentState:
   recon_summary, previous_actions, engagement_scope, iteration_count
+  operator_directives, memory_context (v2)
 
 Writes to AgentState:
   proposed_action (PlannerProposal serialised), kill_switch (if circuit breaker fires)
+  repeated_action_count, last_repeated_action_key (v2 repetition tracking)
+
+v2 additions:
+  - Consumes operator_directives (objective, requested_focus, constraints,
+    paused_tool_families, notes) and injects them into the LLM prompt.
+  - Consumes memory_context (retrieved findings/strategies) for context stability.
+  - Uses RepetitionDetector to suppress redundant action proposals before LLM call.
+  - Emits repetition.detected audit events when suppression occurs.
 
 Novelty check: proposes actions not already in previous_actions.
 Repeated-state circuit breaker: if no novel action can be generated for 3 consecutive
@@ -24,20 +33,27 @@ from urllib.parse import urlparse
 
 import structlog
 
+from pwnpilot.agent.repetition_detector import RepetitionDetector
 from pwnpilot.agent.state import AgentState
 from pwnpilot.data.models import PlannerProposal, RiskLevel
+from pwnpilot.observability.tracing import tracer
 
 log = structlog.get_logger(__name__)
 
 _MAX_REPEATED_STATE: int = 3
 _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_PIVOT: int = 5
 _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_KILL: int = 12
+_REFLECTOR_INTERVENTION_REJECT_STREAK: int = 6
+_REFLECTOR_TERMINATE_REJECT_STREAK: int = 10
 _LOW_VALUE_HINT_CODES = frozenset({
     "wildcard_detected",
     "no_forms_detected",
     "no_matches",
     "output_format_invalid",
 })
+
+# v2: RepetitionDetector singleton used by PlannerNode
+_repetition_detector = RepetitionDetector(repeat_threshold=3, similarity_threshold=5)
 
 
 def _proposal_key(proposal: dict[str, Any]) -> str:
@@ -168,6 +184,9 @@ class PlannerNode:
 
     The LLM call is delegated to *llm_router*.  In simulation/test mode, *llm_router*
     can be replaced with a stub.
+
+    v2: Consumes operator_directives and memory_context from AgentState.
+        Uses RepetitionDetector to suppress redundant proposals.
     """
 
     def __init__(
@@ -182,6 +201,7 @@ class PlannerNode:
         adaptive_cooldown_enabled: bool = True,
         adaptive_cooldown_max: int = 6,
         metrics: Any | None = None,
+        repetition_detector: RepetitionDetector | None = None,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
@@ -194,6 +214,7 @@ class PlannerNode:
         self._adaptive_cooldown_enabled = bool(adaptive_cooldown_enabled)
         self._adaptive_cooldown_max = max(1, int(adaptive_cooldown_max))
         self._metrics = metrics
+        self._repetition_detector = repetition_detector or _repetition_detector
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -222,6 +243,7 @@ class PlannerNode:
         # so fallback logic does not loop on the same incompatible candidate.
         validation_result = state.get("validation_result") or {}
         nonproductive_streak = int(state.get("nonproductive_cycle_streak", 0) or 0)
+        reject_reason_streak = int(state.get("reject_reason_streak_count", 0) or 0)
         rejection_reason_code = ""
         rejection_class = ""
         rejection_repeat_count = int(state.get("rejection_repeat_count", 0) or 0)
@@ -257,7 +279,37 @@ class PlannerNode:
                     cooldown=cooldown_map[rejected_tool],
                 )
 
-        # Build LLM prompt context with findings data (NEW: Rich context for LLM)
+        # v2: Inject operator directives into planning context
+        operator_directives = state.get("operator_directives") or {}
+        operator_context: dict[str, Any] = {}
+        if operator_directives:
+            if operator_directives.get("objective"):
+                operator_context["operator_objective"] = operator_directives["objective"]
+            if operator_directives.get("requested_focus"):
+                operator_context["operator_requested_focus"] = operator_directives["requested_focus"]
+            if operator_directives.get("constraints"):
+                operator_context["operator_constraints"] = operator_directives["constraints"]
+            if operator_directives.get("paused_tool_families"):
+                paused = operator_directives["paused_tool_families"]
+                operator_context["operator_paused_tool_families"] = paused
+                # Add paused families to blocked set
+                blocked_families.update(paused)
+            if operator_directives.get("notes"):
+                operator_context["operator_notes"] = operator_directives["notes"]
+
+            # v2 run-quality: record operator intervention for any active directive
+            try:
+                from pwnpilot.observability.metrics import metrics_registry
+                m = metrics_registry.get(str(state.get("engagement_id", "")))
+                if m is not None:
+                    m.record_operator_intervention()
+            except Exception:
+                pass
+
+        # v2: Inject retrieval memory context (findings/strategies from persistence)
+        memory_context = state.get("memory_context") or {}
+
+        # Build LLM prompt context with findings data
         context = {
             "engagement": self._engagement,
             "iteration": iteration,
@@ -267,9 +319,17 @@ class PlannerNode:
             "available_tools": self._available_tools,
             "tools_catalog": self._tools_catalog,
             "temporarily_unavailable_tools": sorted(cooldown_map.keys()),
-              "rejection_reason_code": rejection_reason_code,
-              "rejection_class": rejection_class,
+            "rejection_reason_code": rejection_reason_code,
+            "rejection_class": rejection_class,
         }
+
+        # Inject operator context deterministically
+        if operator_context:
+            context["operator_guidance"] = operator_context
+
+        # Inject retrieval memory context
+        if memory_context:
+            context["memory_context"] = memory_context
 
         strategy_plan = self._engagement.get("strategy_plan")
         strategy_progress: dict[str, Any] = {}
@@ -357,7 +417,13 @@ class PlannerNode:
                 log.warning("planner.findings_context_error", exc=str(e))
 
         try:
-            raw_proposal = self._llm.plan(context)
+            with tracer.span(
+                "planner.llm_call",
+                engagement_id=str(state.get("engagement_id", "")),
+                iteration=iteration,
+            ) as span:
+                raw_proposal = self._llm.plan(context)
+                span.set_attribute("proposed_tool", raw_proposal.get("tool_name", ""))
         except Exception as exc:
             log.error("planner.llm_error", exc=str(exc))
             return {**state, "error": f"Planner LLM error: {exc}"}
@@ -496,15 +562,49 @@ class PlannerNode:
             isinstance(validation_result, dict)
             and validation_result.get("verdict") == "reject"
             and isinstance(prev_proposal, dict)
-            and nonproductive_streak >= _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_PIVOT
+            and reject_reason_streak >= _REFLECTOR_INTERVENTION_REJECT_STREAK
         ):
             rejected_tool = str(prev_proposal.get("tool_name", "")).strip()
+            reflection = self._reflect_reject_churn_decision(
+                state=state,
+                raw_proposal=raw_proposal,
+                rejected_tool=rejected_tool,
+                reject_reason_code=str(validation_result.get("rejection_reason_code", "")).strip(),
+                rejection_class=str(validation_result.get("rejection_class", "")).strip(),
+                reject_reason_streak=reject_reason_streak,
+            )
+
+            if reflection.get("decision") == "terminate":
+                termination_reason = str(
+                    reflection.get("termination_reason") or "reflector_terminate"
+                ).strip() or "reflector_terminate"
+                rationale = str(reflection.get("rationale") or "").strip()
+                log.error(
+                    "planner.reflector_terminate",
+                    streak=reject_reason_streak,
+                    rejected_tool=rejected_tool,
+                    termination_reason=termination_reason,
+                )
+                return {
+                    **state,
+                    "force_report": True,
+                    "report_trigger_reason": termination_reason,
+                    "stall_state": "terminal",
+                    "termination_reason": termination_reason,
+                    "error": rationale or "Reflector terminated nonproductive reject churn.",
+                }
+
+            reflector_candidates = reflection.get("candidate_tools")
+            if not isinstance(reflector_candidates, list) or not reflector_candidates:
+                reflector_candidates = None
+
             forced_tool = self._select_fallback_tool(
                 blocked_tool=rejected_tool,
                 cooldown_map=cooldown_map,
                 target=str(raw_proposal.get("target", "")),
                 action_type=str(raw_proposal.get("action_type", "")),
                 previous=previous,
+                candidate_tools=reflector_candidates,
                 blocked_families=blocked_families,
             )
             if forced_tool and forced_tool != str(raw_proposal.get("tool_name", "")).strip():
@@ -512,32 +612,33 @@ class PlannerNode:
                     raw_proposal,
                     forced_tool,
                     (
-                        "Forced strategy pivot after consecutive validator rejections "
-                        "to break nonproductive loop."
+                        "Reflector-triggered strategy pivot after repeated validator "
+                        "rejects to break planner-validator churn."
                     ),
                 )
                 log.warning(
-                    "planner.reject_streak_forced_pivot",
+                    "planner.reflector_pivot",
                     from_tool=rejected_tool,
                     to_tool=forced_tool,
-                    streak=nonproductive_streak,
+                    streak=reject_reason_streak,
                     reason=str(validation_result.get("rationale", "")),
                     reason_code=str(validation_result.get("rejection_reason_code", "")),
                     rejection_class=str(validation_result.get("rejection_class", "")),
                 )
                 if self._metrics:
                     self._metrics.record_loop_break_event("forced_pivot")
-            elif nonproductive_streak >= _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_KILL:
+            elif reject_reason_streak >= _REFLECTOR_TERMINATE_REJECT_STREAK:
                 log.error(
                     "planner.nonproductive_reject_loop",
-                    streak=nonproductive_streak,
+                    streak=reject_reason_streak,
                     rejected_tool=rejected_tool,
                 )
                 return {
                     **state,
-                    "kill_switch": True,
+                    "force_report": True,
+                    "report_trigger_reason": "reflector_terminate",
                     "stall_state": "terminal",
-                    "termination_reason": "stalled_nonproductive_loop",
+                    "termination_reason": "reflector_terminate",
                     "error": "Nonproductive reject loop detected; no viable planner pivot available.",
                 }
         else:
@@ -552,7 +653,57 @@ class PlannerNode:
             log.error("planner.invalid_proposal", exc=str(exc))
             return {**state, "error": f"Invalid planner proposal: {exc}"}
 
-        # Novelty check
+        # v2: Repetition detection — suppress redundant proposals before LLM loop
+        repetition_result = self._repetition_detector.check(
+            tool_name=proposal.tool_name,
+            target=proposal.target,
+            action_type=proposal.action_type,
+            previous_actions=previous,
+        )
+        repeated_action_count = int(state.get("repeated_action_count", 0))
+        last_repeated_key = state.get("last_repeated_action_key")
+
+        if repetition_result.is_repeated:
+            repeated_action_count += 1
+            last_repeated_key = f"{proposal.tool_name}:{proposal.target}:{proposal.action_type}"
+            log.warning(
+                "planner.repetition_suppressed",
+                reason_code=repetition_result.reason_code,
+                occurrences=repetition_result.occurrences,
+                tool=proposal.tool_name,
+                hint=repetition_result.hint,
+            )
+            if self._audit:
+                try:
+                    from uuid import UUID
+                    self._audit.append(
+                        engagement_id=UUID(state["engagement_id"]),
+                        actor="planner",
+                        event_type="repetition.detected",
+                        payload={
+                            "reason_code": repetition_result.reason_code,
+                            "occurrences": repetition_result.occurrences,
+                            "tool": proposal.tool_name,
+                            "target": proposal.target,
+                            "hint": repetition_result.hint,
+                        },
+                    )
+                except Exception:
+                    pass
+            # Inject repetition context into rejection_reason so LLM can pivot
+            raw_proposal_with_hint = raw_proposal.copy()
+            raw_proposal_with_hint["rejection_reason"] = repetition_result.hint
+            return {
+                **state,
+                "proposed_action": raw_proposal_with_hint,
+                "iteration_count": iteration + 1,
+                "temporarily_unavailable_tools": cooldown_map,
+                "repeated_action_count": repeated_action_count,
+                "last_repeated_action_key": last_repeated_key,
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
+            }
+
+        # Novelty check (hash-based deduplification)
         prop_key = _proposal_key(raw_proposal)
         known_keys = {
             _proposal_key(a) for a in previous if isinstance(a, dict)
@@ -587,6 +738,8 @@ class PlannerNode:
             "last_rejection_code": rejection_reason_code,
             "last_rejection_class": rejection_class,
             "rejection_repeat_count": rejection_repeat_count,
+            "repeated_action_count": repeated_action_count,
+            "last_repeated_action_key": last_repeated_key,
         }
         self._emit_agent_invoked(state, output, _input_hash, _t0)
         return output
@@ -1023,3 +1176,47 @@ class PlannerNode:
             )
         except Exception as exc:
             log.warning("planner.audit_invoked_failed", exc=str(exc))
+
+    def _reflect_reject_churn_decision(
+        self,
+        state: AgentState,
+        raw_proposal: dict[str, Any],
+        rejected_tool: str,
+        reject_reason_code: str,
+        rejection_class: str,
+        reject_reason_streak: int,
+    ) -> dict[str, Any]:
+        """Return a reflector decision dict: pivot or terminate."""
+        context = {
+            "iteration": int(state.get("iteration_count", 0) or 0),
+            "rejected_tool": rejected_tool,
+            "reject_reason_code": reject_reason_code,
+            "rejection_class": rejection_class,
+            "reject_reason_streak": reject_reason_streak,
+            "candidate_tools": [
+                t for t in self._available_tools if t != rejected_tool
+            ],
+            "target": str(raw_proposal.get("target", "")),
+            "action_type": str(raw_proposal.get("action_type", "")),
+        }
+
+        if hasattr(self._llm, "reflect"):
+            try:
+                decision = self._llm.reflect(context)
+                if isinstance(decision, dict) and decision.get("decision") in {"pivot", "terminate"}:
+                    return decision
+            except Exception as exc:
+                log.warning("planner.reflector_failed", exc=str(exc))
+
+        if reject_reason_streak >= _REFLECTOR_TERMINATE_REJECT_STREAK:
+            return {
+                "decision": "terminate",
+                "termination_reason": "reflector_terminate",
+                "rationale": "Reject reason streak exceeded reflector terminate threshold.",
+            }
+
+        return {
+            "decision": "pivot",
+            "candidate_tools": [t for t in self._available_tools if t != rejected_tool],
+            "rationale": "Default pivot fallback when reflector response is unavailable.",
+        }

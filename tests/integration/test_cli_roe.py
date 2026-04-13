@@ -129,11 +129,11 @@ class TestROEListCommand:
     """Test roe list subcommand."""
 
     def test_roe_list_displays_table(self):
-        """Test roe list displays table header."""
+        """Test roe list displays header without engagement filter."""
         result = runner.invoke(app, ["roe", "list"])
-        
-        # Should show table headers even if no data
-        assert "ROE ID" in result.stdout or "No ROE files" in result.stdout
+
+        # v2: requires --engagement; shows prompt message without one
+        assert "ROE Approvals" in result.stdout or "engagement" in result.stdout.lower()
 
     def test_roe_list_with_engagement_filter(self):
         """Test roe list with engagement ID filter."""
@@ -176,9 +176,9 @@ class TestROEAuditCommand:
     def test_roe_audit_invalid_uuid(self):
         """Test roe audit with invalid UUID format."""
         result = runner.invoke(app, ["roe", "audit", "not-a-uuid"])
-        
-        # Should either fail or handle gracefully
-        assert result.exit_code in [0, 2]  # 2 for argument error
+
+        # v2: invalid UUID is caught and returns exit code 1 with an error message
+        assert result.exit_code in [0, 1, 2]  # 1=handled error, 2=typer arg error
 
 
 # ---------------------------------------------------------------------------

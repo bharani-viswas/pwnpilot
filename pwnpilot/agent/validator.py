@@ -19,11 +19,13 @@ import re
 import time
 from numbers import Real
 from typing import Any
+from uuid import UUID
 
 import structlog
 
 from pwnpilot.agent.state import AgentState
-from pwnpilot.data.models import RiskLevel, ValidationResult
+from pwnpilot.data.models import ExecutionEvent, ExecutionEventType, RiskLevel, ValidationResult
+from pwnpilot.observability.tracing import tracer
 
 log = structlog.get_logger(__name__)
 
@@ -80,11 +82,13 @@ class ValidatorNode:
         policy_context: dict[str, Any],
         audit_store: Any | None = None,
         metrics: Any | None = None,
+        event_bus: Any | None = None,
     ) -> None:
         self._llm = llm_router
         self._policy_context = policy_context
         self._audit = audit_store
         self._metrics = metrics
+        self._event_bus = event_bus
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -100,6 +104,13 @@ class ValidatorNode:
             log.error("validator.no_proposal")
             if self._metrics:
                 self._metrics.record_nonproductive_cycle()
+            self._emit_rejection_event(
+                state,
+                rejection_reason_code="NO_PROPOSAL",
+                rejection_class="capability",
+                rationale="No proposal present.",
+                next_streak=int(state.get("nonproductive_cycle_streak", 0) or 0) + 1,
+            )
             return {
                 **state,
                 "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
@@ -123,6 +134,13 @@ class ValidatorNode:
             log.warning("validator.capability_reject", reason=deterministic_error["rationale"])
             if self._metrics:
                 self._metrics.record_nonproductive_cycle()
+            self._emit_rejection_event(
+                state,
+                rejection_reason_code=deterministic_error["rejection_reason_code"],
+                rejection_class=deterministic_error["rejection_class"],
+                rationale=deterministic_error["rationale"],
+                next_streak=int(state.get("nonproductive_cycle_streak", 0) or 0) + 1,
+            )
             return {
                 **state,
                 "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
@@ -137,12 +155,25 @@ class ValidatorNode:
             }
 
         try:
-            raw_result = self._llm.validate(context)
+            with tracer.span(
+                "validator.llm_call",
+                engagement_id=str(state.get("engagement_id", "")),
+                iteration=state.get("iteration_count", 0),
+            ) as _vspan:
+                raw_result = self._llm.validate(context)
+                _vspan.set_attribute("verdict", raw_result.get("verdict", ""))
         except Exception as exc:
             log.error("validator.llm_error", exc=str(exc))
             # Fail-safe: reject on LLM error
             if self._metrics:
                 self._metrics.record_nonproductive_cycle()
+            self._emit_rejection_event(
+                state,
+                rejection_reason_code="VALIDATOR_LLM_ERROR",
+                rejection_class="policy",
+                rationale=f"Validator LLM error (fail-safe reject): {exc}",
+                next_streak=int(state.get("nonproductive_cycle_streak", 0) or 0) + 1,
+            )
             return {
                 **state,
                 "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
@@ -162,6 +193,13 @@ class ValidatorNode:
             log.error("validator.invalid_result", exc=str(exc))
             if self._metrics:
                 self._metrics.record_nonproductive_cycle()
+            self._emit_rejection_event(
+                state,
+                rejection_reason_code="INVALID_VALIDATOR_OUTPUT",
+                rejection_class="policy",
+                rationale=f"Invalid validator output: {exc}",
+                next_streak=int(state.get("nonproductive_cycle_streak", 0) or 0) + 1,
+            )
             return {
                 **state,
                 "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
@@ -182,6 +220,15 @@ class ValidatorNode:
                     "rejection_reason_detail": result.rationale,
                     "rejection_class": "policy",
                 }
+            )
+
+        if result.verdict == "reject":
+            self._emit_rejection_event(
+                state,
+                rejection_reason_code=str(result.rejection_reason_code or "VALIDATOR_REJECT"),
+                rejection_class=str(result.rejection_class or "policy"),
+                rationale=str(result.rationale or ""),
+                next_streak=int(state.get("nonproductive_cycle_streak", 0) or 0) + 1,
             )
 
         # Enforce no-downgrade invariant
@@ -221,6 +268,36 @@ class ValidatorNode:
         }
         self._emit_agent_invoked(state, output, _input_hash, _t0)
         return output
+
+    def _emit_rejection_event(
+        self,
+        state: AgentState,
+        rejection_reason_code: str,
+        rejection_class: str,
+        rationale: str,
+        next_streak: int,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            engagement_id = UUID(str(state.get("engagement_id", "")))
+            self._event_bus.publish(
+                engagement_id,
+                ExecutionEvent(
+                    engagement_id=engagement_id,
+                    event_type=ExecutionEventType.VALIDATOR_REJECTED,
+                    actor="validator",
+                    payload={
+                        "rejection_reason_code": str(rejection_reason_code or "").strip() or "VALIDATOR_REJECT",
+                        "rejection_class": str(rejection_class or "").strip() or "policy",
+                        "rationale": rationale,
+                        "nonproductive_cycle_streak": int(next_streak),
+                    },
+                ),
+            )
+        except Exception:
+            # Rejection telemetry must never interrupt validator decisions.
+            return
 
     def _deterministic_capability_check(self, proposal: dict[str, Any]) -> dict[str, str] | None:
         available_tools = self._policy_context.get("available_tools") or []

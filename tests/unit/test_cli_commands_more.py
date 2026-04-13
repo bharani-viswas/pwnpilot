@@ -442,8 +442,8 @@ def test_roe_verify_failure_and_export_error_paths(tmp_path: Path) -> None:
         generic_verify = runner.invoke(app, ["roe", "verify", str(roe_file)])
     assert generic_verify.exit_code == 1
 
-    # export error branch (lines ~817+)
+    # export error branch — patch Path.write_text so the file write fails
     out = tmp_path / "export.json"
-    with patch("builtins.open", side_effect=OSError("disk full")):
+    with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
         export_fail = runner.invoke(app, ["roe", "export", str(uuid4()), "--output", str(out)])
     assert export_fail.exit_code == 1

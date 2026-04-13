@@ -153,6 +153,24 @@ class PolicyConfig(BaseModel):
 
 class AgentConfig(BaseModel):
     max_iterations: int = Field(default=50, ge=1, le=500)
+    max_planner_validator_cycles_without_executor: int = Field(
+        default=40,
+        ge=5,
+        le=10000,
+        description="Hard cap for consecutive planner-validator cycles with no executor progress.",
+    )
+    max_consecutive_rejects_per_reason: int = Field(
+        default=12,
+        ge=2,
+        le=1000,
+        description="Hard cap for consecutive validator rejects with the same reason fingerprint.",
+    )
+    max_autonomous_runtime_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=172800,
+        description="Hard cap for autonomous run wall-clock duration in seconds.",
+    )
     convergence_threshold: int = Field(
         default=3,
         ge=1,
