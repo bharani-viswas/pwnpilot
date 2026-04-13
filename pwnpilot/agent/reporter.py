@@ -24,6 +24,8 @@ from uuid import UUID
 import structlog
 
 from pwnpilot.agent.state import AgentState
+from pwnpilot.reporting.readiness_policy import ReportReadinessPolicy
+from pwnpilot.reporting.run_health import evaluate_run_health
 
 log = structlog.get_logger(__name__)
 
@@ -40,10 +42,12 @@ class ReporterNode:
         report_generator: Any,
         audit_store: Any,
         output_dir: Path,
+        readiness_policy: ReportReadinessPolicy | None = None,
     ) -> None:
         self._generator = report_generator
         self._audit = audit_store
         self._output_dir = output_dir
+        self._readiness_policy = readiness_policy or ReportReadinessPolicy()
 
     def __call__(self, state: AgentState) -> AgentState:
         engagement_id = UUID(state["engagement_id"])
@@ -54,10 +58,21 @@ class ReporterNode:
 
         log.info("reporter.building_report", engagement_id=str(engagement_id))
 
+        readiness = self._readiness_policy.evaluate(state)
+        health = evaluate_run_health(state, readiness)
+
+        run_metadata = {
+            "run_verdict": health["run_verdict"],
+            "readiness_gate_results": readiness,
+            "degradation_reasons": health["degradation_reasons"],
+            "termination_reason": health["termination_reason"],
+        }
+
         try:
             bundle_path, summary_path = self._generator.build_bundle(
                 engagement_id=engagement_id,
                 output_dir=self._output_dir,
+                                run_metadata=run_metadata,
             )
         except Exception as exc:
             log.error("reporter.build_failed", exc=str(exc))
@@ -70,6 +85,8 @@ class ReporterNode:
                 "engagement_id": str(engagement_id),
                 "bundle_path": str(bundle_path),
                 "summary_path": str(summary_path),
+                                "run_verdict": run_metadata["run_verdict"],
+                                "termination_reason": run_metadata["termination_reason"],
             },
         )
 
@@ -79,7 +96,14 @@ class ReporterNode:
             summary=str(summary_path),
         )
 
-        output = {**state, "report_complete": True}
+        output = {
+            **state,
+            "report_complete": True,
+            "run_verdict": run_metadata["run_verdict"],
+            "readiness_gate_results": run_metadata["readiness_gate_results"],
+            "degradation_reasons": run_metadata["degradation_reasons"],
+            "termination_reason": run_metadata["termination_reason"],
+        }
         duration_ms = round((time.monotonic() - _t0) * 1000, 2)
         output_hash = hashlib.sha256(
             json.dumps(output, default=str, sort_keys=True).encode()

@@ -119,6 +119,22 @@ class ErrorClass(str, Enum):
     HALTED = "HALTED"
 
 
+class OutcomeStatus(str, Enum):
+    SUCCESS = "success"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+
+
+class FailureReason(str, Enum):
+    TARGET_UNREACHABLE = "TargetUnreachable"
+    TOOL_MODE_MISMATCH = "ToolModeMismatch"
+    AUTH_FAILURE = "AuthFailure"
+    TIMEOUT = "Timeout"
+    PARSER_DEGRADED = "ParserDegraded"
+    NO_ACTIONABLE_OUTPUT = "NoActionableOutput"
+    UNKNOWN_RUNTIME_FAILURE = "UnknownRuntimeFailure"
+
+
 class ToolExecutionResult(BaseModel):
     action_id: UUID
     tool_name: str
@@ -133,6 +149,8 @@ class ToolExecutionResult(BaseModel):
     parsed_output: dict[str, Any] = Field(default_factory=dict)
     parser_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     error_class: ErrorClass | None = None
+    outcome_status: OutcomeStatus = OutcomeStatus.SUCCESS
+    failure_reasons: list[FailureReason] = Field(default_factory=list)
     schema_version: str = "v1"
 
 
@@ -231,6 +249,7 @@ class PlannerProposal(BaseModel):
     action_type: str
     tool_name: str
     target: str
+    strategy_step_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     rationale: str
     estimated_risk: RiskLevel
@@ -247,6 +266,9 @@ class ValidationResult(BaseModel):
     verdict: str  # "approve" | "reject" | "escalate"
     risk_override: RiskLevel | None = None
     rationale: str
+    rejection_reason_code: str | None = None
+    rejection_reason_detail: str | None = None
+    rejection_class: str | None = None
     schema_version: str = "v1"
 
     @field_validator("verdict")

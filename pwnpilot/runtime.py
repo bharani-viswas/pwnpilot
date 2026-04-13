@@ -40,6 +40,8 @@ from pwnpilot.control.llm_router import LLMRouter
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.audit_store import AuditStore
 from pwnpilot.data.evidence_store import EvidenceStore
+from pwnpilot.control.capability_registry import CapabilityRegistry
+from pwnpilot.control.target_resolver import TargetResolver
 from pwnpilot.data.finding_store import FindingStore
 from pwnpilot.data.models import Engagement, EngagementScope
 from pwnpilot.data.recon_store import ReconStore
@@ -52,6 +54,7 @@ from pwnpilot.plugins.policy import PluginTrustPolicy
 from pwnpilot.plugins.runner import ToolRunner
 from pwnpilot.plugins.registry import ToolRegistry
 from pwnpilot.observability.logging_setup import configure_logging_from_config
+from pwnpilot.observability.metrics import metrics_registry
 from pwnpilot.reporting.generator import ReportGenerator
 from pwnpilot.secrets.redactor import Redactor
 
@@ -185,6 +188,15 @@ def _filter_tools_catalog(
 ) -> list[dict[str, Any]]:
     allowed = set(allowed_tools)
     return [t for t in tools_catalog if t.get("tool_name") in allowed]
+
+
+def _agent_runtime_settings(typed_cfg: Any) -> dict[str, Any]:
+    agent_cfg = getattr(typed_cfg, "agent", None)
+    return {
+        "per_step_budget": int(getattr(agent_cfg, "per_step_budget", 3)),
+        "adaptive_cooldown_enabled": bool(getattr(agent_cfg, "adaptive_cooldown_enabled", True)),
+        "adaptive_cooldown_max": int(getattr(agent_cfg, "adaptive_cooldown_max", 6)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +335,17 @@ def _build_runtime(
     planner_available_tools = _compute_executable_tool_names(tool_registry)
     if not planner_available_tools:
         planner_available_tools = tool_runner.available_tools
-    planner_tools_catalog = _filter_tools_catalog(
-        tool_registry.planner_context().get("tools_catalog", []),
-        planner_available_tools,
+    runtime_mode = str(os.environ.get("PWNPILOT_RUNTIME_MODE", "headless")).strip() or "headless"
+    has_display = bool(os.environ.get("DISPLAY"))
+    full_tools_catalog = tool_registry.planner_context().get("tools_catalog", [])
+    capability_registry = CapabilityRegistry(
+        tools_catalog=full_tools_catalog,
+        runtime_mode=runtime_mode,
+        has_display=has_display,
     )
+    planner_available_tools = capability_registry.filter_runtime_compatible(planner_available_tools)
+    planner_tools_catalog = _filter_tools_catalog(full_tools_catalog, planner_available_tools)
+    target_resolver = TargetResolver()
 
     # LLM router — unified multi-provider support via LiteLLM
     redactor = Redactor()
@@ -371,6 +390,10 @@ def _build_runtime(
         "tool_runner": tool_runner,
         "planner_available_tools": planner_available_tools,
         "planner_tools_catalog": planner_tools_catalog,
+        "capability_registry": capability_registry,
+        "target_resolver": target_resolver,
+        "runtime_mode": runtime_mode,
+        "has_display": has_display,
         "llm_router": llm_router,
         "approval_service": approval_service,
         "report_generator": report_generator,
@@ -422,6 +445,7 @@ def create_and_run_engagement(
         return str(engagement.engagement_id)
 
     # Build agent nodes
+    agent_settings = _agent_runtime_settings(rt["typed_cfg"])
     engagement_summary = {
         "engagement_id": str(engagement.engagement_id),
         "name": name,
@@ -436,6 +460,7 @@ def create_and_run_engagement(
         ),
     }
 
+    metrics = metrics_registry.get_or_create(str(engagement.engagement_id))
     planner = PlannerNode(
         llm_router=rt["llm_router"],
         engagement_summary=engagement_summary,
@@ -443,6 +468,10 @@ def create_and_run_engagement(
         finding_store=rt["finding_store"],
         available_tools=rt["planner_available_tools"],
         tools_catalog=rt["planner_tools_catalog"],
+        per_step_budget=agent_settings["per_step_budget"],
+        adaptive_cooldown_enabled=agent_settings["adaptive_cooldown_enabled"],
+        adaptive_cooldown_max=agent_settings["adaptive_cooldown_max"],
+        metrics=metrics,
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -450,8 +479,12 @@ def create_and_run_engagement(
             "gates": "recon_passive:allow,active_scan:allow,exploit:requires_approval",
             "available_tools": rt["planner_available_tools"],
             "tools_catalog": rt["planner_tools_catalog"],
+            "capability_contracts": rt["capability_registry"].contracts_for_tools(rt["planner_available_tools"]),
+            "runtime_mode": rt["runtime_mode"],
+            "has_display": rt["has_display"],
         },
         audit_store=rt["audit_store"],
+        metrics=metrics,
     )
     executor = ExecutorNode(
         policy_engine=policy_engine,
@@ -461,6 +494,10 @@ def create_and_run_engagement(
         finding_store=rt["finding_store"],
         recon_store=rt["recon_store"],
         planner_available_tools=rt["planner_available_tools"],
+        metrics=metrics,
+        target_family="multi_scope",
+        target_resolver=rt["target_resolver"],
+        capability_registry=rt["capability_registry"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -490,6 +527,7 @@ def create_and_run_engagement(
         "iteration_count": 0,
         "max_iterations": max_iterations,
         "no_new_findings_streak": 0,
+        "nonproductive_cycle_streak": 0,
         "recon_summary": {},
         "previous_actions": [],
         "temporarily_unavailable_tools": {},
@@ -499,6 +537,15 @@ def create_and_run_engagement(
         "evidence_ids": [],
         "kill_switch": False,
         "report_complete": False,
+        "report_trigger_reason": None,
+        "stall_state": "none",
+        "termination_reason": None,
+        "run_verdict": None,
+        "readiness_gate_results": {},
+        "degradation_reasons": [],
+        "last_rejection_code": "",
+        "last_rejection_class": "",
+        "rejection_repeat_count": 0,
         "error": None,
     }
 
@@ -510,6 +557,9 @@ def create_and_run_engagement(
     )
 
     final_state = supervisor.run(initial_state, thread_id=str(engagement.engagement_id))
+
+    if final_state.get("report_trigger_reason"):
+        metrics.record_report_trigger(str(final_state.get("report_trigger_reason")))
 
     if final_state.get("error"):
         log.error("runtime.engagement_error", error=final_state["error"])
@@ -591,6 +641,9 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
     eng_svc = EngagementService(engagement)
     policy_engine = PolicyEngine(eng_svc)
 
+    agent_settings = _agent_runtime_settings(rt["typed_cfg"])
+
+    metrics = metrics_registry.get_or_create(thread_id)
     planner = PlannerNode(
         llm_router=rt["llm_router"],
         engagement_summary={
@@ -606,14 +659,22 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         finding_store=rt["finding_store"],
         available_tools=rt["planner_available_tools"],
         tools_catalog=rt["planner_tools_catalog"],
+        per_step_budget=agent_settings["per_step_budget"],
+        adaptive_cooldown_enabled=agent_settings["adaptive_cooldown_enabled"],
+        adaptive_cooldown_max=agent_settings["adaptive_cooldown_max"],
+        metrics=metrics,
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
         policy_context={
             "available_tools": rt["planner_available_tools"],
             "tools_catalog": rt["planner_tools_catalog"],
+            "capability_contracts": rt["capability_registry"].contracts_for_tools(rt["planner_available_tools"]),
+            "runtime_mode": rt["runtime_mode"],
+            "has_display": rt["has_display"],
         },
         audit_store=rt["audit_store"],
+        metrics=metrics,
     )
     executor = ExecutorNode(
         policy_engine=policy_engine,
@@ -623,6 +684,10 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         finding_store=rt["finding_store"],
         recon_store=rt["recon_store"],
         planner_available_tools=rt["planner_available_tools"],
+        metrics=metrics,
+        target_family="resumed",
+        target_resolver=rt["target_resolver"],
+        capability_registry=rt["capability_registry"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -641,6 +706,9 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
 
     # Invoke with None: LangGraph resumes from the last checkpoint
     final_state = supervisor.run(None, thread_id=thread_id)  # type: ignore[arg-type]
+
+    if final_state and final_state.get("report_trigger_reason"):
+        metrics.record_report_trigger(str(final_state.get("report_trigger_reason")))
 
     if final_state and final_state.get("error"):
         log.error("runtime.resume_error", error=final_state["error"])

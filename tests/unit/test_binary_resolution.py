@@ -38,6 +38,12 @@ class TestBinaryResolver:
 
         assert resolved == "/usr/bin/drill"
 
+    def test_zap_candidates_prioritize_baseline_script(self) -> None:
+        with mock.patch("platform.system", return_value="Linux"):
+            candidates = candidate_binaries("zap", "zap-baseline.py")
+        assert candidates[0] == "zap-baseline.py"
+        assert "zaproxy" not in candidates
+
 
 class TestToolRunnerBinaryResolution:
     def test_execute_substitutes_resolved_binary(self, tmp_path):

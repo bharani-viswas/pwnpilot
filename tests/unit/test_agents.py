@@ -40,6 +40,7 @@ def _base_state(max_iter=10) -> AgentState:
         "iteration_count": 0,
         "max_iterations": max_iter,
         "no_new_findings_streak": 0,
+        "nonproductive_cycle_streak": 0,
         "recon_summary": {},
         "previous_actions": [],
         "proposed_action": None,
@@ -70,6 +71,14 @@ class TestRouting:
         state = {**_base_state(), "validation_result": {"verdict": "reject"}}
         assert _route_after_validation(state) == "replan"
 
+    def test_route_after_validation_reports_on_nonproductive_limit(self):
+        state = {
+            **_base_state(),
+            "nonproductive_cycle_streak": 5,
+            "validation_result": {"verdict": "reject"},
+        }
+        assert _route_after_validation(state) == "report"
+
     def test_route_after_validation_kill_switch(self):
         state = {**_base_state(), "kill_switch": True, "validation_result": {"verdict": "approve"}}
         assert _route_after_validation(state) == "halt"
@@ -93,6 +102,10 @@ class TestRouting:
     def test_route_after_execution_error(self):
         state = {**_base_state(), "error": "something broke"}
         assert _route_after_execution(state) == "halt"
+
+    def test_route_after_execution_reports_on_nonproductive_limit(self):
+        state = {**_base_state(), "nonproductive_cycle_streak": 5}
+        assert _route_after_execution(state) == "report"
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +280,7 @@ class TestValidatorNode:
         validator = ValidatorNode(llm_router=MockLLMRouter(), policy_context={})
         result = validator(_base_state())
         assert result["validation_result"]["verdict"] == "reject"
+        assert result["validation_result"]["rejection_reason_code"] == "NO_PROPOSAL"
 
     def test_downgrade_rejected_by_no_downgrade_rule(self):
         router = MockLLMRouter(
@@ -309,6 +323,7 @@ class TestValidatorNode:
         result = validator(state)
         assert result["validation_result"]["verdict"] == "reject"
         assert "not enabled or trusted" in result["validation_result"]["rationale"]
+        assert result["validation_result"]["rejection_reason_code"] == "TOOL_NOT_ENABLED"
 
     def test_capability_rejects_incompatible_target_type(self):
         validator = ValidatorNode(
@@ -335,6 +350,99 @@ class TestValidatorNode:
         result = validator(state)
         assert result["validation_result"]["verdict"] == "reject"
         assert "not supported" in result["validation_result"]["rationale"]
+
+    def test_capability_rejects_risk_class_mismatch(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["whatweb"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "whatweb",
+                        "risk_class": "recon_passive",
+                        "supported_target_types": ["url"],
+                        "required_params": ["target"],
+                        "parameter_schema": {
+                            "target": {"type": "string"},
+                            "aggression": {"type": "integer", "minimum": 1, "maximum": 3},
+                        },
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "active_scan",
+            "tool_name": "whatweb",
+            "target": "https://example.com",
+            "rationale": "test",
+            "estimated_risk": "low",
+            "params": {},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "reject"
+        assert "risk class" in result["validation_result"]["rationale"]
+
+    def test_capability_rejects_unknown_parameters(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["nmap"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "nmap",
+                        "risk_class": "active_scan",
+                        "supported_target_types": ["ip", "domain", "url", "cidr"],
+                        "required_params": ["target"],
+                        "parameter_schema": {
+                            "target": {"type": "string"},
+                            "ports": {"type": "string"},
+                        },
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "active_scan",
+            "tool_name": "nmap",
+            "target": "10.0.0.1",
+            "rationale": "test",
+            "estimated_risk": "low",
+            "params": {"mode": "dir"},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "reject"
+        assert "unsupported parameters" in result["validation_result"]["rationale"]
+
+    def test_capability_rejects_schema_value_violations(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["whatweb"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "whatweb",
+                        "risk_class": "recon_passive",
+                        "supported_target_types": ["url"],
+                        "required_params": ["target"],
+                        "parameter_schema": {
+                            "target": {"type": "string"},
+                            "aggression": {"type": "integer", "minimum": 1, "maximum": 3},
+                        },
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "recon_passive",
+            "tool_name": "whatweb",
+            "target": "https://example.com",
+            "rationale": "test",
+            "estimated_risk": "low",
+            "params": {"aggression": 7},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "reject"
+        assert "must be <= 3" in result["validation_result"]["rationale"]
 
 
 # ---------------------------------------------------------------------------

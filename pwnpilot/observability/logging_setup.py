@@ -35,6 +35,22 @@ def _prepare_log_file(path: str) -> str:
     return expanded
 
 
+def _should_use_console_colors() -> bool:
+    """Return True when ANSI colors should be enabled for console output."""
+    force_color = os.getenv("FORCE_COLOR") or os.getenv("CLICOLOR_FORCE")
+    if str(force_color or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+
+    if os.getenv("NO_COLOR") is not None:
+        return False
+
+    term = str(os.getenv("TERM") or "").strip().lower()
+    if term == "dumb":
+        return False
+
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
 def configure_logging(
     level: str = "INFO",
     log_file: str = "",
@@ -64,10 +80,11 @@ def configure_logging(
         structlog.processors.format_exc_info,
     ]
 
+    use_console_colors = _should_use_console_colors()
     stdout_renderer = (
         structlog.processors.JSONRenderer(sort_keys=True)
         if str(stdout_format).lower() == "json"
-        else structlog.dev.ConsoleRenderer(colors=False)
+        else structlog.dev.ConsoleRenderer(colors=use_console_colors)
     )
 
     stdout_formatter = structlog.stdlib.ProcessorFormatter(
@@ -135,6 +152,7 @@ def configure_logging(
         level=logging.getLevelName(log_level),
         log_file=log_file or "stdout",
         stdout_format=("json" if str(stdout_format).lower() == "json" else "console"),
+        stdout_colors=bool(use_console_colors),
         rotation_days=keep_days,
         pid=os.getpid(),
     )

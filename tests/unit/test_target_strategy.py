@@ -28,3 +28,4 @@ def test_build_engagement_strategy_marks_missing_tools() -> None:
     sequence = strategy["sequence"]
     discovery = next(step for step in sequence if step["step_id"] == "web_discovery")
     assert discovery["preferred_available"] == ["gobuster"]
+    assert discovery["recovery_rules"][0]["hint_codes"] == ["wildcard_detected"]

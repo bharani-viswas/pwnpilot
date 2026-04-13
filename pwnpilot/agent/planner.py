@@ -18,7 +18,9 @@ import ipaddress
 import json
 import re
 import time
+from copy import deepcopy
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 
@@ -28,6 +30,8 @@ from pwnpilot.data.models import PlannerProposal, RiskLevel
 log = structlog.get_logger(__name__)
 
 _MAX_REPEATED_STATE: int = 3
+_MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_PIVOT: int = 5
+_MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_KILL: int = 12
 _LOW_VALUE_HINT_CODES = frozenset({
     "wildcard_detected",
     "no_forms_detected",
@@ -68,6 +72,25 @@ def _classify_target_type(target: str) -> str:
     return "unknown"
 
 
+def _schema_property_names(tool_meta: dict[str, Any]) -> set[str]:
+    props = tool_meta.get("parameter_schema", {}) if isinstance(tool_meta, dict) else {}
+    if not isinstance(props, dict):
+        return set()
+    return {str(name).strip() for name in props.keys() if str(name).strip()}
+
+
+def _target_has_query_params(target: str) -> bool:
+    parsed = urlparse(str(target or "").strip())
+    return bool(parsed.query)
+
+
+def _normalize_base_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return str(url or "").strip()
+
+
 def _strategy_progress(
     strategy_plan: dict[str, Any],
     previous: list[dict[str, Any]],
@@ -93,8 +116,39 @@ def _strategy_progress(
             for t in (step.get("preferred_tools", []) + step.get("fallback_tools", []))
             if str(t).strip()
         }
+        step_actions = [
+            item for item in previous
+            if isinstance(item, dict) and str(item.get("tool_name", "")).strip() in step_tools
+        ]
         step_id = str(step.get("step_id", "")).strip()
-        if step_tools & used_tools:
+        if step_actions:
+            latest_action = step_actions[-1]
+            hint_codes = {
+                str(code).strip()
+                for code in latest_action.get("execution_hint_codes", [])
+                if str(code).strip()
+            }
+            latest_error = str(latest_action.get("error", "")).strip()
+            recovery_policy = None
+            for rule in step.get("recovery_rules", []):
+                rule_codes = {
+                    str(code).strip()
+                    for code in rule.get("hint_codes", [])
+                    if str(code).strip()
+                }
+                if hint_codes & rule_codes:
+                    recovery_policy = rule
+                    break
+
+            if hint_codes & _LOW_VALUE_HINT_CODES or latest_error:
+                current_step = {
+                    **step,
+                    "recovery_hint_codes": sorted(hint_codes),
+                    "recovery_preferred_tools": list(recovery_policy.get("preferred_tools", [])) if recovery_policy else [],
+                    "active_recovery_rule": recovery_policy or {},
+                }
+                break
+
             if step_id:
                 completed_steps.append(step_id)
             continue
@@ -124,6 +178,10 @@ class PlannerNode:
         finding_store: Any | None = None,
         available_tools: list[str] | None = None,
         tools_catalog: list[dict[str, Any]] | None = None,
+        per_step_budget: int = 3,
+        adaptive_cooldown_enabled: bool = True,
+        adaptive_cooldown_max: int = 6,
+        metrics: Any | None = None,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
@@ -132,6 +190,10 @@ class PlannerNode:
         self._finding_store = finding_store
         self._available_tools = available_tools or []
         self._tools_catalog = tools_catalog or []
+        self._per_step_budget = max(1, int(per_step_budget))
+        self._adaptive_cooldown_enabled = bool(adaptive_cooldown_enabled)
+        self._adaptive_cooldown_max = max(1, int(adaptive_cooldown_max))
+        self._metrics = metrics
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -148,6 +210,7 @@ class PlannerNode:
         cooldown_map = self._decay_tool_cooldowns(
             state.get("temporarily_unavailable_tools", {})
         )
+        cooldown_map = self._apply_adaptive_cooldowns(cooldown_map, previous)
         rejection_reason = None
 
         # Carry forward rejection reason from previous validation (if any)
@@ -158,12 +221,29 @@ class PlannerNode:
         # If validator rejected the previous proposal, cool that tool down briefly
         # so fallback logic does not loop on the same incompatible candidate.
         validation_result = state.get("validation_result") or {}
+        nonproductive_streak = int(state.get("nonproductive_cycle_streak", 0) or 0)
+        rejection_reason_code = ""
+        rejection_class = ""
+        rejection_repeat_count = int(state.get("rejection_repeat_count", 0) or 0)
+        last_rejection_code = str(state.get("last_rejection_code", "")).strip()
+        last_rejection_class = str(state.get("last_rejection_class", "")).strip()
+        blocked_families: set[str] = set()
         if (
             isinstance(validation_result, dict)
             and validation_result.get("verdict") == "reject"
             and isinstance(prev_proposal, dict)
         ):
+            rejection_reason_code = str(validation_result.get("rejection_reason_code", "")).strip()
+            rejection_class = str(validation_result.get("rejection_class", "")).strip()
+            if rejection_reason_code and rejection_reason_code == last_rejection_code and rejection_class == last_rejection_class:
+                rejection_repeat_count += 1
+            else:
+                rejection_repeat_count = 1
             rejected_tool = str(prev_proposal.get("tool_name", "")).strip()
+            if rejection_repeat_count >= 2 and rejection_class:
+                family = self._tool_family(rejected_tool)
+                if family:
+                    blocked_families.add(family)
             if rejected_tool:
                 try:
                     current = int(cooldown_map.get(rejected_tool, 0))
@@ -187,12 +267,35 @@ class PlannerNode:
             "available_tools": self._available_tools,
             "tools_catalog": self._tools_catalog,
             "temporarily_unavailable_tools": sorted(cooldown_map.keys()),
+              "rejection_reason_code": rejection_reason_code,
+              "rejection_class": rejection_class,
         }
 
         strategy_plan = self._engagement.get("strategy_plan")
+        strategy_progress: dict[str, Any] = {}
+        current_step: dict[str, Any] | None = None
+        step_budget_next_candidates: list[str] = []
+        step_budget_next_step_id: str | None = None
         if isinstance(strategy_plan, dict) and strategy_plan:
+            strategy_progress = _strategy_progress(strategy_plan, previous)
+            current_step = strategy_progress.get("current_step") if isinstance(strategy_progress, dict) else None
             context["target_strategy"] = strategy_plan
-            context["target_strategy_progress"] = _strategy_progress(strategy_plan, previous)
+            context["target_strategy_progress"] = strategy_progress
+
+            if isinstance(current_step, dict):
+                step_attempts = self._step_attempt_count(previous, current_step)
+                context["current_step_attempt_count"] = step_attempts
+                context["per_step_budget"] = self._per_step_budget
+                if step_attempts >= self._per_step_budget:
+                    next_candidates, next_step_id = self._next_strategy_step_candidates(
+                        strategy_plan,
+                        str(current_step.get("step_id", "")).strip(),
+                    )
+                    if next_candidates:
+                        step_budget_next_candidates = next_candidates
+                        step_budget_next_step_id = next_step_id
+                        context["step_budget_exhausted"] = True
+                        context["step_budget_exhausted_step_id"] = str(current_step.get("step_id", "")).strip()
         
         # Extract canonical tool parameter schemas for LLM (NEW: Schema guidance for accurate params)
         if self._tools_catalog:
@@ -259,8 +362,52 @@ class PlannerNode:
             log.error("planner.llm_error", exc=str(exc))
             return {**state, "error": f"Planner LLM error: {exc}"}
 
+        raw_proposal = self._apply_attack_surface_targeting(raw_proposal, recon)
+
         proposed_tool = str(raw_proposal.get("tool_name", ""))
-        if self._recent_low_value_outcome(
+        step_recovery_candidates = self._step_recovery_candidates(current_step)
+        recovery_override_applied = False
+
+        raw_proposal, recovery_override_applied = self._apply_recovery_param_overrides(
+            raw_proposal,
+            current_step,
+            proposed_tool,
+        )
+        proposed_tool = str(raw_proposal.get("tool_name", ""))
+
+        if step_recovery_candidates and proposed_tool not in step_recovery_candidates:
+            recovery_tool = self._select_fallback_tool(
+                blocked_tool=proposed_tool,
+                cooldown_map=cooldown_map,
+                target=str(raw_proposal.get("target", "")),
+                action_type=str(raw_proposal.get("action_type", "")),
+                previous=previous,
+                candidate_tools=step_recovery_candidates,
+            )
+            if recovery_tool:
+                log.warning(
+                    "planner.step_recovery_override",
+                    blocked_tool=proposed_tool,
+                    fallback_tool=recovery_tool,
+                    step_id=str(current_step.get("step_id", "")),
+                    hint_codes=list(current_step.get("recovery_hint_codes", [])),
+                )
+                raw_proposal = self._rebuild_fallback_proposal(
+                    raw_proposal,
+                    recovery_tool,
+                    (
+                        "Stayed within the current target-strategy step because the "
+                        "previous attempt returned recoverable low-value hints."
+                    ),
+                )
+                raw_proposal, recovery_override_applied = self._apply_recovery_param_overrides(
+                    raw_proposal,
+                    current_step,
+                    recovery_tool,
+                )
+                proposed_tool = str(raw_proposal.get("tool_name", ""))
+
+        if not recovery_override_applied and self._recent_low_value_outcome(
             tool_name=proposed_tool,
             target=str(raw_proposal.get("target", "")),
             action_type=str(raw_proposal.get("action_type", "")),
@@ -272,6 +419,8 @@ class PlannerNode:
                 target=str(raw_proposal.get("target", "")),
                 action_type=str(raw_proposal.get("action_type", "")),
                 previous=previous,
+                candidate_tools=step_recovery_candidates,
+                blocked_families=blocked_families,
             )
             if fallback_tool:
                 log.warning(
@@ -279,11 +428,14 @@ class PlannerNode:
                     blocked_tool=proposed_tool,
                     fallback_tool=fallback_tool,
                 )
-                raw_proposal["tool_name"] = fallback_tool
-                raw_proposal["rationale"] = (
-                    str(raw_proposal.get("rationale", "")).strip()
-                    + f" Switched from '{proposed_tool}' because the same action recently produced low-value runtime hints."
-                ).strip()
+                raw_proposal = self._rebuild_fallback_proposal(
+                    raw_proposal,
+                    fallback_tool,
+                    (
+                        f"Switched from '{proposed_tool}' because the same action "
+                        "recently produced low-value runtime hints."
+                    ),
+                )
 
         if proposed_tool and proposed_tool in cooldown_map:
             fallback_tool = self._select_fallback_tool(
@@ -292,6 +444,7 @@ class PlannerNode:
                 target=str(raw_proposal.get("target", "")),
                 action_type=str(raw_proposal.get("action_type", "")),
                 previous=previous,
+                blocked_families=blocked_families,
             )
             if fallback_tool:
                 log.warning(
@@ -299,11 +452,98 @@ class PlannerNode:
                     blocked_tool=proposed_tool,
                     fallback_tool=fallback_tool,
                 )
-                raw_proposal["tool_name"] = fallback_tool
-                raw_proposal["rationale"] = (
-                    str(raw_proposal.get("rationale", "")).strip()
-                    + f" Switched from '{proposed_tool}' because it recently failed as unavailable."
-                ).strip()
+                raw_proposal = self._rebuild_fallback_proposal(
+                    raw_proposal,
+                    fallback_tool,
+                    f"Switched from '{proposed_tool}' because it recently failed as unavailable.",
+                )
+
+        if step_budget_next_candidates and current_step:
+            budget_tool = self._select_fallback_tool(
+                blocked_tool=str(raw_proposal.get("tool_name", "")),
+                cooldown_map=cooldown_map,
+                target=str(raw_proposal.get("target", "")),
+                action_type=str(raw_proposal.get("action_type", "")),
+                previous=previous,
+                candidate_tools=step_budget_next_candidates,
+                blocked_families=blocked_families,
+            )
+            if budget_tool:
+                raw_proposal = self._rebuild_fallback_proposal(
+                    raw_proposal,
+                    budget_tool,
+                    (
+                        f"Advanced from step '{str(current_step.get('step_id', '')).strip()}' "
+                        "after exhausting per-step budget."
+                    ),
+                )
+                if step_budget_next_step_id:
+                    raw_proposal["strategy_step_id"] = step_budget_next_step_id
+                log.info(
+                    "planner.step_budget_advance",
+                    from_step=str(current_step.get("step_id", "")).strip(),
+                    to_step=step_budget_next_step_id,
+                    tool=budget_tool,
+                )
+
+        if isinstance(current_step, dict) and not raw_proposal.get("strategy_step_id"):
+            raw_proposal["strategy_step_id"] = str(current_step.get("step_id", "")).strip()
+
+        # Guardrail for prolonged validator reject churn: force a tool pivot.
+        # This prevents planner/validator deadlocks where the loop keeps proposing
+        # semantically similar low-value actions.
+        if (
+            isinstance(validation_result, dict)
+            and validation_result.get("verdict") == "reject"
+            and isinstance(prev_proposal, dict)
+            and nonproductive_streak >= _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_PIVOT
+        ):
+            rejected_tool = str(prev_proposal.get("tool_name", "")).strip()
+            forced_tool = self._select_fallback_tool(
+                blocked_tool=rejected_tool,
+                cooldown_map=cooldown_map,
+                target=str(raw_proposal.get("target", "")),
+                action_type=str(raw_proposal.get("action_type", "")),
+                previous=previous,
+                blocked_families=blocked_families,
+            )
+            if forced_tool and forced_tool != str(raw_proposal.get("tool_name", "")).strip():
+                raw_proposal = self._rebuild_fallback_proposal(
+                    raw_proposal,
+                    forced_tool,
+                    (
+                        "Forced strategy pivot after consecutive validator rejections "
+                        "to break nonproductive loop."
+                    ),
+                )
+                log.warning(
+                    "planner.reject_streak_forced_pivot",
+                    from_tool=rejected_tool,
+                    to_tool=forced_tool,
+                    streak=nonproductive_streak,
+                    reason=str(validation_result.get("rationale", "")),
+                    reason_code=str(validation_result.get("rejection_reason_code", "")),
+                    rejection_class=str(validation_result.get("rejection_class", "")),
+                )
+                if self._metrics:
+                    self._metrics.record_loop_break_event("forced_pivot")
+            elif nonproductive_streak >= _MAX_NONPRODUCTIVE_REJECT_STREAK_FOR_KILL:
+                log.error(
+                    "planner.nonproductive_reject_loop",
+                    streak=nonproductive_streak,
+                    rejected_tool=rejected_tool,
+                )
+                return {
+                    **state,
+                    "kill_switch": True,
+                    "stall_state": "terminal",
+                    "termination_reason": "stalled_nonproductive_loop",
+                    "error": "Nonproductive reject loop detected; no viable planner pivot available.",
+                }
+        else:
+            rejection_repeat_count = 0
+            rejection_reason_code = ""
+            rejection_class = ""
 
         # Validate proposal structure
         try:
@@ -344,6 +584,9 @@ class PlannerNode:
             "proposed_action": proposal.model_dump(),
             "iteration_count": iteration + 1,
             "temporarily_unavailable_tools": cooldown_map,
+            "last_rejection_code": rejection_reason_code,
+            "last_rejection_class": rejection_class,
+            "rejection_repeat_count": rejection_repeat_count,
         }
         self._emit_agent_invoked(state, output, _input_hash, _t0)
         return output
@@ -360,6 +603,103 @@ class PlannerNode:
                 decayed[tool] = remaining - 1
         return decayed
 
+    def _apply_adaptive_cooldowns(
+        self,
+        cooldown_map: dict[str, int],
+        previous: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        if not self._adaptive_cooldown_enabled:
+            return cooldown_map
+
+        updated = dict(cooldown_map)
+        tool_stats: dict[str, dict[str, int]] = {}
+        for action in previous[-20:]:
+            if not isinstance(action, dict):
+                continue
+            tool = str(action.get("tool_name", "")).strip()
+            if not tool:
+                continue
+            stats = tool_stats.setdefault(tool, {"attempts": 0, "new_findings": 0, "low_value": 0})
+            stats["attempts"] += 1
+            stats["new_findings"] += int(action.get("new_findings_count", 0) or 0)
+            hint_codes = {
+                str(code).strip()
+                for code in action.get("execution_hint_codes", [])
+                if str(code).strip()
+            }
+            if hint_codes & _LOW_VALUE_HINT_CODES:
+                stats["low_value"] += 1
+
+        for tool, stats in tool_stats.items():
+            attempts = int(stats.get("attempts", 0))
+            findings = int(stats.get("new_findings", 0))
+            low_value = int(stats.get("low_value", 0))
+            if attempts < 2 or findings > 0 or low_value < 2:
+                continue
+            adaptive_window = min(self._adaptive_cooldown_max, max(2, low_value + 1))
+            updated[tool] = max(int(updated.get(tool, 0) or 0), adaptive_window)
+            log.info(
+                "planner.adaptive_cooldown_applied",
+                tool=tool,
+                attempts=attempts,
+                low_value_hints=low_value,
+                cooldown=updated[tool],
+            )
+        return updated
+
+    def _step_attempt_count(
+        self,
+        previous: list[dict[str, Any]],
+        current_step: dict[str, Any],
+    ) -> int:
+        if not isinstance(current_step, dict):
+            return 0
+
+        step_id = str(current_step.get("step_id", "")).strip()
+        if not step_id:
+            return 0
+
+        attempts = 0
+        for action in previous:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("strategy_step_id", "")).strip() == step_id:
+                attempts += 1
+        return attempts
+
+    def _next_strategy_step_candidates(
+        self,
+        strategy_plan: dict[str, Any],
+        current_step_id: str,
+    ) -> tuple[list[str], str | None]:
+        sequence = strategy_plan.get("sequence", []) if isinstance(strategy_plan, dict) else []
+        if not isinstance(sequence, list) or not sequence:
+            return [], None
+
+        current_index = -1
+        for idx, step in enumerate(sequence):
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("step_id", "")).strip() == current_step_id:
+                current_index = idx
+                break
+
+        if current_index < 0 or current_index >= len(sequence) - 1:
+            return [], None
+
+        next_step = sequence[current_index + 1]
+        if not isinstance(next_step, dict):
+            return [], None
+
+        candidates: list[str] = []
+        for key in ("preferred_tools", "fallback_tools"):
+            for tool_name in next_step.get(key, []):
+                candidate = str(tool_name).strip()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+        return candidates, str(next_step.get("step_id", "")).strip() or None
+
     def _select_fallback_tool(
         self,
         blocked_tool: str,
@@ -367,10 +707,13 @@ class PlannerNode:
         target: str,
         action_type: str,
         previous: list[dict[str, Any]],
+        candidate_tools: list[str] | None = None,
+        blocked_families: set[str] | None = None,
     ) -> str | None:
         """Pick a deterministic fallback tool not in cooldown and not recently repeated."""
         blocked = set(cooldown_map.keys())
-        blocked.add(blocked_tool)
+        if blocked_tool:
+            blocked.add(blocked_tool)
 
         recent_keys = {
             f"{a.get('tool_name')}:{a.get('target')}:{a.get('action_type')}"
@@ -378,10 +721,19 @@ class PlannerNode:
             if isinstance(a, dict)
         }
 
-        for candidate in self._available_tools:
+        candidate_pool = candidate_tools or self._available_tools
+        blocked_families = blocked_families or set()
+
+        for candidate in candidate_pool:
             if candidate in blocked:
                 continue
+            if candidate not in self._available_tools:
+                continue
+            if blocked_families and self._tool_family(candidate) in blocked_families:
+                continue
             if self._tool_requires_extra_params(candidate):
+                continue
+            if not self._tool_matches_action_type(candidate, action_type):
                 continue
             if not self._tool_supports_target(candidate, target):
                 continue
@@ -391,6 +743,198 @@ class PlannerNode:
             return candidate
         return None
 
+    def _tool_family(self, tool_name: str) -> str:
+        tool_meta = self._tool_meta(tool_name)
+        if not tool_meta:
+            return str(tool_name or "").strip()
+        categories = tool_meta.get("categories", []) if isinstance(tool_meta.get("categories", []), list) else []
+        if categories:
+            return str(categories[0]).strip().lower()
+        risk_class = str(tool_meta.get("risk_class", "")).strip().lower()
+        if risk_class:
+            return risk_class
+        return str(tool_name or "").strip().lower()
+
+    def _rebuild_fallback_proposal(
+        self,
+        proposal: dict[str, Any],
+        fallback_tool: str,
+        rationale_suffix: str,
+    ) -> dict[str, Any]:
+        rebuilt = deepcopy(proposal)
+        rebuilt["tool_name"] = fallback_tool
+
+        tool_meta = self._tool_meta(fallback_tool)
+        filtered_params: dict[str, Any] = {}
+        if isinstance(proposal.get("params"), dict):
+            source_params = dict(proposal.get("params", {}))
+            allowed_params = _schema_property_names(tool_meta) if tool_meta else set()
+            allowed_params.discard("target")
+            if allowed_params:
+                filtered_params = {
+                    key: value
+                    for key, value in source_params.items()
+                    if key in allowed_params
+                }
+
+        rebuilt["params"] = filtered_params
+
+        if tool_meta and str(tool_meta.get("risk_class", "")).strip():
+            rebuilt["action_type"] = str(tool_meta.get("risk_class", "")).strip()
+
+        rebuilt["rationale"] = (
+            str(proposal.get("rationale", "")).strip() + " " + rationale_suffix.strip()
+        ).strip()
+        return rebuilt
+
+    def _tool_meta(self, tool_name: str) -> dict[str, Any] | None:
+        for tool in self._tools_catalog:
+            if str(tool.get("tool_name", "")).strip() == tool_name:
+                return tool
+        return None
+
+    def _tool_matches_action_type(self, tool_name: str, action_type: str) -> bool:
+        tool_meta = self._tool_meta(tool_name)
+        if not tool_meta:
+            return True
+        risk_class = str(tool_meta.get("risk_class", "")).strip().lower()
+        requested = str(action_type or "").strip().lower()
+        if not risk_class or not requested:
+            return True
+        return risk_class == requested
+
+    def _step_recovery_candidates(self, current_step: dict[str, Any] | None) -> list[str]:
+        if not isinstance(current_step, dict):
+            return []
+
+        ordered: list[str] = []
+        for key in ("recovery_preferred_tools", "preferred_tools", "fallback_tools"):
+            for tool_name in current_step.get(key, []):
+                candidate = str(tool_name).strip()
+                if candidate and candidate not in ordered:
+                    ordered.append(candidate)
+        return ordered
+
+    def _apply_recovery_param_overrides(
+        self,
+        proposal: dict[str, Any],
+        current_step: dict[str, Any] | None,
+        tool_name: str,
+    ) -> tuple[dict[str, Any], bool]:
+        if not isinstance(current_step, dict):
+            return proposal, False
+
+        recovery_rule = current_step.get("active_recovery_rule", {})
+        if not isinstance(recovery_rule, dict):
+            return proposal, False
+
+        overrides_map = recovery_rule.get("param_overrides", {})
+        if not isinstance(overrides_map, dict):
+            return proposal, False
+
+        tool_overrides = overrides_map.get(tool_name)
+        if not isinstance(tool_overrides, dict) or not tool_overrides:
+            return proposal, False
+
+        merged = deepcopy(proposal)
+        existing_params = merged.get("params") if isinstance(merged.get("params"), dict) else {}
+        merged["params"] = {**existing_params, **tool_overrides}
+        merged["rationale"] = (
+            str(merged.get("rationale", "")).strip()
+            + " Applied step recovery parameter overrides based on recent runtime hints."
+        ).strip()
+        return merged, True
+
+    def _apply_attack_surface_targeting(
+        self,
+        proposal: dict[str, Any],
+        recon_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(proposal, dict):
+            return proposal
+        if not isinstance(recon_summary, dict):
+            return proposal
+
+        tool_name = str(proposal.get("tool_name", "")).strip()
+        if not tool_name:
+            return proposal
+
+        tool_meta = self._tool_meta(tool_name)
+        if not tool_meta:
+            return proposal
+
+        supported = {
+            str(item).strip().lower()
+            for item in tool_meta.get("supported_target_types", [])
+            if str(item).strip()
+        }
+        if "url" not in supported:
+            return proposal
+
+        surface = recon_summary.get("attack_surface")
+        if not isinstance(surface, dict):
+            return proposal
+
+        endpoints = [str(v).strip() for v in surface.get("endpoints", []) if str(v).strip()]
+        web_targets = [str(v).strip() for v in surface.get("web_targets", []) if str(v).strip()]
+        auth_paths = {str(v).strip() for v in surface.get("auth_paths", []) if str(v).strip()}
+        parameters = [str(v).strip() for v in surface.get("parameters", []) if str(v).strip()]
+
+        if not endpoints and not web_targets:
+            return proposal
+
+        current_target = str(proposal.get("target", "")).strip()
+
+        preferred_endpoint = ""
+        if endpoints:
+            auth_endpoint = next(
+                (
+                    endpoint
+                    for endpoint in endpoints
+                    if urlparse(endpoint).path in auth_paths
+                ),
+                "",
+            )
+            param_endpoint = next((endpoint for endpoint in endpoints if _target_has_query_params(endpoint)), "")
+            preferred_endpoint = auth_endpoint or param_endpoint or endpoints[0]
+
+        preferred_base = web_targets[0] if web_targets else ""
+        preferred_target = preferred_endpoint or preferred_base
+
+        if not preferred_target:
+            return proposal
+
+        current_base = _normalize_base_url(current_target)
+        preferred_base_norm = _normalize_base_url(preferred_target)
+        if current_target == preferred_target:
+            return proposal
+        if current_target == preferred_base and preferred_endpoint:
+            pass
+        elif current_base == preferred_base_norm and not preferred_endpoint:
+            return proposal
+
+        updated = deepcopy(proposal)
+        updated["target"] = preferred_target
+        rationale_suffix = ""
+        if preferred_endpoint and _target_has_query_params(preferred_endpoint):
+            rationale_suffix = " Prioritized discovered endpoint with query parameters from attack_surface."
+        elif preferred_endpoint:
+            rationale_suffix = " Prioritized discovered endpoint from attack_surface."
+        else:
+            rationale_suffix = " Prioritized discovered web target from attack_surface."
+
+        if parameters:
+            rationale_suffix += f" Known parameters: {', '.join(parameters[:5])}."
+
+        updated["rationale"] = (str(updated.get("rationale", "")).strip() + rationale_suffix).strip()
+        log.info(
+            "planner.attack_surface_target_override",
+            tool=tool_name,
+            from_target=current_target,
+            to_target=preferred_target,
+        )
+        return updated
+
     def _tool_requires_extra_params(self, tool_name: str) -> bool:
         """Return True when a tool requires mandatory params beyond target.
 
@@ -398,9 +942,8 @@ class PlannerNode:
         mandatory parameters, so tools with required non-target params are
         skipped during fallback selection.
         """
-        for tool in self._tools_catalog:
-            if str(tool.get("tool_name", "")) != tool_name:
-                continue
+        tool = self._tool_meta(tool_name)
+        if tool:
             required = {
                 str(param).strip()
                 for param in tool.get("required_params", [])
@@ -413,9 +956,8 @@ class PlannerNode:
     def _tool_supports_target(self, tool_name: str, target: str) -> bool:
         """Return True when a tool advertises compatibility with the target type."""
         target_type = _classify_target_type(target)
-        for tool in self._tools_catalog:
-            if str(tool.get("tool_name", "")) != tool_name:
-                continue
+        tool = self._tool_meta(tool_name)
+        if tool:
             supported = {
                 str(item).strip().lower()
                 for item in tool.get("supported_target_types", [])

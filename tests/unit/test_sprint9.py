@@ -111,6 +111,21 @@ class TestPwnpilotConfig:
         with pytest.raises(pydantic.ValidationError):
             AgentConfig(max_iterations=501)
 
+    def test_agent_config_phase5_tuning_bounds(self):
+        from pwnpilot.config import AgentConfig
+        import pydantic
+
+        cfg = AgentConfig()
+        assert cfg.per_step_budget >= 1
+        assert cfg.adaptive_cooldown_enabled is True
+        assert cfg.adaptive_cooldown_max >= 1
+
+        with pytest.raises(pydantic.ValidationError):
+            AgentConfig(per_step_budget=0)
+
+        with pytest.raises(pydantic.ValidationError):
+            AgentConfig(adaptive_cooldown_max=0)
+
     def test_extra_keys_ignored(self, tmp_path: Path):
         from pwnpilot.config import load_config
 
@@ -173,6 +188,15 @@ class TestEngagementMetrics:
         assert counts["nmap"] == 2
         assert counts["nikto"] == 1
 
+    def test_record_tool_invoked_accepts_success_kwarg(self):
+        from pwnpilot.observability.metrics import EngagementMetrics
+
+        m = EngagementMetrics("eng-004b")
+        m.record_tool_invoked("whatweb", 123.4, success=True)
+        m.record_tool_invoked("whatweb", 150.0, success=False)
+        counts = m.tool_invocation_counts
+        assert counts["whatweb"] == 2
+
     def test_summary_tool_stats(self):
         from pwnpilot.observability.metrics import EngagementMetrics
 
@@ -231,6 +255,30 @@ class TestEngagementMetrics:
         m.record_timeout()
         assert m.parser_error_count == 1
         assert m.timeout_count == 2
+
+    def test_summary_includes_phase5_telemetry(self):
+        from pwnpilot.observability.metrics import EngagementMetrics
+
+        m = EngagementMetrics("eng-011")
+        m.record_tool_invoked("nuclei", 120.0)
+        m.record_action_outcome(
+            tool_name="nuclei",
+            new_findings_count=2,
+            execution_hint_codes=["wildcard_detected", "no_matches"],
+            target_family="web",
+        )
+        m.record_nonproductive_cycle()
+        m.record_report_trigger("convergence")
+
+        s = m.summary()
+        assert s["action_count"] == 1
+        assert s["findings_total"] == 2
+        assert s["findings_per_action"] == 2.0
+        assert s["nonproductive_cycle_count"] == 1
+        assert s["report_trigger_reasons"]["convergence"] == 1
+        assert s["recoverable_hint_by_tool"]["nuclei"] == 2
+        assert s["recoverable_hint_by_family"]["web:wildcard_detected"] == 1
+        assert s["tool_stats"]["nuclei"]["findings_total"] == 2
 
 
 class TestMetricsRegistry:

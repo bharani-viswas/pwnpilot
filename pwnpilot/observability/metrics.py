@@ -48,6 +48,9 @@ class EngagementMetrics:
     _timeout_count: int = field(default=0, init=False, repr=False)
     _approval_count: int = field(default=0, init=False, repr=False)
     _kill_switch_triggers: int = field(default=0, init=False, repr=False)
+    _action_count: int = field(default=0, init=False, repr=False)
+    _findings_total: int = field(default=0, init=False, repr=False)
+    _nonproductive_cycle_count: int = field(default=0, init=False, repr=False)
 
     # --- Per-tool invocation counts and latencies (ms) ---
     _tool_invocation_counts: dict[str, int] = field(
@@ -64,6 +67,21 @@ class EngagementMetrics:
 
     # --- Policy deny breakdown by action type ---
     _policy_deny_by_type: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _tool_findings_total: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _recoverable_hint_by_tool: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _recoverable_hint_by_family: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _report_trigger_reasons: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _loop_break_events: dict[str, int] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -106,7 +124,13 @@ class EngagementMetrics:
             self._approval_count += 1
             self._approval_latencies_ms.append(latency)
 
-    def record_tool_invoked(self, tool_name: str, duration_ms: float = 0.0) -> None:
+    def record_tool_invoked(
+        self,
+        tool_name: str,
+        duration_ms: float = 0.0,
+        success: bool | None = None,
+    ) -> None:
+        _ = success  # Reserved for future success/failure-rate telemetry.
         with self._lock:
             self._tool_invocation_counts[tool_name] = (
                 self._tool_invocation_counts.get(tool_name, 0) + 1
@@ -116,6 +140,41 @@ class EngagementMetrics:
     def record_kill_switch(self) -> None:
         with self._lock:
             self._kill_switch_triggers += 1
+
+    def record_nonproductive_cycle(self) -> None:
+        with self._lock:
+            self._nonproductive_cycle_count += 1
+
+    def record_report_trigger(self, reason: str) -> None:
+        key = str(reason or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            self._report_trigger_reasons[key] = self._report_trigger_reasons.get(key, 0) + 1
+
+    def record_loop_break_event(self, event_name: str) -> None:
+        key = str(event_name or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            self._loop_break_events[key] = self._loop_break_events.get(key, 0) + 1
+
+    def record_action_outcome(
+        self,
+        tool_name: str,
+        new_findings_count: int,
+        execution_hint_codes: list[str] | None = None,
+        target_family: str = "unknown",
+    ) -> None:
+        hints = [str(code).strip().lower() for code in (execution_hint_codes or []) if str(code).strip()]
+        family = str(target_family or "unknown").strip().lower() or "unknown"
+
+        with self._lock:
+            self._action_count += 1
+            findings = int(new_findings_count or 0)
+            self._findings_total += findings
+            self._tool_findings_total[tool_name] = self._tool_findings_total.get(tool_name, 0) + findings
+
+            for code in hints:
+                self._recoverable_hint_by_tool[tool_name] = self._recoverable_hint_by_tool.get(tool_name, 0) + 1
+                fam_key = f"{family}:{code}"
+                self._recoverable_hint_by_family[fam_key] = self._recoverable_hint_by_family.get(fam_key, 0) + 1
 
     # ------------------------------------------------------------------
     # Read helpers
@@ -169,11 +228,25 @@ class EngagementMetrics:
             elapsed = time.monotonic() - self._start_time
             tool_stats: dict[str, dict[str, Any]] = {}
             for tool, lats in self._tool_latencies_ms.items():
+                invocations = self._tool_invocation_counts.get(tool, 0)
+                findings = self._tool_findings_total.get(tool, 0)
                 tool_stats[tool] = {
-                    "invocations": self._tool_invocation_counts.get(tool, 0),
+                    "invocations": invocations,
                     "avg_latency_ms": self._avg_latency(lats),
                     "p95_latency_ms": self._p95_latency(lats),
+                    "findings_total": findings,
+                    "findings_per_invocation": round(findings / invocations, 3) if invocations else 0.0,
                 }
+            findings_per_action = (
+                round(self._findings_total / self._action_count, 3)
+                if self._action_count
+                else 0.0
+            )
+            nonproductive_cycle_rate = (
+                round(self._nonproductive_cycle_count / self._action_count, 3)
+                if self._action_count
+                else 0.0
+            )
             return {
                 "engagement_id": self.engagement_id,
                 "elapsed_seconds": round(elapsed, 2),
@@ -186,6 +259,15 @@ class EngagementMetrics:
                 "approval_avg_latency_ms": self._avg_latency(self._approval_latencies_ms),
                 "approval_p95_latency_ms": self._p95_latency(self._approval_latencies_ms),
                 "kill_switch_triggers": self._kill_switch_triggers,
+                "action_count": self._action_count,
+                "findings_total": self._findings_total,
+                "findings_per_action": findings_per_action,
+                "nonproductive_cycle_count": self._nonproductive_cycle_count,
+                "nonproductive_cycle_rate": nonproductive_cycle_rate,
+                "recoverable_hint_by_tool": dict(self._recoverable_hint_by_tool),
+                "recoverable_hint_by_family": dict(self._recoverable_hint_by_family),
+                "report_trigger_reasons": dict(self._report_trigger_reasons),
+                "loop_break_events": dict(self._loop_break_events),
                 "tool_stats": tool_stats,
             }
 

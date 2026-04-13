@@ -64,6 +64,11 @@ class GobusterAdapter(BaseAdapter):
                     "maximum": 120,
                     "default": 10,
                 },
+                "force_wildcard": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable wildcard-force mode (-fw) for wildcard-prone targets in dir mode.",
+                },
             },
             "x_supported_target_types": ["ip", "domain", "url"],
         },
@@ -122,6 +127,10 @@ class GobusterAdapter(BaseAdapter):
                 f"gobuster: timeout_seconds must be 1-120, got {timeout_seconds}"
             )
 
+        force_wildcard = bool(params.get("force_wildcard", False))
+        if force_wildcard and mode != "dir":
+            raise ValueError("gobuster: force_wildcard is only supported in dir mode.")
+
         return ToolParams(
             target=target,
             extra={
@@ -130,6 +139,7 @@ class GobusterAdapter(BaseAdapter):
                 "extensions": extensions,
                 "threads": threads,
                 "timeout_seconds": timeout_seconds,
+                "force_wildcard": force_wildcard,
             },
         )
 
@@ -151,6 +161,8 @@ class GobusterAdapter(BaseAdapter):
 
         if mode == "dir":
             cmd.extend(["-u", params.target])
+            if bool(params.extra.get("force_wildcard", False)):
+                cmd.append("-fw")
             extensions = str(params.extra.get("extensions", ""))
             if extensions:
                 cmd.extend(["-x", extensions])

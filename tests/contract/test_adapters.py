@@ -576,6 +576,17 @@ class TestGobusterContract:
         assert "dns" in cmd
         assert "-d" in cmd
 
+    def test_build_command_dir_with_force_wildcard(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "https://example.com",
+                "mode": "dir",
+                "force_wildcard": True,
+            }
+        )
+        cmd = self.adapter.build_command(params)
+        assert "-fw" in cmd
+
     def test_parse_dir_output(self):
         out = b"/admin (Status: 301) [Size: 0]\n/images (Status: 200) [Size: 1234]\n"
         result = self.adapter.parse(out, b"", 0)

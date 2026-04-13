@@ -133,6 +133,8 @@ class TestToolRunner:
 
         from pwnpilot.data.models import ErrorClass
         assert result.error_class == ErrorClass.TIMEOUT
+        assert result.outcome_status.value == "failed"
+        assert "Timeout" in [reason.value for reason in result.failure_reasons]
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +432,23 @@ class TestToolRunnerErrorPaths:
 
         from pwnpilot.data.models import ErrorClass
         assert result.error_class == ErrorClass.NONZERO_EXIT
+
+    def test_connection_refused_is_classified_as_target_unreachable(self, tmp_path):
+        runner = self._make_runner(tmp_path)
+        action = ActionRequest(
+            engagement_id=uuid4(),
+            action_type=ActionType.ACTIVE_SCAN,
+            tool_name="nmap",
+            params={"target": "10.0.0.1"},
+            risk_level=RiskLevel.MEDIUM,
+        )
+
+        stderr = b"failed to connect: connection refused"
+        with mock.patch.object(runner, "_run_subprocess", return_value=(b"", stderr, 1, False)):
+            result = runner.execute(action)
+
+        assert result.outcome_status.value == "failed"
+        assert "TargetUnreachable" in [reason.value for reason in result.failure_reasons]
 
     def test_parse_error_sets_error_class(self, tmp_path):
         runner = self._make_runner(tmp_path)

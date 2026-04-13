@@ -53,6 +53,7 @@ def test_runtime_registry_builder_uses_cache(monkeypatch) -> None:
 
     assert r1 is r2
     assert calls["count"] == 1
+    invalidate_tool_registry_cache()
 
 
 def test_compute_executable_tools_and_filter_catalog(monkeypatch) -> None:
@@ -146,6 +147,30 @@ def test_planner_target_type_and_strategy_progress() -> None:
     assert progress["completed_steps"] == ["s1"]
     assert progress["current_step"]["step_id"] == "s2"
     assert progress["remaining_steps"] == 1
+
+
+def test_strategy_progress_keeps_step_current_on_recoverable_hint() -> None:
+    plan = {
+        "sequence": [
+            {
+                "step_id": "web_discovery",
+                "preferred_tools": ["gobuster"],
+                "fallback_tools": ["shell"],
+                "recovery_rules": [
+                    {
+                        "hint_codes": ["wildcard_detected"],
+                        "preferred_tools": ["shell"],
+                    }
+                ],
+            },
+            {"step_id": "web_vuln_scan", "preferred_tools": ["nuclei"], "fallback_tools": []},
+        ]
+    }
+    previous = [{"tool_name": "gobuster", "execution_hint_codes": ["wildcard_detected"]}]
+    progress = _strategy_progress(plan, previous)
+    assert progress["completed_steps"] == []
+    assert progress["current_step"]["step_id"] == "web_discovery"
+    assert progress["current_step"]["recovery_preferred_tools"] == ["shell"]
 
 
 def test_llm_router_helpers_format_parse_and_retry(monkeypatch) -> None:

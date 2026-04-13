@@ -51,6 +51,7 @@ class ReportGenerator:
         engagement_id: UUID,
         output_dir: Path = Path("."),
         signer: "Any | None" = None,
+        run_metadata: dict[str, Any] | None = None,
     ) -> tuple[Path, Path]:
         """
         Build and write report bundle + Markdown summary.
@@ -67,6 +68,8 @@ class ReportGenerator:
         hosts = self._recon.hosts_for_engagement(engagement_id)
         services = self._recon.services_for_engagement(engagement_id)
 
+        metadata = run_metadata or {}
+
         bundle = {
             "engagement_id": str(engagement_id),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -76,6 +79,10 @@ class ReportGenerator:
             "findings": [f.model_dump(mode="json") for f in findings],
             "hosts": hosts,
             "services": services,
+            "run_verdict": metadata.get("run_verdict"),
+            "readiness_gate_results": metadata.get("readiness_gate_results", {}),
+            "degradation_reasons": metadata.get("degradation_reasons", []),
+            "termination_reason": metadata.get("termination_reason"),
             "schema_version": "v1",
         }
 

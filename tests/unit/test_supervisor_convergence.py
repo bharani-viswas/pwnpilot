@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pwnpilot.agent.supervisor import _route_after_execution
+from pwnpilot.agent.supervisor import _route_after_execution, _route_after_validation
 
 
 def _base_state() -> dict:
@@ -10,6 +10,7 @@ def _base_state() -> dict:
         "iteration_count": 1,
         "max_iterations": 50,
         "no_new_findings_streak": 0,
+        "nonproductive_cycle_streak": 0,
         "previous_actions": [],
     }
 
@@ -38,3 +39,23 @@ def test_convergence_triggered_after_threshold_and_minimum_actions() -> None:
     }
 
     assert _route_after_execution(state) == "report"
+
+
+def test_validation_reject_reports_when_max_iterations_reached() -> None:
+    state = {
+        **_base_state(),
+        "iteration_count": 50,
+        "validation_result": {"verdict": "reject"},
+    }
+
+    assert _route_after_validation(state) == "report"
+
+
+def test_validation_reject_reports_when_nonproductive_limit_reached() -> None:
+    state = {
+        **_base_state(),
+        "nonproductive_cycle_streak": 5,
+        "validation_result": {"verdict": "reject"},
+    }
+
+    assert _route_after_validation(state) == "report"

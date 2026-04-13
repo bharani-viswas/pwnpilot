@@ -159,6 +159,22 @@ class AgentConfig(BaseModel):
         le=20,
         description="Consecutive no-new-findings cycles before triggering report",
     )
+    per_step_budget: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Max planner attempts per deterministic strategy step before advancing.",
+    )
+    adaptive_cooldown_enabled: bool = Field(
+        default=True,
+        description="Enable adaptive cooldown for repeatedly low-yield tools.",
+    )
+    adaptive_cooldown_max: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Maximum planner cooldown window for adaptive suppression.",
+    )
 
 
 class StorageConfig(BaseModel):

@@ -18,6 +18,7 @@ def _build_fallback_vuln_ref(tool_name: str, finding: dict[str, Any]) -> str:
     fingerprint_parts = [
         tool_name,
         _first_non_empty(
+            finding.get("type"),
             finding.get("template_id"),
             finding.get("id"),
             finding.get("name"),

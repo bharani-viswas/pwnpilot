@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from uuid import uuid4
 
-from pwnpilot.agent.executor import _normalize_params, _service_host_fields, ExecutorNode
+from pwnpilot.agent.executor import (
+    _extract_attack_surface_updates,
+    _merge_attack_surface,
+    _normalize_params,
+    _service_host_fields,
+    ExecutorNode,
+)
 from pwnpilot.control.engagement import EngagementService
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.models import Engagement, EngagementScope
@@ -145,6 +151,59 @@ def test_executor_stores_findings_hosts_services_and_hints() -> None:
     assert recon_store.upsert_host.call_count >= 1
     assert recon_store.upsert_service.call_count >= 2
     assert out["recon_summary"]["findings_summary"]["findings_count"] == 1
+    assert "attack_surface" in out["recon_summary"]
+
+
+def test_extract_attack_surface_updates_from_services_and_findings() -> None:
+    parsed_output = {
+        "services": [
+            {"url": "http://localhost:3000/rest/user/login?email=test@example.com"},
+            {"url": "https://example.com/api/items?id=1"},
+        ]
+    }
+    findings_summary = {
+        "top_findings": [
+            {
+                "title": "Auth endpoint leaks token",
+                "asset_ref": "http://localhost:3000/rest/user/login?email=test@example.com",
+            }
+        ]
+    }
+    recon_summary = {
+        "discovered_hosts": [
+            {"ip_address": "127.0.0.1", "hostname": "localhost", "services": ["http", "unknown:22"]}
+        ]
+    }
+
+    updates = _extract_attack_surface_updates(parsed_output, findings_summary, recon_summary)
+
+    assert "http://localhost" in updates["web_targets"]
+    assert "/rest/user/login" in updates["routes"]
+    assert "email" in updates["parameters"]
+    assert "/rest/user/login" in updates["auth_paths"]
+
+
+def test_merge_attack_surface_deduplicates_and_counts() -> None:
+    existing = {
+        "web_targets": ["http://localhost"],
+        "endpoints": ["http://localhost:3000/health"],
+        "routes": ["/health"],
+        "parameters": ["q"],
+        "auth_paths": [],
+    }
+    updates = {
+        "web_targets": ["http://localhost", "https://example.com"],
+        "endpoints": ["https://example.com/login"],
+        "routes": ["/login"],
+        "parameters": ["email", "q"],
+        "auth_paths": ["/login"],
+    }
+
+    merged = _merge_attack_surface(existing, updates)
+
+    assert merged["web_targets"] == ["http://localhost", "https://example.com"]
+    assert merged["counts"]["parameters"] == 2
+    assert "/login" in merged["auth_paths"]
 
 
 def test_tui_dashboard_internal_methods_without_ui_loop() -> None:

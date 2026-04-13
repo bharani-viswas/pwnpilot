@@ -12,10 +12,14 @@ _TOOL_BINARY_ALIASES: dict[str, dict[str, list[str]]] = {
         "default": ["dig", "nslookup"],
     },
     "zap": {
-        "linux": ["zap-cli", "zaproxy", "zap.sh"],
-        "darwin": ["zap-cli", "zaproxy", "zap.sh"],
-        "windows": ["zap.bat", "zaproxy.exe", "zap-cli.exe"],
-        "default": ["zap-cli", "zaproxy"],
+        "linux": [
+            "zap-baseline.py",
+            "/usr/share/zaproxy/zap-baseline.py",
+            "/snap/zaproxy/current/zap-baseline.py",
+        ],
+        "darwin": ["zap-baseline.py", "/Applications/ZAP.app/Contents/Java/zap-baseline.py"],
+        "windows": ["zap-baseline.py", "zap-baseline.bat"],
+        "default": ["zap-baseline.py"],
     },
     "gobuster": {
         "linux": ["gobuster"],

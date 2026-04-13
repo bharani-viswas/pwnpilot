@@ -18,7 +18,6 @@ REQUIRED_CMDS=(
 
 OPTIONAL_CMDS=(
   nuclei
-  zaproxy
 )
 
 missing_required=0
@@ -33,6 +32,14 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
     missing_required=1
   fi
 done
+
+echo "[*] Verifying required ZAP tooling..."
+if command -v zap-baseline.py >/dev/null 2>&1; then
+  printf "  [OK] %s -> %s\n" "zap-baseline.py" "$(command -v zap-baseline.py)"
+else
+  printf "  [MISSING] %s\n" "zap-baseline.py"
+  missing_required=1
+fi
 
 echo "[*] Checking optional tools..."
 for cmd in "${OPTIONAL_CMDS[@]}"; do

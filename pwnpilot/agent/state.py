@@ -19,6 +19,7 @@ class AgentState(TypedDict, total=False):
     iteration_count: int
     max_iterations: int
     no_new_findings_streak: int   # convergence counter (trigger reporter at 3)
+    nonproductive_cycle_streak: int  # reject/invalid-action churn counter
 
     # Recon context (snapshot from ReconStore, serialisable)
     recon_summary: dict[str, Any]
@@ -42,6 +43,15 @@ class AgentState(TypedDict, total=False):
     # Control flags
     kill_switch: bool
     report_complete: bool
+    report_trigger_reason: str | None
+    stall_state: str
+    termination_reason: str | None
+    run_verdict: str | None
+    readiness_gate_results: dict[str, Any]
+    degradation_reasons: list[str]
+    last_rejection_code: str
+    last_rejection_class: str
+    rejection_repeat_count: int
 
     # Error state
     error: str | None

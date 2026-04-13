@@ -64,8 +64,8 @@ Description: Policy-first, multi-agent LLM-driven pentesting framework
  PwnPilot orchestrates a team of LLM-backed agents over a deny-by-default 
  policy engine. Every tool call is typed, every finding is evidence-backed,
  and every state transition is audited.
-Depends: python3.10 | python3.11, python3-venv, python3-pip, nmap
-Recommends: nuclei, nikto, sqlmap, whatweb, zaproxy
+Depends: python3.10 | python3.11, python3-venv, python3-pip, nmap, zaproxy
+Recommends: nuclei, nikto, sqlmap, whatweb
 Standards-Version: 4.6.0
 Priority: optional
 EOF

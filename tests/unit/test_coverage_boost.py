@@ -365,8 +365,27 @@ class TestRouteAfterValidation:
 
     def test_reject_routes_replan(self):
         from pwnpilot.agent.supervisor import _route_after_validation
-        state = {"kill_switch": False, "validation_result": {"verdict": "reject"}}
+        state = {
+            "kill_switch": False,
+            "validation_result": {"verdict": "reject"},
+            "iteration_count": 1,
+            "max_iterations": 50,
+            "no_new_findings_streak": 0,
+            "nonproductive_cycle_streak": 0,
+        }
         assert _route_after_validation(state) == "replan"
+
+    def test_reject_routes_report_on_nonproductive_limit(self):
+        from pwnpilot.agent.supervisor import _route_after_validation
+        state = {
+            "kill_switch": False,
+            "validation_result": {"verdict": "reject"},
+            "iteration_count": 4,
+            "max_iterations": 50,
+            "no_new_findings_streak": 0,
+            "nonproductive_cycle_streak": 5,
+        }
+        assert _route_after_validation(state) == "report"
 
 
 class TestRouteAfterExecution:
@@ -383,20 +402,23 @@ class TestRouteAfterExecution:
     def test_max_iterations_routes_report(self):
         from pwnpilot.agent.supervisor import _route_after_execution
         state = {"kill_switch": False, "error": None,
-                 "iteration_count": 50, "max_iterations": 50, "no_new_findings_streak": 0}
+                 "iteration_count": 50, "max_iterations": 50, "no_new_findings_streak": 0,
+                 "nonproductive_cycle_streak": 0}
         assert _route_after_execution(state) == "report"
 
     def test_convergence_routes_report(self):
         from pwnpilot.agent.supervisor import _route_after_execution, CONVERGENCE_THRESHOLD
         state = {"kill_switch": False, "error": None,
                  "iteration_count": 5, "max_iterations": 50,
-                 "no_new_findings_streak": CONVERGENCE_THRESHOLD}
+                 "no_new_findings_streak": CONVERGENCE_THRESHOLD,
+                 "nonproductive_cycle_streak": 0}
         assert _route_after_execution(state) == "report"
 
     def test_normal_routes_continue(self):
         from pwnpilot.agent.supervisor import _route_after_execution
         state = {"kill_switch": False, "error": None,
-                 "iteration_count": 5, "max_iterations": 50, "no_new_findings_streak": 0}
+                 "iteration_count": 5, "max_iterations": 50, "no_new_findings_streak": 0,
+                 "nonproductive_cycle_streak": 0}
         assert _route_after_execution(state) == "continue"
 
 

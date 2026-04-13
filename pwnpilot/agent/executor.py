@@ -16,13 +16,14 @@ import hashlib
 import json
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from uuid import UUID
 
 import structlog
 
 from pwnpilot.agent.state import AgentState
 from pwnpilot.control.approval import ApprovalService
+from pwnpilot.control.target_resolver import TargetResolver
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.models import (
     ActionRequest,
@@ -43,6 +44,15 @@ log = structlog.get_logger(__name__)
 
 # Severity order from highest to lowest
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+_AUTH_PATH_MARKERS = (
+    "login",
+    "signin",
+    "auth",
+    "oauth",
+    "token",
+    "session",
+    "admin",
+)
 
 
 def _service_host_fields(service: dict[str, Any], fallback_target: str) -> tuple[str, str | None]:
@@ -101,6 +111,147 @@ def _normalize_params(params: dict[str, Any], tool_name: str) -> dict[str, Any]:
     return normalized
 
 
+def _merge_attack_surface(
+    existing: dict[str, Any] | None,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    base = existing if isinstance(existing, dict) else {}
+
+    def _as_set(name: str) -> set[str]:
+        values = base.get(name, [])
+        if not isinstance(values, list):
+            return set()
+        return {str(v).strip() for v in values if str(v).strip()}
+
+    web_targets = _as_set("web_targets")
+    endpoints = _as_set("endpoints")
+    routes = _as_set("routes")
+    parameters = _as_set("parameters")
+    auth_paths = _as_set("auth_paths")
+
+    for key, bucket in (
+        ("web_targets", web_targets),
+        ("endpoints", endpoints),
+        ("routes", routes),
+        ("parameters", parameters),
+        ("auth_paths", auth_paths),
+    ):
+        values = updates.get(key, [])
+        if isinstance(values, list):
+            bucket.update({str(v).strip() for v in values if str(v).strip()})
+
+    return {
+        "web_targets": sorted(web_targets),
+        "endpoints": sorted(endpoints),
+        "routes": sorted(routes),
+        "parameters": sorted(parameters),
+        "auth_paths": sorted(auth_paths),
+        "counts": {
+            "web_targets": len(web_targets),
+            "endpoints": len(endpoints),
+            "routes": len(routes),
+            "parameters": len(parameters),
+            "auth_paths": len(auth_paths),
+        },
+    }
+
+
+def _extract_attack_surface_updates(
+    parsed_output: dict[str, Any],
+    findings_summary: dict[str, Any],
+    recon_summary: dict[str, Any],
+) -> dict[str, Any]:
+    web_targets: set[str] = set()
+    endpoints: set[str] = set()
+    routes: set[str] = set()
+    parameters: set[str] = set()
+    auth_paths: set[str] = set()
+
+    # Derive web targets from discovered services in recon summary.
+    for host in recon_summary.get("discovered_hosts", []):
+        if not isinstance(host, dict):
+            continue
+        ip_or_host = str(host.get("hostname") or host.get("ip_address") or "").strip()
+        if not ip_or_host:
+            continue
+        host_services = host.get("services", [])
+        host_ports = [
+            int(port)
+            for port in host.get("ports", [])
+            if isinstance(port, int)
+        ]
+        if not isinstance(host_services, list):
+            continue
+        for svc in host_services:
+            name = str(svc).lower()
+            if "http" in name:
+                if ":443" in name or "https" in name:
+                    if 443 in host_ports:
+                        web_targets.add(f"https://{ip_or_host}")
+                    for port in host_ports:
+                        if port != 443:
+                            web_targets.add(f"https://{ip_or_host}:{port}")
+                else:
+                    if 80 in host_ports or not host_ports:
+                        web_targets.add(f"http://{ip_or_host}")
+                    for port in host_ports:
+                        if port != 80:
+                            web_targets.add(f"http://{ip_or_host}:{port}")
+
+    # Parse explicit service URLs from the latest tool output.
+    services = parsed_output.get("services", [])
+    if isinstance(services, list):
+        for svc in services:
+            if not isinstance(svc, dict):
+                continue
+            url = str(svc.get("url", "")).strip()
+            if not url:
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                web_targets.add(f"{parsed.scheme}://{parsed.netloc}")
+                endpoints.add(url)
+                if parsed.path and parsed.path != "/":
+                    routes.add(parsed.path)
+                for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                    if key:
+                        parameters.add(key)
+
+    # Use top findings to infer routes, auth paths, and parameters.
+    top_findings = findings_summary.get("top_findings", []) if isinstance(findings_summary, dict) else []
+    if isinstance(top_findings, list):
+        for finding in top_findings:
+            if not isinstance(finding, dict):
+                continue
+            asset_ref = str(finding.get("asset_ref", "")).strip()
+            parsed = urlparse(asset_ref)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                web_targets.add(f"{parsed.scheme}://{parsed.netloc}")
+                endpoints.add(asset_ref)
+                if parsed.path and parsed.path != "/":
+                    routes.add(parsed.path)
+                for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                    if key:
+                        parameters.add(key)
+
+                path_lower = parsed.path.lower()
+                if any(marker in path_lower for marker in _AUTH_PATH_MARKERS):
+                    auth_paths.add(parsed.path)
+
+            title = str(finding.get("title", "")).lower()
+            if "auth" in title or "login" in title:
+                if parsed.path and parsed.path != "/":
+                    auth_paths.add(parsed.path)
+
+    return {
+        "web_targets": sorted(web_targets),
+        "endpoints": sorted(endpoints),
+        "routes": sorted(routes),
+        "parameters": sorted(parameters),
+        "auth_paths": sorted(auth_paths),
+    }
+
+
 class ExecutorNode:
     """
     Stateless callable used as a LangGraph executor node.
@@ -118,6 +269,10 @@ class ExecutorNode:
         finding_store: Any = None,
         recon_store: Any = None,
         planner_available_tools: list[str] | None = None,
+        metrics: Any | None = None,
+        target_family: str = "unknown",
+        target_resolver: TargetResolver | None = None,
+        capability_registry: Any | None = None,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
@@ -126,6 +281,10 @@ class ExecutorNode:
         self._finding_store = finding_store
         self._recon_store = recon_store
         self._planner_available_tools = planner_available_tools or []
+        self._metrics = metrics
+        self._target_family = str(target_family or "unknown")
+        self._target_resolver = target_resolver
+        self._capability_registry = capability_registry
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -140,17 +299,56 @@ class ExecutorNode:
         validation_dict = state.get("validation_result")
 
         if not proposal_dict or not validation_dict:
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
             return {**state, "error": "Missing proposal or validation result in executor."}
 
         try:
             proposal = PlannerProposal(**proposal_dict)
             validation = ValidationResult(**validation_dict)
         except Exception as exc:
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
             return {**state, "error": f"Executor: invalid proposal/validation: {exc}"}
 
         # Determine effective risk level (validation can escalate, never downgrade)
         effective_risk = validation.risk_override or proposal.estimated_risk
         engagement_id = UUID(state["engagement_id"])
+
+        if self._capability_registry:
+            compatible, reason = self._capability_registry.is_runtime_compatible(proposal.tool_name)
+            if not compatible:
+                updated_proposal = proposal_dict.copy()
+                updated_proposal["rejection_reason"] = reason
+                return {
+                    **state,
+                    "proposed_action": updated_proposal,
+                    "validation_result": {
+                        "verdict": "reject",
+                        "risk_override": None,
+                        "rationale": reason,
+                        "rejection_reason_code": "TOOL_MODE_MISMATCH",
+                        "rejection_reason_detail": reason,
+                        "rejection_class": "capability",
+                    },
+                    "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
+                    "error": None,
+                }
+
+        resolved_target_snapshot: dict[str, Any] = {}
+        target_for_tool = proposal.target
+        if self._target_resolver:
+            supported_target_types: list[str] = []
+            if self._capability_registry:
+                contract = self._capability_registry.contract_for(proposal.tool_name)
+                if isinstance(contract, dict):
+                    supported_target_types = list(contract.get("supported_target_types", []))
+            resolved = self._target_resolver.resolve(proposal.target)
+            resolved_target_snapshot = resolved.model_dump()
+            target_for_tool = self._target_resolver.target_for_tool(
+                proposal.target,
+                supported_target_types=supported_target_types,
+            )
 
         # Construct typed ActionRequest
         try:
@@ -159,10 +357,16 @@ class ExecutorNode:
                 engagement_id=engagement_id,
                 action_type=ActionType(proposal.action_type),
                 tool_name=proposal.tool_name,
-                params={**normalized_params, "target": proposal.target},
+                params={
+                    **normalized_params,
+                    "target": target_for_tool,
+                    "target_resolved": resolved_target_snapshot,
+                },
                 risk_level=effective_risk,
             )
         except Exception as exc:
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
             return {**state, "error": f"Executor: failed to build ActionRequest: {exc}"}
 
         # Policy Engine evaluation
@@ -186,10 +390,14 @@ class ExecutorNode:
             # Inject rejection reason so Planner can try something different
             updated_proposal = proposal_dict.copy()
             updated_proposal["rejection_reason"] = decision.reason
+            if self._metrics:
+                self._metrics.record_policy_deny(decision.gate_type.value)
+                self._metrics.record_nonproductive_cycle()
             return {
                 **state,
                 "proposed_action": updated_proposal,
                 "validation_result": None,
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
             }
 
         if decision.verdict == PolicyVerdict.REQUIRES_APPROVAL:
@@ -218,7 +426,8 @@ class ExecutorNode:
                 "action_id": str(action.action_id),
                 "tool": action.tool_name,
                 "action_type": action.action_type.value,
-                "target": proposal.target,
+                "target": target_for_tool,
+                "target_resolved": resolved_target_snapshot,
                 "params": action.params,
                 "risk_level": (
                     action.risk_level.value
@@ -232,6 +441,7 @@ class ExecutorNode:
         try:
             result = self._runner.execute(action)
         except (KeyError, FileNotFoundError) as exc:
+            duration_ms = round((time.monotonic() - _t0) * 1000, 2)
             available = list(self._planner_available_tools)
             if not available and hasattr(self._runner, "available_tools"):
                 try:
@@ -246,7 +456,8 @@ class ExecutorNode:
                 {
                     "action_id": str(action.action_id),
                     "tool": action.tool_name,
-                    "target": proposal.target,
+                    "target": target_for_tool,
+                    "target_resolved": resolved_target_snapshot,
                     "params": action.params,
                     "error": str(exc),
                 },
@@ -258,8 +469,9 @@ class ExecutorNode:
                     "action_id": str(action.action_id),
                     "tool_name": action.tool_name,
                     "action_type": action.action_type.value,
-                    "target": proposal.target,
+                    "target": target_for_tool,
                     "error": "tool_not_available",
+                    "strategy_step_id": str(proposal_dict.get("strategy_step_id", "")).strip(),
                 }
             )
 
@@ -272,15 +484,21 @@ class ExecutorNode:
                 f"Choose from available tools: {available}"
             )
 
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
+                self._metrics.record_tool_invoked(action.tool_name, duration_ms, success=False)
+
             return {
                 **state,
                 "proposed_action": updated_proposal,
                 "validation_result": None,
                 "previous_actions": updated_prev,
                 "temporarily_unavailable_tools": cooldowns,
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
                 "error": None,
             }
         except ValueError as exc:
+            duration_ms = round((time.monotonic() - _t0) * 1000, 2)
             # Adapter parameter validation error - check if it's a permission request
             error_msg = str(exc)
             
@@ -331,7 +549,8 @@ class ExecutorNode:
                 {
                     "action_id": str(action.action_id),
                     "tool": action.tool_name,
-                    "target": proposal.target,
+                    "target": target_for_tool,
+                    "target_resolved": resolved_target_snapshot,
                     "params": action.params,
                     "error": "param_validation_failed",
                     "details": error_msg,
@@ -344,8 +563,9 @@ class ExecutorNode:
                     "action_id": str(action.action_id),
                     "tool_name": action.tool_name,
                     "action_type": action.action_type.value,
-                    "target": proposal.target,
+                    "target": target_for_tool,
                     "error": "param_validation_failed",
+                    "strategy_step_id": str(proposal_dict.get("strategy_step_id", "")).strip(),
                 }
             )
 
@@ -355,14 +575,20 @@ class ExecutorNode:
                 f"Please try different parameters."
             )
 
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
+                self._metrics.record_tool_invoked(action.tool_name, duration_ms, success=False)
+
             return {
                 **state,
                 "proposed_action": updated_proposal,
                 "validation_result": None,
                 "previous_actions": updated_prev,
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
                 "error": None,
             }
         except Exception as exc:
+            duration_ms = round((time.monotonic() - _t0) * 1000, 2)
             log.error("executor.tool_error", exc=str(exc), tool=action.tool_name)
             self._audit_event(
                 state,
@@ -370,11 +596,15 @@ class ExecutorNode:
                 {
                     "action_id": str(action.action_id),
                     "tool": action.tool_name,
-                    "target": proposal.target,
+                    "target": target_for_tool,
+                    "target_resolved": resolved_target_snapshot,
                     "params": action.params,
                     "error": str(exc),
                 },
             )
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
+                self._metrics.record_tool_invoked(action.tool_name, duration_ms, success=False)
             return {**state, "error": f"Tool execution failed: {exc}"}
 
         # Update convergence streak
@@ -506,11 +736,44 @@ class ExecutorNode:
                 "action_id": str(action.action_id),
                 "tool_name": action.tool_name,
                 "action_type": action.action_type.value,
-                "target": proposal.target,
+                "target": target_for_tool,
+                "target_resolved": resolved_target_snapshot,
+                "strategy_step_id": str(proposal_dict.get("strategy_step_id", "")).strip(),
                 "exit_code": result.exit_code,
+                "outcome_status": (
+                    result.outcome_status.value if hasattr(result.outcome_status, "value") else str(result.outcome_status)
+                ),
+                "failure_reasons": [
+                    reason.value if hasattr(reason, "value") else str(reason)
+                    for reason in (result.failure_reasons or [])
+                ],
                 "execution_hint_codes": [hint.get("code") for hint in execution_hints],
+                "new_findings_count": int(result.parsed_output.get("new_findings_count", 0) or 0),
+                "parser_confidence": result.parser_confidence,
+                "had_runtime_hints": bool(execution_hints),
             }
         )
+
+        if self._metrics:
+            hint_codes = [
+                str(hint.get("code", "")).strip()
+                for hint in execution_hints
+                if str(hint.get("code", "")).strip()
+            ]
+            duration_val = float(result.duration_ms) if result.duration_ms is not None else 0.0
+            self._metrics.record_tool_invoked(action.tool_name, duration_val, success=(result.exit_code == 0))
+            self._metrics.record_action_outcome(
+                tool_name=action.tool_name,
+                new_findings_count=int(result.parsed_output.get("new_findings_count", 0) or 0),
+                execution_hint_codes=hint_codes,
+                target_family=self._target_family,
+            )
+            if result.error_class:
+                error_class = result.error_class.value if hasattr(result.error_class, "value") else str(result.error_class)
+                if error_class == "TIMEOUT":
+                    self._metrics.record_timeout()
+                if error_class == "PARSE_ERROR":
+                    self._metrics.record_parser_error()
 
         self._audit_event(
             state,
@@ -566,6 +829,15 @@ class ExecutorNode:
                 findings_summary = self._finding_store.get_summary(engagement_id)
                 # Merge with recon summary
                 recon_summary["findings_summary"] = findings_summary
+                attack_surface_updates = _extract_attack_surface_updates(
+                    parsed_output=result.parsed_output,
+                    findings_summary=findings_summary,
+                    recon_summary=recon_summary,
+                )
+                recon_summary["attack_surface"] = _merge_attack_surface(
+                    recon_summary.get("attack_surface"),
+                    attack_surface_updates,
+                )
             except Exception as summary_exc:
                 log.warning("executor.summary_error", exc=str(summary_exc))
 
@@ -577,6 +849,7 @@ class ExecutorNode:
             "proposed_action": None,
             "validation_result": None,
             "no_new_findings_streak": streak,
+            "nonproductive_cycle_streak": 0,
             "recon_summary": recon_summary,
             "last_execution_hints": execution_hints,
             "error": None,

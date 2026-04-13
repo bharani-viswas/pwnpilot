@@ -47,7 +47,6 @@ APT_PACKAGES=(
 
 # Optional packages that may not be available in all repos
 OPTIONAL_PACKAGES=(
-  zaproxy
   docker.io
 )
 
@@ -58,6 +57,91 @@ apt-get update -y
 
 echo "[*] Installing base and security tooling..."
 apt-get install -y "${APT_PACKAGES[@]}"
+
+_ensure_zap_baseline_on_path() {
+  if command -v zap-baseline.py >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local zap_baseline=""
+  for candidate in \
+    /usr/share/zaproxy/zap-baseline.py \
+    /snap/zaproxy/current/zap-baseline.py \
+    /snap/bin/zap-baseline.py; do
+    if [[ -f "$candidate" ]]; then
+      zap_baseline="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$zap_baseline" ]]; then
+    zap_baseline="$(find /snap /usr/share -maxdepth 5 -type f -name zap-baseline.py 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -n "$zap_baseline" ]]; then
+    ln -sf "$zap_baseline" /usr/local/bin/zap-baseline.py
+  fi
+
+  command -v zap-baseline.py >/dev/null 2>&1
+}
+
+_install_docker_zap_wrapper() {
+  if command -v zap-baseline.py >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+
+  cat > /usr/local/bin/zap-baseline.py <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec docker run --rm --network=host ghcr.io/zaproxy/zaproxy:stable zap-baseline.py "$@"
+EOF
+  chmod +x /usr/local/bin/zap-baseline.py
+  command -v zap-baseline.py >/dev/null 2>&1
+}
+
+echo "[*] Installing mandatory OWASP ZAP..."
+if _ensure_zap_baseline_on_path; then
+  echo "  ✓ ZAP baseline script already available"
+else
+  if apt-cache show zaproxy >/dev/null 2>&1; then
+    if apt-get install -y zaproxy >/dev/null 2>&1; then
+      echo "  ✓ Installed zaproxy via apt"
+    else
+      echo "  ⚠ apt install for zaproxy failed"
+    fi
+  else
+    echo "  ⚠ zaproxy is not available in current apt repositories"
+  fi
+
+  export PATH="$PATH:/snap/bin"
+  if ! _ensure_zap_baseline_on_path && command -v snap >/dev/null 2>&1; then
+    echo "  ⚠ attempting snap fallback for zaproxy..."
+    if snap install zaproxy --classic >/dev/null 2>&1; then
+      echo "  ✓ Installed zaproxy via snap"
+      _ensure_zap_baseline_on_path || true
+    else
+      echo "  ⚠ snap install for zaproxy failed"
+    fi
+  fi
+
+  if ! _ensure_zap_baseline_on_path; then
+    echo "  ⚠ attempting docker-backed zap-baseline wrapper..."
+    if _install_docker_zap_wrapper; then
+      echo "  ✓ Installed docker-backed zap-baseline.py wrapper"
+    else
+      echo "  ⚠ docker wrapper fallback unavailable"
+    fi
+  fi
+fi
+
+if ! command -v zap-baseline.py >/dev/null 2>&1; then
+  echo "[!] Mandatory dependency missing: OWASP ZAP baseline script (zap-baseline.py)."
+  echo "[!] Install zaproxy from an enabled repo or via snap, then rerun this script."
+  exit 1
+fi
 
 echo "[*] Attempting to install optional packages..."
 for pkg in "${OPTIONAL_PACKAGES[@]}"; do

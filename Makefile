@@ -22,9 +22,9 @@ install-deps:
 	sudo apt-get install -y \
 		python3.10 python3.11 python3-pip python3-venv \
 		build-essential python3-dev \
-		nmap nikto \
+		nmap nikto zaproxy \
 		git curl wget
-	@echo "Optional security tools: Run 'sudo bash scripts/install_security_tools.sh'"
+	@echo "Install the full required security toolchain: 'sudo bash scripts/install_security_tools.sh'"
 
 quick-install: 
 	@echo "Installing PwnPilot (quick - Python deps only)..."

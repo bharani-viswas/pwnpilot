@@ -311,7 +311,10 @@ Return a JSON object matching ValidationResult schema:
 {
   "verdict": "approve|reject",
   "risk_override": "low|medium|high|critical" or null,
-  "rationale": "Why this decision"
+    "rationale": "Why this decision",
+    "rejection_reason_code": "optional normalized code when verdict=reject",
+    "rejection_reason_detail": "optional reject detail",
+    "rejection_class": "optional class: capability|target|policy|low_value|duplicate"
 }"""
         user = json.dumps(context, default=str)
         raw = self.complete(system, user)

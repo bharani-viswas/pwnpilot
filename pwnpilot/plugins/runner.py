@@ -26,7 +26,13 @@ from uuid import UUID
 import structlog
 
 from pwnpilot.data.evidence_store import EvidenceStore
-from pwnpilot.data.models import ActionRequest, ErrorClass, ToolExecutionResult
+from pwnpilot.data.models import (
+    ActionRequest,
+    ErrorClass,
+    FailureReason,
+    OutcomeStatus,
+    ToolExecutionResult,
+)
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.plugins.binaries import candidate_binaries, resolve_binary_for_tool
 from pwnpilot.plugins.sdk import BaseAdapter
@@ -65,6 +71,99 @@ def _redact_sensitive(value: object) -> object:
     if isinstance(value, list):
         return [_redact_sensitive(v) for v in value]
     return value
+
+
+def _normalized_blob(stdout: bytes, stderr: bytes) -> str:
+    return (stdout + b"\n" + stderr).decode(errors="replace").lower()
+
+
+def _extract_hint_codes(parsed_output: dict[str, object]) -> set[str]:
+    hints = parsed_output.get("execution_hints", []) if isinstance(parsed_output, dict) else []
+    out: set[str] = set()
+    if not isinstance(hints, list):
+        return out
+    for item in hints:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code", "")).strip().lower()
+        if code:
+            out.add(code)
+    return out
+
+
+def _classify_outcome(
+    *,
+    exit_code: int,
+    timed_out: bool,
+    error_class: ErrorClass | None,
+    parsed_output: dict[str, object],
+    stdout: bytes,
+    stderr: bytes,
+) -> tuple[OutcomeStatus, list[FailureReason]]:
+    reasons: list[FailureReason] = []
+    blob = _normalized_blob(stdout, stderr)
+    hint_codes = _extract_hint_codes(parsed_output)
+    new_findings_count = int(parsed_output.get("new_findings_count", 0) or 0)
+
+    if timed_out or error_class == ErrorClass.TIMEOUT:
+        reasons.append(FailureReason.TIMEOUT)
+
+    if (
+        "connection refused" in blob
+        or "failed to connect" in blob
+        or "target is not responding" in blob
+        or "could not resolve host" in blob
+    ):
+        reasons.append(FailureReason.TARGET_UNREACHABLE)
+
+    if (
+        "headless" in blob and "gui" in blob
+    ) or "cannot open display" in blob:
+        reasons.append(FailureReason.TOOL_MODE_MISMATCH)
+
+    if (
+        "401 unauthorized" in blob
+        or "403 forbidden" in blob
+        or "access denied" in blob
+        or "authentication required" in blob
+    ):
+        reasons.append(FailureReason.AUTH_FAILURE)
+
+    if error_class == ErrorClass.PARSE_ERROR or str(parsed_output.get("parser_error", "")).strip():
+        reasons.append(FailureReason.PARSER_DEGRADED)
+
+    if hint_codes & {"no_forms_detected", "no_matches", "wildcard_detected", "output_format_invalid"}:
+        reasons.append(FailureReason.NO_ACTIONABLE_OUTPUT)
+
+    # Deduplicate while preserving order
+    unique_reasons: list[FailureReason] = []
+    for reason in reasons:
+        if reason not in unique_reasons:
+            unique_reasons.append(reason)
+
+    hard_fail = any(
+        reason in {
+            FailureReason.TARGET_UNREACHABLE,
+            FailureReason.TOOL_MODE_MISMATCH,
+            FailureReason.TIMEOUT,
+        }
+        for reason in unique_reasons
+    )
+
+    if hard_fail:
+        return OutcomeStatus.FAILED, unique_reasons
+
+    if exit_code != 0 and not unique_reasons:
+        unique_reasons.append(FailureReason.UNKNOWN_RUNTIME_FAILURE)
+        return OutcomeStatus.FAILED, unique_reasons
+
+    if unique_reasons:
+        return OutcomeStatus.DEGRADED, unique_reasons
+
+    if new_findings_count == 0 and exit_code == 0:
+        return OutcomeStatus.DEGRADED, [FailureReason.NO_ACTIONABLE_OUTPUT]
+
+    return OutcomeStatus.SUCCESS, []
 
 
 class HaltedError(Exception):
@@ -183,6 +282,21 @@ class ToolRunner:
             error_class=error_class,
         )
 
+        outcome_status, failure_reasons = _classify_outcome(
+            exit_code=exit_code,
+            timed_out=timed_out,
+            error_class=error_class,
+            parsed_output=result.parsed_output,
+            stdout=stdout_bytes,
+            stderr=stderr_bytes,
+        )
+        result = result.model_copy(
+            update={
+                "outcome_status": outcome_status,
+                "failure_reasons": failure_reasons,
+            }
+        )
+
         log.info(
             "runner.complete",
             tool=action.tool_name,
@@ -201,6 +315,8 @@ class ToolRunner:
             parsed_output=_redact_sensitive(result.parsed_output),
             parser_confidence=result.parser_confidence,
             error_class=(result.error_class.value if result.error_class else None),
+              outcome_status=result.outcome_status.value,
+              failure_reasons=[reason.value for reason in result.failure_reasons],
         )
         return result
 

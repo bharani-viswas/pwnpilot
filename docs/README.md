@@ -252,7 +252,7 @@ make clean             # Clean build artifacts
 
 ### Security Tools Installation
 
-To use all tool adapters (nmap, nuclei, ZAP, nikto, sqlmap, etc.), install the security toolkit:
+Install the required security toolkit (including ZAP) before running engagements:
 
 ```bash
 # Only on first installation

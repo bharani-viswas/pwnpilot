@@ -29,6 +29,13 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Identify framework, headers, and baseline web technologies.",
             "preferred_tools": ["whatweb"],
             "fallback_tools": ["nikto"],
+            "recovery_rules": [
+                {
+                    "hint_codes": ["output_format_invalid"],
+                    "preferred_tools": ["nikto"],
+                    "param_overrides": {},
+                }
+            ],
         },
         {
             "step_id": "web_discovery",
@@ -36,6 +43,17 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Expand attack surface by crawling and directory/API discovery.",
             "preferred_tools": ["zap", "gobuster"],
             "fallback_tools": ["shell"],
+            "recovery_rules": [
+                {
+                    "hint_codes": ["wildcard_detected"],
+                    "preferred_tools": ["gobuster", "zap"],
+                    "param_overrides": {
+                        "gobuster": {
+                            "force_wildcard": True,
+                        }
+                    },
+                }
+            ],
         },
         {
             "step_id": "web_vuln_scan",
@@ -43,6 +61,13 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Run template/signature scans against discovered endpoints.",
             "preferred_tools": ["nuclei", "nikto"],
             "fallback_tools": ["whatweb"],
+            "recovery_rules": [
+                {
+                    "hint_codes": ["no_matches"],
+                    "preferred_tools": ["nikto"],
+                    "param_overrides": {},
+                }
+            ],
         },
         {
             "step_id": "web_injection_checks",
@@ -50,6 +75,17 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Perform targeted SQLi/form/API validation on discovered inputs.",
             "preferred_tools": ["sqlmap"],
             "fallback_tools": ["shell"],
+            "recovery_rules": [
+                {
+                    "hint_codes": ["no_forms_detected"],
+                    "preferred_tools": ["sqlmap", "shell"],
+                    "param_overrides": {
+                        "sqlmap": {
+                            "forms": False,
+                        }
+                    },
+                }
+            ],
         },
     ]
 
@@ -60,6 +96,7 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Identify reachable hosts and open services in scope.",
             "preferred_tools": ["nmap", "dns", "whois"],
             "fallback_tools": ["shell"],
+            "recovery_rules": [],
         },
         {
             "step_id": "network_service_enum",
@@ -67,6 +104,7 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Collect service versions and protocol details.",
             "preferred_tools": ["nmap"],
             "fallback_tools": ["whatweb", "shell"],
+            "recovery_rules": [],
         },
         {
             "step_id": "network_vuln_scan",
@@ -74,6 +112,13 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Check known vulnerabilities on discovered services.",
             "preferred_tools": ["nuclei", "nikto"],
             "fallback_tools": ["shell"],
+            "recovery_rules": [
+                {
+                    "hint_codes": ["no_matches"],
+                    "preferred_tools": ["nikto"],
+                    "param_overrides": {},
+                }
+            ],
         },
     ]
 
@@ -90,6 +135,7 @@ def recommended_sequence_for_family(target_family: str) -> list[dict[str, Any]]:
             "goal": "Establish baseline connectivity and services.",
             "preferred_tools": ["whatweb", "nmap", "dns"],
             "fallback_tools": ["shell"],
+            "recovery_rules": [],
         }
     ]
 

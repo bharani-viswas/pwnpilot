@@ -91,6 +91,10 @@ def test_resume_engagement_raises_when_checkpoint_missing(monkeypatch) -> None:
 
 
 def test_create_and_run_engagement_full_path(monkeypatch, tmp_path: Path) -> None:
+    class _Caps:
+        def contracts_for_tools(self, _tools):
+            return []
+
     fake_rt = {
         "llm_router": object(),
         "audit_store": SimpleNamespace(append=lambda **kwargs: None),
@@ -102,6 +106,10 @@ def test_create_and_run_engagement_full_path(monkeypatch, tmp_path: Path) -> Non
         "kill_switch": object(),
         "planner_available_tools": ["nmap"],
         "planner_tools_catalog": [{"tool_name": "nmap"}],
+        "capability_registry": _Caps(),
+        "target_resolver": object(),
+        "runtime_mode": "headless",
+        "has_display": False,
         "typed_cfg": SimpleNamespace(
             storage=SimpleNamespace(report_dir=str(tmp_path / "reports")),
             database=SimpleNamespace(url="sqlite:///pwnpilot.db"),
@@ -138,6 +146,10 @@ def test_create_and_run_engagement_full_path(monkeypatch, tmp_path: Path) -> Non
 
 
 def test_resume_engagement_success_path(monkeypatch, tmp_path: Path) -> None:
+    class _Caps:
+        def contracts_for_tools(self, _tools):
+            return []
+
     class _Tuple:
         checkpoint = {
             "id": "cp-1",
@@ -163,6 +175,10 @@ def test_resume_engagement_success_path(monkeypatch, tmp_path: Path) -> None:
         "kill_switch": object(),
         "planner_available_tools": ["nmap"],
         "planner_tools_catalog": [{"tool_name": "nmap"}],
+        "capability_registry": _Caps(),
+        "target_resolver": object(),
+        "runtime_mode": "headless",
+        "has_display": False,
     }
 
     monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: fake_rt)
