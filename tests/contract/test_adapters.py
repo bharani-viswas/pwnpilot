@@ -559,9 +559,20 @@ class TestGobusterContract:
         assert "dir" in cmd
         assert "-u" in cmd
         assert "-x" in cmd
-        assert "-to" in cmd
         assert "-np" in cmd
         assert "-q" in cmd
+
+    def test_build_command_dir_with_exclude_length(self):
+        params = self.adapter.validate_params(
+            {
+                "target": "https://example.com",
+                "mode": "dir",
+                "exclude_length": 1234,
+            }
+        )
+        cmd = self.adapter.build_command(params)
+        assert "-bl" in cmd
+        assert "1234" in cmd
 
     def test_build_command_dns(self):
         params = self.adapter.validate_params(
@@ -602,6 +613,16 @@ class TestGobusterContract:
     def test_parse_nonzero_exit_code_returns_error(self):
         result = self.adapter.parse(b"", b"error", 2)
         assert result.parser_error is not None
+
+    def test_parse_wildcard_noise_lowers_confidence(self):
+        out = (
+            b"[!] Wildcard response found: /abc (Status: 200) [Size: 2345]\n"
+            b"/admin (Status: 200) [Size: 2345]\n"
+        )
+        result = self.adapter.parse(out, b"", 0)
+        assert result.findings
+        assert any(h["code"] == "wildcard_detected" for h in result.execution_hints)
+        assert result.confidence <= 0.5
 
 
 # ---------------------------------------------------------------------------

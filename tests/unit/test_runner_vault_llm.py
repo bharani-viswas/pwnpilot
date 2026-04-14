@@ -14,8 +14,8 @@ from pwnpilot.data.evidence_store import EvidenceStore
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.plugins.adapters.nmap import NmapAdapter
 from pwnpilot.plugins.adapters.shell import ShellAdapter
-from pwnpilot.plugins.runner import HaltedError, ToolRunner
-from pwnpilot.data.models import ActionRequest, ActionType, RiskLevel
+from pwnpilot.plugins.runner import HaltedError, ToolRunner, _classify_outcome
+from pwnpilot.data.models import ActionRequest, ActionType, FailureReason, OutcomeStatus, RiskLevel
 
 
 def _session():
@@ -135,6 +135,23 @@ class TestToolRunner:
         assert result.error_class == ErrorClass.TIMEOUT
         assert result.outcome_status.value == "failed"
         assert "Timeout" in [reason.value for reason in result.failure_reasons]
+
+    def test_classify_outcome_ignores_none_parser_error(self):
+        status, reasons = _classify_outcome(
+            exit_code=0,
+            timed_out=False,
+            error_class=None,
+            parsed_output={
+                "parser_error": None,
+                "new_findings_count": 0,
+                "services": [{"service_name": "http"}],
+            },
+            stdout=b"",
+            stderr=b"",
+        )
+
+        assert status == OutcomeStatus.SUCCESS
+        assert FailureReason.PARSER_DEGRADED not in reasons
 
 
 # ---------------------------------------------------------------------------

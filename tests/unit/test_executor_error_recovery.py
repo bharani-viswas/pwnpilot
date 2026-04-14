@@ -13,7 +13,7 @@ from pwnpilot.agent.state import AgentState
 from pwnpilot.control.policy import PolicyEngine, PolicyDecision, PolicyVerdict, GateType
 from pwnpilot.control.approval import ApprovalService
 from pwnpilot.data.audit_store import AuditStore
-from pwnpilot.data.models import RiskLevel
+from pwnpilot.data.models import RiskLevel, OutcomeStatus
 
 
 def _make_session() -> Session:
@@ -271,3 +271,113 @@ class TestExecutorValueErrorRecovery:
         # Hard errors should still cause errors
         assert result["error"] is not None
         assert "catastrophic failure" in result["error"]
+
+    def test_failed_execution_increments_nonproductive_streak(self, executor_setup):
+        executor = executor_setup["executor"]
+        tool_runner = executor_setup["tool_runner"]
+
+        tool_runner.execute.return_value = MagicMock(
+            action_id=uuid4(),
+            tool_name="nmap",
+            exit_code=0,
+            duration_ms=10,
+            stdout_hash="a",
+            stderr_hash="b",
+            stdout_evidence_id=uuid4(),
+            stderr_evidence_id=uuid4(),
+            stdout_evidence_path="/tmp/out",
+            stderr_evidence_path="/tmp/err",
+            parsed_output={"findings": [], "hosts": [], "services": [], "execution_hints": [], "new_findings_count": 0},
+            parser_confidence=0.5,
+            error_class=None,
+            outcome_status=OutcomeStatus.FAILED,
+            failure_reasons=[],
+            model_dump=lambda mode="json": {
+                "outcome_status": "failed",
+                "parsed_output": {"new_findings_count": 0},
+            },
+        )
+
+        state = {
+            "engagement_id": str(uuid4()),
+            "kill_switch": False,
+            "nonproductive_cycle_streak": 2,
+            "proposed_action": {
+                "action_type": "recon_passive",
+                "tool_name": "nmap",
+                "target": "192.168.1.1",
+                "params": {},
+                "rationale": "Test",
+                "estimated_risk": "medium",
+            },
+            "validation_result": {
+                "verdict": "approve",
+                "risk_override": None,
+                "rationale": "Test",
+            },
+            "previous_actions": [],
+            "evidence_ids": [],
+            "no_new_findings_streak": 0,
+            "recon_summary": {},
+        }
+
+        result = executor(state)
+        assert result["nonproductive_cycle_streak"] == 3
+
+    def test_success_with_structured_output_resets_nonproductive_streak(self, executor_setup):
+        executor = executor_setup["executor"]
+        tool_runner = executor_setup["tool_runner"]
+
+        tool_runner.execute.return_value = MagicMock(
+            action_id=uuid4(),
+            tool_name="whatweb",
+            exit_code=0,
+            duration_ms=10,
+            stdout_hash="a",
+            stderr_hash="b",
+            stdout_evidence_id=uuid4(),
+            stderr_evidence_id=uuid4(),
+            stdout_evidence_path="/tmp/out",
+            stderr_evidence_path="/tmp/err",
+            parsed_output={
+                "findings": [],
+                "hosts": [],
+                "services": [{"service_name": "http", "port": 3000}],
+                "execution_hints": [],
+                "new_findings_count": 0,
+            },
+            parser_confidence=0.9,
+            error_class=None,
+            outcome_status=OutcomeStatus.SUCCESS,
+            failure_reasons=[],
+            model_dump=lambda mode="json": {
+                "outcome_status": "success",
+                "parsed_output": {"new_findings_count": 0},
+            },
+        )
+
+        state = {
+            "engagement_id": str(uuid4()),
+            "kill_switch": False,
+            "nonproductive_cycle_streak": 2,
+            "proposed_action": {
+                "action_type": "recon_passive",
+                "tool_name": "whatweb",
+                "target": "http://localhost:3000",
+                "params": {},
+                "rationale": "Test",
+                "estimated_risk": "low",
+            },
+            "validation_result": {
+                "verdict": "approve",
+                "risk_override": None,
+                "rationale": "Test",
+            },
+            "previous_actions": [],
+            "evidence_ids": [],
+            "no_new_findings_streak": 0,
+            "recon_summary": {},
+        }
+
+        result = executor(state)
+        assert result["nonproductive_cycle_streak"] == 0

@@ -58,6 +58,12 @@ class GobusterAdapter(BaseAdapter):
                     "maximum": 50,
                     "default": 20,
                 },
+                "exclude_length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000000,
+                    "description": "Exclude responses by body length (gobuster -bl), useful for SPA wildcard noise.",
+                },
                 "force_wildcard": {
                     "type": "boolean",
                     "default": False,
@@ -115,6 +121,17 @@ class GobusterAdapter(BaseAdapter):
         if not 1 <= threads <= 50:
             raise ValueError(f"gobuster: threads must be 1-50, got {threads}")
 
+        exclude_length_raw = params.get("exclude_length")
+        exclude_length: int | None = None
+        if exclude_length_raw not in (None, ""):
+            exclude_length = int(exclude_length_raw)
+            if not 1 <= exclude_length <= 10000000:
+                raise ValueError(
+                    f"gobuster: exclude_length must be 1-10000000, got {exclude_length}"
+                )
+            if mode != "dir":
+                raise ValueError("gobuster: exclude_length is only supported in dir mode.")
+
         force_wildcard = bool(params.get("force_wildcard", False))
         if force_wildcard and mode != "dir":
             raise ValueError("gobuster: force_wildcard is only supported in dir mode.")
@@ -126,6 +143,7 @@ class GobusterAdapter(BaseAdapter):
                 "wordlist": wordlist,
                 "extensions": extensions,
                 "threads": threads,
+                "exclude_length": exclude_length,
                 "force_wildcard": force_wildcard,
             },
         )
@@ -146,6 +164,8 @@ class GobusterAdapter(BaseAdapter):
 
         if mode == "dir":
             cmd.extend(["-u", params.target])
+            if params.extra.get("exclude_length") is not None:
+                cmd.extend(["-bl", str(params.extra["exclude_length"])])
             if bool(params.extra.get("force_wildcard", False)):
                 cmd.append("-fw")
             extensions = str(params.extra.get("extensions", ""))
@@ -166,6 +186,7 @@ class GobusterAdapter(BaseAdapter):
         lines = (stdout + b"\n" + stderr).decode(errors="replace").splitlines()
         findings: list[dict[str, Any]] = []
         execution_hints: list[dict[str, Any]] = []
+        wildcard_detected = False
 
         for raw in lines:
             line = raw.strip()
@@ -173,6 +194,7 @@ class GobusterAdapter(BaseAdapter):
                 continue
 
             if "wildcard response found" in line.lower():
+                wildcard_detected = True
                 execution_hints.append(
                     normalize_execution_hint(
                         code="wildcard_detected",
@@ -212,10 +234,17 @@ class GobusterAdapter(BaseAdapter):
                     }
                 )
 
+        if findings and wildcard_detected:
+            confidence = 0.45
+        elif findings:
+            confidence = 0.85
+        else:
+            confidence = 0.6
+
         return ParsedOutput(
             findings=findings,
             execution_hints=execution_hints,
             new_findings_count=len(findings),
-            confidence=0.85 if findings else 0.6,
+            confidence=confidence,
             raw_summary=f"gobuster discovered {len(findings)} item(s)",
         )

@@ -29,7 +29,7 @@ import re
 import time
 from copy import deepcopy
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import structlog
 
@@ -50,6 +50,16 @@ _LOW_VALUE_HINT_CODES = frozenset({
     "no_forms_detected",
     "no_matches",
     "output_format_invalid",
+    "execution_error",
+})
+
+_LOW_VALUE_FAILURE_REASONS = frozenset({
+    "TargetUnreachable",
+    "ToolModeMismatch",
+    "Timeout",
+    "ParserDegraded",
+    "NoActionableOutput",
+    "UnknownRuntimeFailure",
 })
 
 # v2: RepetitionDetector singleton used by PlannerNode
@@ -745,7 +755,14 @@ class PlannerNode:
             )
             if self._no_novel_count >= _MAX_REPEATED_STATE:
                 log.error("planner.circuit_breaker_triggered")
-                return {**state, "kill_switch": True, "error": "Repeated-state circuit breaker fired."}
+                return {
+                    **state,
+                    "force_report": True,
+                    "report_trigger_reason": "repeated_state_circuit_breaker",
+                    "stall_state": "terminal",
+                    "termination_reason": "repeated_state_circuit_breaker",
+                    "error": "Repeated-state circuit breaker fired.",
+                }
         else:
             self._no_novel_count = 0
 
@@ -807,7 +824,12 @@ class PlannerNode:
                 for code in action.get("execution_hint_codes", [])
                 if str(code).strip()
             }
-            if hint_codes & _LOW_VALUE_HINT_CODES:
+            failure_reasons = {
+                str(reason).strip()
+                for reason in action.get("failure_reasons", [])
+                if str(reason).strip()
+            }
+            if hint_codes & _LOW_VALUE_HINT_CODES or failure_reasons & _LOW_VALUE_FAILURE_REASONS:
                 stats["low_value"] += 1
 
         for tool, stats in tool_stats.items():
@@ -1095,6 +1117,22 @@ class PlannerNode:
 
         updated = deepcopy(proposal)
         updated["target"] = preferred_target
+
+        if tool_name == "sqlmap":
+            params_obj = updated.get("params") if isinstance(updated.get("params"), dict) else {}
+            sqlmap_params = dict(params_obj)
+            # Form discovery is usually low-value on SPA roots and API-first targets.
+            sqlmap_params["forms"] = False
+
+            if parameters and not sqlmap_params.get("data") and not _target_has_query_params(str(updated.get("target", ""))):
+                sqlmap_params["data"] = f"{parameters[0]}=1"
+
+            if parameters and not _target_has_query_params(str(updated.get("target", ""))):
+                sep = "&" if "?" in str(updated["target"]) else "?"
+                updated["target"] = f"{updated['target']}{sep}{urlencode({parameters[0]: '1'})}"
+
+            updated["params"] = sqlmap_params
+
         rationale_suffix = ""
         if preferred_endpoint and _target_has_query_params(preferred_endpoint):
             rationale_suffix = " Prioritized discovered endpoint with query parameters from attack_surface."
@@ -1102,6 +1140,9 @@ class PlannerNode:
             rationale_suffix = " Prioritized discovered endpoint from attack_surface."
         else:
             rationale_suffix = " Prioritized discovered web target from attack_surface."
+
+        if tool_name == "sqlmap":
+            rationale_suffix += " Configured sqlmap for parameterized API-aware testing."
 
         if parameters:
             rationale_suffix += f" Known parameters: {', '.join(parameters[:5])}."
@@ -1168,8 +1209,17 @@ class PlannerNode:
             )
             if action_signature != signature:
                 continue
-            hint_codes = set(action.get("execution_hint_codes", []))
-            if hint_codes & _LOW_VALUE_HINT_CODES:
+            hint_codes = {
+                str(code).strip()
+                for code in action.get("execution_hint_codes", [])
+                if str(code).strip()
+            }
+            failure_reasons = {
+                str(reason).strip()
+                for reason in action.get("failure_reasons", [])
+                if str(reason).strip()
+            }
+            if hint_codes & _LOW_VALUE_HINT_CODES or failure_reasons & _LOW_VALUE_FAILURE_REASONS:
                 return True
         return False
 

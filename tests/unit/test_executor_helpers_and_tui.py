@@ -92,8 +92,8 @@ def test_executor_stores_findings_hosts_services_and_hints() -> None:
     result.duration_ms = 42
     result.stdout_hash = "h1"
     result.stderr_hash = "h2"
-    result.stdout_evidence_id = None
-    result.stderr_evidence_id = None
+    result.stdout_evidence_id = uuid4()
+    result.stderr_evidence_id = uuid4()
     result.stdout_evidence_path = None
     result.stderr_evidence_path = None
     result.parser_confidence = 0.8
@@ -148,6 +148,8 @@ def test_executor_stores_findings_hosts_services_and_hints() -> None:
     assert out["error"] is None
     assert out["last_execution_hints"][0]["code"] == "no_matches"
     assert finding_store.upsert.called
+    call_kwargs = finding_store.upsert.call_args.kwargs
+    assert len(call_kwargs["evidence_ids"]) == 2
     assert recon_store.upsert_host.call_count >= 1
     assert recon_store.upsert_service.call_count >= 2
     assert out["recon_summary"]["findings_summary"]["findings_count"] == 1

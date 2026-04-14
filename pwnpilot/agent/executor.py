@@ -721,6 +721,25 @@ class ExecutorNode:
         streak = state.get("no_new_findings_streak", 0)
         streak = 0 if new_evidence > 0 else streak + 1
         execution_hints = list(result.parsed_output.get("execution_hints", []))
+        run_evidence_ids: list[str] = []
+        if result.stdout_evidence_id is not None:
+            run_evidence_ids.append(str(result.stdout_evidence_id))
+        if result.stderr_evidence_id is not None:
+            run_evidence_ids.append(str(result.stderr_evidence_id))
+        has_structured_output = bool(
+            result.parsed_output.get("services")
+            or result.parsed_output.get("hosts")
+            or result.parsed_output.get("technologies")
+            or result.parsed_output.get("routes")
+        )
+        outcome_status_value = (
+            result.outcome_status.value
+            if hasattr(result.outcome_status, "value")
+            else str(result.outcome_status)
+        )
+        is_productive_execution = bool(new_evidence) or has_structured_output
+        current_nonproductive = int(state.get("nonproductive_cycle_streak", 0) or 0)
+        next_nonproductive = 0 if is_productive_execution and outcome_status_value == "success" else current_nonproductive + 1
 
         # Store findings and hosts from tool output (NEW: Feedback loop)
         if self._finding_store and self._recon_store:
@@ -764,7 +783,7 @@ class ExecutorNode:
                         tool_name=action.tool_name,
                         severity=severity,
                         confidence=normalized.get("confidence", 0.5),
-                        evidence_ids=[],
+                        evidence_ids=run_evidence_ids,
                         remediation=normalized.get("remediation", ""),
                     )
 
@@ -971,12 +990,7 @@ class ExecutorNode:
 
         # Accumulate evidence artifact IDs from this tool run into state so that
         # the readiness policy's min_evidence_artifacts gate counts them correctly.
-        new_evidence_ids: list[str] = []
-        if result.stdout_evidence_id is not None:
-            new_evidence_ids.append(str(result.stdout_evidence_id))
-        if result.stderr_evidence_id is not None:
-            new_evidence_ids.append(str(result.stderr_evidence_id))
-        updated_evidence_ids = list(state.get("evidence_ids") or []) + new_evidence_ids
+        updated_evidence_ids = list(state.get("evidence_ids") or []) + run_evidence_ids
 
         output = {
             **state,
@@ -986,7 +1000,7 @@ class ExecutorNode:
             "proposed_action": None,
             "validation_result": None,
             "no_new_findings_streak": streak,
-            "nonproductive_cycle_streak": 0,
+            "nonproductive_cycle_streak": next_nonproductive,
             "recon_summary": recon_summary,
             "last_execution_hints": execution_hints,
             # Clear active action fields after completion

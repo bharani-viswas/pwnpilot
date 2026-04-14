@@ -141,7 +141,9 @@ def _classify_outcome(
     ):
         reasons.append(FailureReason.AUTH_FAILURE)
 
-    if error_class == ErrorClass.PARSE_ERROR or str(parsed_output.get("parser_error", "")).strip():
+    parser_error = parsed_output.get("parser_error")
+    has_parser_error = isinstance(parser_error, str) and bool(parser_error.strip())
+    if error_class == ErrorClass.PARSE_ERROR or has_parser_error:
         reasons.append(FailureReason.PARSER_DEGRADED)
 
     if hint_codes & {"no_forms_detected", "no_matches", "wildcard_detected", "output_format_invalid"}:

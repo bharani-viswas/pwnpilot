@@ -178,8 +178,71 @@ class TestPlannerNode:
             ]}
             state = planner(state)
 
-        # After 3 consecutive repeats, kill_switch should be set
-        assert state.get("kill_switch") is True
+        # After 3 consecutive repeats, planner should force report routing
+        assert state.get("force_report") is True
+        assert state.get("termination_reason") == "repeated_state_circuit_breaker"
+
+    def test_adaptive_cooldown_uses_failure_reasons(self):
+        class _RepeatGobusterLLM:
+            def plan(self, _context: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "action_type": "active_scan",
+                    "tool_name": "gobuster",
+                    "target": "http://localhost:3000",
+                    "params": {},
+                    "rationale": "repeat",
+                    "estimated_risk": "medium",
+                }
+
+        planner = PlannerNode(
+            llm_router=_RepeatGobusterLLM(),
+            engagement_summary={"engagement_id": str(uuid4())},
+            available_tools=["gobuster", "nuclei"],
+            tools_catalog=[
+                {
+                    "tool_name": "gobuster",
+                    "risk_class": "active_scan",
+                    "supported_target_types": ["url"],
+                    "required_params": ["target"],
+                    "parameter_schema": {"target": {"type": "string"}},
+                },
+                {
+                    "tool_name": "nuclei",
+                    "risk_class": "active_scan",
+                    "supported_target_types": ["url"],
+                    "required_params": ["target"],
+                    "parameter_schema": {"target": {"type": "string"}},
+                },
+            ],
+            adaptive_cooldown_enabled=True,
+            adaptive_cooldown_max=4,
+        )
+
+        state = {
+            **_base_state(),
+            "previous_actions": [
+                {
+                    "tool_name": "gobuster",
+                    "target": "http://localhost:3000",
+                    "action_type": "active_scan",
+                    "execution_hint_codes": [],
+                    "failure_reasons": ["TargetUnreachable"],
+                    "new_findings_count": 0,
+                },
+                {
+                    "tool_name": "gobuster",
+                    "target": "http://localhost:3000",
+                    "action_type": "active_scan",
+                    "execution_hint_codes": [],
+                    "failure_reasons": ["TargetUnreachable"],
+                    "new_findings_count": 0,
+                },
+            ],
+        }
+
+        result = planner(state)
+        assert result["proposed_action"]["tool_name"] == "nuclei"
+        assert result["temporarily_unavailable_tools"].get("gobuster", 0) >= 2
 
     def test_schema_context_uses_tool_name_key(self):
         class CaptureLLM:
@@ -523,6 +586,37 @@ class TestValidatorNode:
         result = validator(state)
         assert result["validation_result"]["verdict"] == "reject"
         assert "unsupported parameters" in result["validation_result"]["rationale"]
+
+    def test_capability_allows_target_key_in_params(self):
+        validator = ValidatorNode(
+            llm_router=MockLLMRouter(),
+            policy_context={
+                "available_tools": ["nikto"],
+                "tools_catalog": [
+                    {
+                        "tool_name": "nikto",
+                        "risk_class": "active_scan",
+                        "supported_target_types": ["url", "domain", "ip"],
+                        "required_params": ["target"],
+                        "parameter_schema": {
+                            "target": {"type": "string"},
+                            "ssl": {"type": "boolean"},
+                            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                        },
+                    }
+                ],
+            },
+        )
+        state = {**_base_state(), "proposed_action": {
+            "action_type": "active_scan",
+            "tool_name": "nikto",
+            "target": "http://localhost:3000",
+            "rationale": "test",
+            "estimated_risk": "medium",
+            "params": {"target": "http://localhost:3000", "ssl": False, "port": 3000},
+        }}
+        result = validator(state)
+        assert result["validation_result"]["verdict"] == "approve"
 
     def test_capability_rejects_schema_value_violations(self):
         validator = ValidatorNode(

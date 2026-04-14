@@ -382,7 +382,11 @@ class ValidatorNode:
             for name in schema_props.keys()
             if str(name).strip() and str(name).strip() != "target"
         }
-        unknown = sorted(param for param in params.keys() if param not in allowed_params)
+        unknown = sorted(
+            param
+            for param in params.keys()
+            if param not in allowed_params and param not in {"target", "target_resolved"}
+        )
         if allowed_params and unknown:
             return {
                 "rationale": f"Proposal includes unsupported parameters for tool '{tool_name}': {unknown}",

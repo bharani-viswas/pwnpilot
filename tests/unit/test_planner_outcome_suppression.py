@@ -634,6 +634,47 @@ def test_planner_prioritizes_attack_surface_endpoint_target() -> None:
     assert "attack_surface" in result["proposed_action"]["rationale"]
 
 
+def test_planner_parameterizes_sqlmap_target_from_attack_surface_fields() -> None:
+    planner = PlannerNode(
+        llm_router=_BaseTargetSqlmapLLM(),
+        engagement_summary={"engagement_id": str(uuid4())},
+        available_tools=["sqlmap"],
+        tools_catalog=[
+            {
+                "tool_name": "sqlmap",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {
+                    "target": {"type": "string"},
+                    "forms": {"type": "boolean"},
+                    "data": {"type": "string"},
+                },
+            }
+        ],
+    )
+
+    state = {
+        **_base_state(),
+        "recon_summary": {
+            "attack_surface": {
+                "web_targets": ["http://localhost:3000"],
+                "endpoints": [
+                    "http://localhost:3000/rest/products/search",
+                ],
+                "routes": ["/rest/products/search"],
+                "parameters": ["q"],
+                "auth_paths": [],
+            }
+        },
+    }
+
+    result = planner(state)
+    assert result["proposed_action"]["target"].endswith("/rest/products/search?q=1")
+    assert result["proposed_action"]["params"]["forms"] is False
+    assert result["proposed_action"]["params"]["data"] == "q=1"
+
+
 def test_planner_advances_when_step_budget_exhausted() -> None:
     planner = PlannerNode(
         llm_router=_RepeatGobusterLLM(),
