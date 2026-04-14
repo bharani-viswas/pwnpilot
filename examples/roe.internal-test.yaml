@@ -26,8 +26,6 @@ policy:
   max_iterations: 50
   # More retries acceptable for internal, stable systems
   max_retries: 5
-  # 8 hour timeout = full business day of testing
-  timeout_seconds: 28800
 
 metadata:
   organization: "ACME Corp Security Team"

@@ -25,7 +25,6 @@ def _policy() -> ExtractedPolicy:
         restricted_actions=["DELETE_DATA"],
         max_iterations=20,
         max_retries=3,
-        timeout_seconds=1800,
         cloud_allowed=False,
     )
 

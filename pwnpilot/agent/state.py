@@ -76,7 +76,6 @@ class AgentState(TypedDict, total=False):
     last_reject_reason_fingerprint: str | None
     max_pv_cycles_without_executor: int
     max_consecutive_rejects_per_reason: int
-    max_autonomous_runtime_seconds: int
     run_started_at_epoch: float
 
     # -----------------------------------------------------------------------
@@ -115,6 +114,7 @@ class AgentState(TypedDict, total=False):
     # -----------------------------------------------------------------------
     # Control flags
     # -----------------------------------------------------------------------
+    pending_approval_ticket_id: str | None  # set when executor halts awaiting approval
     kill_switch: bool
     force_report: bool
     report_complete: bool
@@ -139,7 +139,6 @@ def make_initial_state(
     max_iterations: int = 50,
     max_pv_cycles_without_executor: int = 40,
     max_consecutive_rejects_per_reason: int = 12,
-    max_autonomous_runtime_seconds: int = 3600,
     operator_mode: OperatorMode = OperatorMode.AUTONOMOUS,
     operator_directives: dict[str, Any] | None = None,
     live_output_enabled: bool = True,
@@ -167,7 +166,6 @@ def make_initial_state(
         last_reject_reason_fingerprint=None,
         max_pv_cycles_without_executor=max_pv_cycles_without_executor,
         max_consecutive_rejects_per_reason=max_consecutive_rejects_per_reason,
-        max_autonomous_runtime_seconds=max_autonomous_runtime_seconds,
         run_started_at_epoch=time.time(),
         recon_summary={},
         memory_context={},
@@ -180,6 +178,7 @@ def make_initial_state(
         last_result=None,
         last_execution_hints=[],
         evidence_ids=[],
+        pending_approval_ticket_id=None,
         kill_switch=False,
         force_report=False,
         report_complete=False,

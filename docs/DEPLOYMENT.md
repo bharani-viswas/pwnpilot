@@ -465,7 +465,6 @@ active_hours_utc: "09:00-17:00"
 valid_hours: 24
 max_iterations: 100
 max_retries: 3
-timeout_seconds: 3600
 allowed_actions:
   - "network_scan"
   - "vulnerability_scan"

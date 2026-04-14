@@ -111,7 +111,6 @@ class TestEngagementPolicyModel:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=5,
             max_retries=3,
-            timeout_seconds=300,
             cloud_allowed=False,
             confidence_score=0.0,  # Lowest valid
         )
@@ -129,7 +128,6 @@ class TestEngagementPolicyModel:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=5,
             max_retries=3,
-            timeout_seconds=300,
             cloud_allowed=False,
             confidence_score=1.0,  # Highest valid
         )
@@ -160,7 +158,6 @@ class TestEngagementPolicyModel:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=5,
             max_retries=3,
-            timeout_seconds=300,
             cloud_allowed=True,  # Cloud operations allowed
             confidence_score=0.95,
         )
@@ -261,7 +258,6 @@ class TestROEModelsIntegration:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=5,
             max_retries=3,
-            timeout_seconds=300,
             cloud_allowed=False,
             confidence_score=0.95,
         )
@@ -287,7 +283,6 @@ class TestROEModelsIntegration:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=5,
             max_retries=3,
-            timeout_seconds=300,
             cloud_allowed=False,
             confidence_score=0.95,
         )
@@ -303,7 +298,6 @@ class TestROEModelsIntegration:
             restricted_actions=["DELETE_DATA"],
             max_iterations=10,
             max_retries=5,
-            timeout_seconds=600,
             cloud_allowed=True,
             confidence_score=0.88,
         )
@@ -371,7 +365,6 @@ class TestROEModelsEdgeCases:
             restricted_actions=[],
             max_iterations=1,
             max_retries=1,
-            timeout_seconds=60,
             cloud_allowed=False,
             confidence_score=0.0,
         )

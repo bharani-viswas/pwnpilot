@@ -58,12 +58,6 @@ class GobusterAdapter(BaseAdapter):
                     "maximum": 50,
                     "default": 20,
                 },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 120,
-                    "default": 10,
-                },
                 "force_wildcard": {
                     "type": "boolean",
                     "default": False,
@@ -121,12 +115,6 @@ class GobusterAdapter(BaseAdapter):
         if not 1 <= threads <= 50:
             raise ValueError(f"gobuster: threads must be 1-50, got {threads}")
 
-        timeout_seconds = int(params.get("timeout_seconds", 10))
-        if not 1 <= timeout_seconds <= 120:
-            raise ValueError(
-                f"gobuster: timeout_seconds must be 1-120, got {timeout_seconds}"
-            )
-
         force_wildcard = bool(params.get("force_wildcard", False))
         if force_wildcard and mode != "dir":
             raise ValueError("gobuster: force_wildcard is only supported in dir mode.")
@@ -138,7 +126,6 @@ class GobusterAdapter(BaseAdapter):
                 "wordlist": wordlist,
                 "extensions": extensions,
                 "threads": threads,
-                "timeout_seconds": timeout_seconds,
                 "force_wildcard": force_wildcard,
             },
         )
@@ -153,8 +140,6 @@ class GobusterAdapter(BaseAdapter):
             str(params.extra["wordlist"]),
             "-t",
             str(params.extra["threads"]),
-            "-to",
-            f"{params.extra['timeout_seconds']}s",
             "-q",
             "-np",
         ]

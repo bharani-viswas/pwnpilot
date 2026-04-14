@@ -165,12 +165,6 @@ class AgentConfig(BaseModel):
         le=1000,
         description="Hard cap for consecutive validator rejects with the same reason fingerprint.",
     )
-    max_autonomous_runtime_seconds: int = Field(
-        default=3600,
-        ge=60,
-        le=172800,
-        description="Hard cap for autonomous run wall-clock duration in seconds.",
-    )
     convergence_threshold: int = Field(
         default=3,
         ge=1,
@@ -279,12 +273,6 @@ class ToolsConfig(BaseModel):
         ge=256,
         le=16384,
         description="Maximum virtual memory per tool subprocess (MB). Default 2048MB. Increase for memory-intensive tools like Nuclei (min 2GB recommended).",
-    )
-    cpu_limit_seconds: int = Field(
-        default=300,
-        ge=30,
-        le=3600,
-        description="Maximum CPU time per tool subprocess (seconds). Default 300s (5 minutes).",
     )
 
     @field_validator("discovery_mode")

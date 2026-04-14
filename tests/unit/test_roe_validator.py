@@ -46,7 +46,6 @@ def valid_roe_dict():
             "cloud_allowed": False,
             "max_iterations": 20,
             "max_retries": 3,
-            "timeout_seconds": 3600,
         },
         "metadata": {
             "organization": "Test Org",
@@ -76,7 +75,6 @@ def complex_roe_dict():
             "cloud_allowed": True,
             "max_iterations": 50,
             "max_retries": 5,
-            "timeout_seconds": 28800,
         },
         "metadata": {
             "organization": "ACME Corp Security",
@@ -536,12 +534,6 @@ class TestBoundaryValues:
         roe = ROESchema(**valid_roe_dict)
         assert roe.policy.max_retries == 10
 
-    def test_timeout_seconds_minimum_passes(self, valid_roe_dict):
-        """timeout_seconds = 300 (5 min) should pass."""
-        valid_roe_dict["policy"]["timeout_seconds"] = 300
-        roe = ROESchema(**valid_roe_dict)
-        assert roe.policy.timeout_seconds == 300
-
     def test_description_minimum_length_enforced(self, valid_roe_dict):
         """Description must be at least 100 characters."""
         valid_roe_dict["engagement"]["description"] = "Short"
@@ -656,7 +648,6 @@ class TestComplexScenarios:
                 "cloud_allowed": False,
                 "max_iterations": 20,
                 "max_retries": 2,
-                "timeout_seconds": 21600,
             },
         })
         roe = ROESchema(**valid_roe_dict)
@@ -683,7 +674,6 @@ class TestComplexScenarios:
                 "cloud_allowed": False,
                 "max_iterations": 50,
                 "max_retries": 5,
-                "timeout_seconds": 28800,
             },
         })
         roe = ROESchema(**valid_roe_dict)

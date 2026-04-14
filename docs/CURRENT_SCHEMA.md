@@ -182,7 +182,6 @@ This document describes the current state of the pwnpilot database schema as of 
 | restricted_actions | Text | - | JSON array of allowed actions |
 | max_iterations | Integer | - | Maximum loop iterations |
 | max_retries | Integer | - | Maximum retry attempts |
-| timeout_seconds | Integer | - | Execution timeout |
 | cloud_allowed | Boolean | - | Allow cloud LLM fallback |
 | confidence_score | Float | - | AI interpretation confidence (0-1) |
 | created_at | DateTime | TZ-aware | When policy was extracted |

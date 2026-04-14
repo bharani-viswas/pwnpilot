@@ -364,7 +364,7 @@ PwnPilot implements a **policy-first authorization framework** via YAML-based **
 
 - **Scope definition** — CIDR ranges, domains, URLs, excluded targets
 - **Restricted actions** — whitelisted operations (e.g., MODIFY_DATA, DELETE_DATA)
-- **Policy constraints** — iteration limits, timeout, retry behavior, cloud LLM allowance
+- **Policy constraints** — iteration limits, retry behavior, cloud LLM allowance
 - **Authorization chain** — cryptographically verified approval workflows
 - **Immutable audit trail** — hash-chained event logs for SOC 2 Type II compliance
 - **AI safeguards** — LLM policy extraction with confidence scoring, hallucination detection, injection prevention
@@ -398,7 +398,6 @@ scope:
 policy:
   max_iterations: 50
   max_retries: 3
-  timeout_seconds: 3600
   cloud_allowed: false
 ```
 
@@ -902,7 +901,7 @@ docs/
 - Ensure all required fields are present
 
 **LLM interpretation timeout**
-- Increase `agent.timeout_seconds` in config
+- Increase `llm.timeout_seconds` in config
 - Use smaller model: `llm.local_model: mistral7b`
 
 ### Getting Help

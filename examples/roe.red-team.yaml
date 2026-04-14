@@ -28,8 +28,6 @@ policy:
   max_iterations: 100
   # Higher retries for persistence testing (red team needs realistic persistence)
   max_retries: 8
-  # 40 hour timeout = full engagement duration, no interruption
-  timeout_seconds: 144000
 
 metadata:
   organization: "ACME Corp Security Operations - Red Team"

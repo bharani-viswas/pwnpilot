@@ -3,7 +3,7 @@ ROE Interpreter - AI-Driven Policy Extraction from ROE Files
 
 Uses LLM (Bedrock Claude via LiteLLM) to interpret ROE documents and extract:
 - Refined scope definitions (CIDRs, domains, URLs from description)
-- Policy configurations (iterations, retries, timeouts)
+- Policy configurations (iterations, retries, cloud policy)
 - Risk assessments and confidence scores
 - Hallucination detection and conflict identification
 
@@ -38,7 +38,6 @@ class ExtractedPolicy:
     restricted_actions: List[str]
     max_iterations: int
     max_retries: int
-    timeout_seconds: int
     cloud_allowed: bool
     
     def to_dict(self) -> dict:
@@ -209,14 +208,13 @@ Extract and return ONLY a JSON object with these fields:
   "restricted_actions": [list of actions from ROE, or empty array],
   "max_iterations": [number from policy.max_iterations],
   "max_retries": [number from policy.max_retries],
-  "timeout_seconds": [number from policy.timeout_seconds],
   "cloud_allowed": [boolean from policy.cloud_allowed]
 }}
 
 CRITICAL RULES:
 1. Only extract values EXPLICITLY in the ROE - do NOT invent values
 2. For restricted_actions, only include actions that are explicitly listed
-3. For numbers (iterations, retries, timeout), use the exact values from ROE
+3. For numbers (iterations, retries), use the exact values from ROE
 4. If a field is not mentioned, use null or empty array
 5. Return ONLY valid JSON, no explanations"""
         
@@ -247,7 +245,6 @@ CRITICAL RULES:
                 restricted_actions=extracted_json.get('restricted_actions', []) or [],
                 max_iterations=extracted_json.get('max_iterations', 50),
                 max_retries=extracted_json.get('max_retries', 3),
-                timeout_seconds=extracted_json.get('timeout_seconds', 3600),
                 cloud_allowed=extracted_json.get('cloud_allowed', False),
             )
             
@@ -313,14 +310,6 @@ CRITICAL RULES:
             )
             confidence -= 0.15
         
-        # Check if timeout_seconds was invented
-        policy_timeout = roe_dict.get('policy', {}).get('timeout_seconds')
-        if extracted.timeout_seconds != policy_timeout:
-            hallucinations.append(
-                f"⚠️ Hallucination: timeout_seconds {extracted.timeout_seconds} != ROE {policy_timeout}"
-            )
-            confidence -= 0.15
-        
         # Check if cloud_allowed was invented
         policy_cloud = roe_dict.get('policy', {}).get('cloud_allowed')
         if extracted.cloud_allowed != policy_cloud:
@@ -333,12 +322,6 @@ CRITICAL RULES:
         if extracted.max_iterations <= 0 or extracted.max_iterations > 1000:
             hallucinations.append(
                 f"⚠️ Hallucination: max_iterations {extracted.max_iterations} out of range [1-1000]"
-            )
-            confidence -= 0.10
-        
-        if extracted.timeout_seconds < 300 or extracted.timeout_seconds > 86400:
-            hallucinations.append(
-                f"⚠️ Hallucination: timeout_seconds {extracted.timeout_seconds} unrealistic"
             )
             confidence -= 0.10
         

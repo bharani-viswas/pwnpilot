@@ -529,6 +529,7 @@ def test_planner_tracks_rejection_repeat_metadata() -> None:
         "last_rejection_code": "TARGET_TYPE_NOT_SUPPORTED",
         "last_rejection_class": "target",
         "rejection_repeat_count": 1,
+        "reject_reason_streak_count": 6,
         "nonproductive_cycle_streak": 6,
     }
 
@@ -571,12 +572,14 @@ def test_planner_sets_kill_switch_when_reject_loop_has_no_viable_pivot() -> None
             "risk_override": None,
             "rationale": "No progress.",
         },
+        "reject_reason_streak_count": 12,
         "nonproductive_cycle_streak": 12,
     }
 
     result = planner(state)
-    assert result.get("kill_switch") is True
-    assert "Nonproductive reject loop" in str(result.get("error", ""))
+    assert result.get("force_report") is True
+    assert result.get("termination_reason") == "reflector_terminate"
+    assert "Reject reason streak exceeded reflector terminate threshold" in str(result.get("error", ""))
 
 
 class _BaseTargetSqlmapLLM:

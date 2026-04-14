@@ -32,7 +32,6 @@ from pwnpilot.plugins.sdk import BaseAdapter, ParsedOutput, PluginManifest, Tool
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$", re.IGNORECASE)
 
 _NVD_BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-_REQUEST_TIMEOUT_SECONDS = 15
 
 
 class CveEnrichAdapter(BaseAdapter):
@@ -139,7 +138,7 @@ class CveEnrichAdapter(BaseAdapter):
 
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS) as resp:  # noqa: S310
+            with urllib.request.urlopen(req) as resp:  # noqa: S310
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             return ParsedOutput(parser_error=f"NVD API HTTP {exc.code}: {exc.reason}")

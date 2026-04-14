@@ -26,7 +26,6 @@ def _base_roe() -> dict:
             "cloud_allowed": False,
             "max_iterations": 20,
             "max_retries": 3,
-            "timeout_seconds": 3600,
         },
     }
 

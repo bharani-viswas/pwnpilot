@@ -108,11 +108,6 @@ tools:
   #   4096  MB  — high-performance, for intensive scanning
   memory_limit_mb: 2048
   
-  # Maximum CPU time per tool subprocess (seconds)
-  # Default 300s (5 minutes) per tool
-  # Increase if tools are slow or scanning large scopes
-  cpu_limit_seconds: 300
-  
   # Tool discovery and trust configuration (advanced)
   # Uncomment to customize behavior
   
@@ -154,10 +149,6 @@ agent:
   # Hard cap for repeated validator rejects with the same reason code/class.
   # Forces deterministic termination instead of infinite retrying.
   max_consecutive_rejects_per_reason: 12
-
-  # Hard wall-clock cap for autonomous runs (seconds).
-  # Reporter is triggered when this budget is exceeded.
-  max_autonomous_runtime_seconds: 3600
   
   # Convergence threshold: consecutive cycles with no new findings
   # When reached, assessment auto-terminates (enables cost control)

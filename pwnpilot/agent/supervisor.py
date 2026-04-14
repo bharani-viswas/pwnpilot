@@ -178,33 +178,22 @@ def _should_route_to_report(state: AgentState) -> bool:
         state["termination_reason"] = "planner_validator_churn"
         return True
 
-    runtime_limit_seconds = int(state.get("max_autonomous_runtime_seconds", 3600) or 3600)
-    run_started_at = float(state.get("run_started_at_epoch", 0.0) or 0.0)
-    if run_started_at > 0:
-        elapsed = max(0.0, time.time() - run_started_at)
-        if elapsed >= runtime_limit_seconds:
-            log.info(
-                "supervisor.runtime_budget_reached",
-                elapsed_seconds=round(elapsed, 3),
-                limit_seconds=runtime_limit_seconds,
-                iteration=iteration,
-            )
-            _escalate_to_hitl(
-                state,
-                reason="runtime_budget_limit",
-                note="Runtime budget exceeded; routing to reporter.",
-            )
-            state["report_trigger_reason"] = "runtime_budget"
-            state["stall_state"] = "terminal"
-            state["termination_reason"] = "runtime_budget_exceeded"
-            return True
-
     return False
 
 
 def _is_guided_mode(state: AgentState) -> bool:
     """Return True if the operator is in guided mode."""
     return state.get("operator_mode") == OperatorMode.GUIDED.value
+
+
+def _is_monitor_mode(state: AgentState) -> bool:
+    """Return True if the operator is in monitor (read-only observe) mode."""
+    return state.get("operator_mode") == OperatorMode.MONITOR.value
+
+
+def _is_replay_mode(state: AgentState) -> bool:
+    """Return True if the operator is in replay mode (report-only, no new execution)."""
+    return state.get("operator_mode") == OperatorMode.REPLAY.value
 
 
 def _route_after_validation(state: AgentState) -> str:
@@ -238,6 +227,14 @@ def _route_after_validation(state: AgentState) -> str:
 
     if _should_route_to_report(state):
         return "report"
+
+    # REPLAY mode: skip all execution, go directly to reporter.
+    if _is_replay_mode(state):
+        return "report"
+
+    # MONITOR mode: approve plan but never execute — loop planner for observe-only runs.
+    if _is_monitor_mode(state) and (verdict == "approve" or verdict == "escalate"):
+        return "replan"
 
     if verdict == "approve" or verdict == "escalate":
         return "execute"

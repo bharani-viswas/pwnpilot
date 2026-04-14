@@ -30,6 +30,8 @@ import structlog
 from pwnpilot.agent.state import AgentState
 from pwnpilot.control.approval import ApprovalService
 from pwnpilot.control.target_resolver import TargetResolver
+from pwnpilot.agent.action_validator import ActionValidationError, ActionValidator
+from pwnpilot.data.retrieval_store import RetrievalStore
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.models import (
     ActionRequest,
@@ -286,6 +288,7 @@ class ExecutorNode:
         target_resolver: TargetResolver | None = None,
         capability_registry: Any | None = None,
         event_bus: object | None = None,
+        retrieval_store: Any | None = None,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
@@ -299,6 +302,11 @@ class ExecutorNode:
         self._target_resolver = target_resolver
         self._capability_registry = capability_registry
         self._event_bus = event_bus  # ExecutionEventBus | None
+        self._retrieval_store = retrieval_store
+        # ActionValidator is lazily initialised once the tool_runner adapters are available
+        self._action_validator: ActionValidator | None = None
+        if hasattr(tool_runner, "_adapters") and tool_runner._adapters:
+            self._action_validator = ActionValidator(adapters=tool_runner._adapters)
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -383,6 +391,33 @@ class ExecutorNode:
                 self._metrics.record_nonproductive_cycle()
             return {**state, "error": f"Executor: failed to build ActionRequest: {exc}"}
 
+        # ADR-002 gate: validate action against adapter schema before policy engine
+        if self._action_validator is not None:
+            try:
+                self._action_validator.validate(action)
+            except ActionValidationError as exc:
+                if self._metrics:
+                    self._metrics.record_nonproductive_cycle()
+                log.warning(
+                    "executor.action_validation_failed",
+                    tool=action.tool_name,
+                    error=str(exc),
+                )
+                return {
+                    **state,
+                    "proposed_action": {**proposal_dict, "rejection_reason": str(exc)},
+                    "validation_result": {
+                        "verdict": "reject",
+                        "risk_override": None,
+                        "rationale": str(exc),
+                        "rejection_reason_code": "ACTION_VALIDATION_FAILED",
+                        "rejection_reason_detail": str(exc),
+                        "rejection_class": "schema",
+                    },
+                    "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
+                    "error": None,
+                }
+
         # Policy Engine evaluation
         decision = self._policy.evaluate(action)
 
@@ -444,7 +479,12 @@ class ExecutorNode:
                     "action_id": str(action.action_id),
                 },
             )
-            return {**state, "kill_switch": True, "error": None}
+            return {
+                **state,
+                "pending_approval_ticket_id": str(ticket.ticket_id),
+                "kill_switch": True,
+                "error": None,
+            }
 
         # Set active action fields for live visibility
         command_hint = " ".join(
@@ -603,7 +643,12 @@ class ExecutorNode:
                 )
                 
                 # Halt and await operator decision
-                return {**state, "kill_switch": True, "error": None}
+                return {
+                    **state,
+                    "pending_approval_ticket_id": str(ticket.ticket_id),
+                    "kill_switch": True,
+                    "error": None,
+                }
             
             # Generic parameter validation error - ask planner to retry
             log.warning("executor.param_validation_error", exc=error_msg, tool=action.tool_name)
@@ -789,6 +834,25 @@ class ExecutorNode:
                     services_count=len(result.parsed_output.get("services", [])),
                     execution_hints_count=len(execution_hints),
                 )
+
+                # Index findings and services into RetrievalStore for planner memory context.
+                if self._retrieval_store is not None:
+                    try:
+                        for f in findings_list:
+                            self._retrieval_store.index_finding(
+                                engagement_id,
+                                title=str(f.get("title", "")),
+                                body=str(f.get("description", f.get("vuln_ref", ""))),
+                            )
+                        for svc in services_list:
+                            self._retrieval_store.index_service(
+                                engagement_id,
+                                title=f"{svc.get('service_name', 'service')} on port {svc.get('port', '?')}",
+                                body=str(svc),
+                            )
+                    except Exception as ridx_exc:
+                        log.debug("executor.retrieval_index_error", exc=str(ridx_exc))
+
             except Exception as store_exc:
                 log.warning("executor.store_error", exc=str(store_exc))
                 # Don't fail the action if storage fails, just log it
@@ -905,10 +969,19 @@ class ExecutorNode:
             except Exception as summary_exc:
                 log.warning("executor.summary_error", exc=str(summary_exc))
 
+        # Accumulate evidence artifact IDs from this tool run into state so that
+        # the readiness policy's min_evidence_artifacts gate counts them correctly.
+        new_evidence_ids: list[str] = []
+        if result.stdout_evidence_id is not None:
+            new_evidence_ids.append(str(result.stdout_evidence_id))
+        if result.stderr_evidence_id is not None:
+            new_evidence_ids.append(str(result.stderr_evidence_id))
+        updated_evidence_ids = list(state.get("evidence_ids") or []) + new_evidence_ids
+
         output = {
             **state,
             "last_result": result.model_dump(mode="json"),
-            "evidence_ids": state.get("evidence_ids", []),
+            "evidence_ids": updated_evidence_ids,
             "previous_actions": previous,
             "proposed_action": None,
             "validation_result": None,

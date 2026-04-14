@@ -160,7 +160,6 @@ This guide covers:
    - Are all actions in whitelist? (Action validation)
    - Is engagement operator authorized? (PAM authentication)
    - Is approval recorded with password verification? (Audit trail)
-   - Has engagement exceeded timeout? (timeout_seconds policy)
    - Have max_iterations been exceeded? (Policy enforcement)
    ```
 
@@ -645,7 +644,6 @@ Use this checklist during compliance review:
 - [ ] Scope matches CIDR/domain/URL approval
 - [ ] No out-of-scope targets tested
 - [ ] No unauthorized actions executed
-- [ ] Engagement within timeout window
 
 ### Audit Trail Verification
 - [ ] All events present and chronological

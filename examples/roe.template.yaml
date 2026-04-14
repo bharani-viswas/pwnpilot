@@ -63,10 +63,6 @@ policy:
   # Higher = more persistent reconnection attempts
   max_retries: 3
 
-  # Session timeout in seconds (minimum 300 = 5 minutes)
-  # AI operations will terminate after this duration to prevent runaway execution
-  timeout_seconds: 3600
-
 metadata:
   # Organization or team name
   # Example: "ACME Corp Security Team"

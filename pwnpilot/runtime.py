@@ -27,7 +27,7 @@ from sqlalchemy.pool import QueuePool
 
 from pwnpilot.agent.checkpointer import SqliteCheckpointer
 from pwnpilot.config import PwnpilotConfig, load_config as _pydantic_load_config
-from pwnpilot.agent.event_bus import ExecutionEventBus, event_bus as _global_event_bus
+from pwnpilot.agent.event_bus import ExecutionEventBus
 from pwnpilot.agent.executor import ExecutorNode
 from pwnpilot.agent.planner import PlannerNode
 from pwnpilot.agent.reporter import ReporterNode
@@ -35,6 +35,7 @@ from pwnpilot.agent.state import AgentState, CompletionState, OperatorMode, make
 from pwnpilot.agent.supervisor import Supervisor, build_graph
 from pwnpilot.agent.validator import ValidatorNode
 from pwnpilot.control.approval import ApprovalService
+from pwnpilot.control.operator_session import OperatorSessionManager
 from pwnpilot.control.target_strategy import build_engagement_strategy
 from pwnpilot.data.approval_store import ApprovalStore
 from pwnpilot.control.engagement import EngagementService
@@ -48,6 +49,8 @@ from pwnpilot.data.finding_store import FindingStore
 from pwnpilot.data.models import Engagement, EngagementScope
 from pwnpilot.data.recon_store import ReconStore
 from pwnpilot.governance.authorization import AuthorizationArtifact, assert_authorized
+from pwnpilot.data.correlation import CorrelationEngine
+from pwnpilot.governance.retention import RetentionManager, EngagementClassification
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.governance.simulation import SimulationEngine
 from pwnpilot.plugins.loader import PluginLoader
@@ -203,9 +206,6 @@ def _agent_runtime_settings(typed_cfg: Any) -> dict[str, Any]:
         ),
         "max_consecutive_rejects_per_reason": int(
             getattr(agent_cfg, "max_consecutive_rejects_per_reason", 12)
-        ),
-        "max_autonomous_runtime_seconds": int(
-            getattr(agent_cfg, "max_autonomous_runtime_seconds", 3600)
         ),
     }
 
@@ -414,6 +414,47 @@ def get_db_session(config_path: Path | None = None) -> Any:
 # ---------------------------------------------------------------------------
 # Full runtime factory
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Per-engagement live-session registry
+# Stores the event_bus and operator_session for each running engagement so
+# that the TUI (launched as a side process or in the same process) can attach.
+# ---------------------------------------------------------------------------
+
+_engagement_registry: dict[str, dict[str, Any]] = {}
+_engagement_registry_lock = threading.Lock()
+
+
+def _register_engagement_session(
+    engagement_id: str,
+    event_bus: Any,
+    operator_session: Any,
+) -> None:
+    with _engagement_registry_lock:
+        _engagement_registry[engagement_id] = {
+            "event_bus": event_bus,
+            "operator_session": operator_session,
+        }
+
+
+def _deregister_engagement_session(engagement_id: str) -> None:
+    with _engagement_registry_lock:
+        _engagement_registry.pop(engagement_id, None)
+
+
+def get_engagement_session(engagement_id: str) -> dict[str, Any] | None:
+    """Return the live event_bus and operator_session for a running engagement.
+
+    Returns a dict with keys ``event_bus`` and ``operator_session``, or
+    ``None`` if no session is registered for the given engagement UUID.
+    Used by ``pwnpilot tui`` to attach to the live event stream.
+    """
+    with _engagement_registry_lock:
+        return _engagement_registry.get(engagement_id)
+
+
+# ---------------------------------------------------------------------------
+# Full runtime factory
+# ---------------------------------------------------------------------------
 
 
 def _build_runtime(
@@ -442,6 +483,8 @@ def _build_runtime(
     permission_store = PermissionStore(session)
     from pwnpilot.data.retrieval_store import RetrievalStore
     retrieval_store = RetrievalStore(session)
+    correlation_engine = CorrelationEngine(finding_store, recon_store)
+    retention_manager = RetentionManager(evidence_store, audit_store)
     from pwnpilot.data.operator_decision_store import OperatorDecisionStore
     operator_decision_store = OperatorDecisionStore(session)
 
@@ -486,7 +529,7 @@ def _build_runtime(
                 "nikto": NiktoAdapter(),
                 "nuclei": NucleiAdapter(),
                 "searchsploit": SearchsploitAdapter(),
-                "shell": ShellAdapter(),  # Shell adapter without permission context (permissions granted via approval flow)
+                "shell": ShellAdapter(permission_context={"permission_store": permission_store}),
                 "sqlmap": SqlmapAdapter(),
                 "whatweb": WhatWebAdapter(),
                 "whois": WhoisAdapter(),
@@ -500,7 +543,6 @@ def _build_runtime(
     # Tool runner — pass memory/CPU limits from config
     tools_cfg = getattr(typed_cfg, "tools", None)
     mem_limit_mb = int(getattr(tools_cfg, "memory_limit_mb", 2048)) if tools_cfg else 2048
-    cpu_limit_sec = int(getattr(tools_cfg, "cpu_limit_seconds", 300)) if tools_cfg else 300
 
     # v2: Wire event bus — tool runner and executor emit to it; audit store persists events.
     engagement_event_bus = ExecutionEventBus()
@@ -511,7 +553,6 @@ def _build_runtime(
         evidence_store=evidence_store,
         kill_switch=kill_switch,
         mem_limit=mem_limit_mb * 1024 * 1024,
-        cpu_limit=cpu_limit_sec,
         event_bus=engagement_event_bus,
     )
 
@@ -560,6 +601,7 @@ def _build_runtime(
         evidence_store=evidence_store,
         audit_store=audit_store,
         operator_decision_store=operator_decision_store,
+        correlation_engine=correlation_engine,
     )
 
     return {
@@ -569,6 +611,8 @@ def _build_runtime(
         "recon_store": recon_store,
         "finding_store": finding_store,
         "retrieval_store": retrieval_store,
+        "correlation_engine": correlation_engine,
+        "retention_manager": retention_manager,
         "permission_store": permission_store,
         "operator_decision_store": operator_decision_store,
         "kill_switch": kill_switch,
@@ -607,6 +651,8 @@ def create_and_run_engagement(
     config_path: Path | None = None,
     dry_run: bool = False,
     event_subscriber: object | None = None,
+    operator_mode: OperatorMode = OperatorMode.AUTONOMOUS,
+    operator_directives: dict[str, Any] | None = None,
 ) -> str:
     """Start and run a full engagement.
 
@@ -633,6 +679,29 @@ def create_and_run_engagement(
 
     eng_svc = EngagementService(engagement)
     policy_engine = PolicyEngine(eng_svc)
+
+    # Enforce authorization before every run (governance invariant).
+    _auth_artifact = AuthorizationArtifact(
+        engagement_id=engagement.engagement_id,
+        approver_identity=authoriser_identity,
+        ticket_reference=roe_document_hash[:16] if roe_document_hash else "none",
+        roe_document_hash=roe_document_hash or ("0" * 64),
+        valid_from=engagement.valid_from,
+        valid_until=engagement.valid_until,
+        signed_at=engagement.valid_from,
+    )
+    assert_authorized(_auth_artifact)
+
+    # Wire engagement_id into the shell adapter permission context so runtime-granted
+    # shell commands are validated against PermissionStore for this specific engagement.
+    _tool_runner = rt.get("tool_runner")
+    _adapters = getattr(_tool_runner, "_adapters", None)
+    _shell = _adapters.get("shell") if hasattr(_adapters, "get") else None
+    if _shell is not None and hasattr(_shell, "_permission_context"):
+        _permission_store = rt.get("permission_store")
+        if _permission_store is not None:
+            _shell._permission_context["permission_store"] = _permission_store
+        _shell._permission_context["engagement_id"] = engagement.engagement_id
 
     if dry_run:
         sim = SimulationEngine(eng_svc)
@@ -661,6 +730,21 @@ def create_and_run_engagement(
     }
 
     metrics = metrics_registry.get_or_create(str(engagement.engagement_id))
+    operator_session = OperatorSessionManager(
+        engagement_id=engagement.engagement_id,
+        operator_id=os.environ.get("USER", "operator"),
+        event_bus=rt["event_bus"],
+    )
+    operator_session.set_mode(operator_mode)
+    if operator_directives:
+        operator_session.submit_directive_from_dict(
+            objective=operator_directives.get("objective"),
+            requested_focus=operator_directives.get("requested_focus"),
+            constraints=operator_directives.get("constraints"),
+            paused_tool_families=operator_directives.get("paused_tool_families"),
+            notes=operator_directives.get("notes"),
+        )
+
     planner = PlannerNode(
         llm_router=rt["llm_router"],
         engagement_summary=engagement_summary,
@@ -672,6 +756,8 @@ def create_and_run_engagement(
         adaptive_cooldown_enabled=agent_settings["adaptive_cooldown_enabled"],
         adaptive_cooldown_max=agent_settings["adaptive_cooldown_max"],
         metrics=metrics,
+        operator_session_manager=operator_session,
+        retrieval_store=rt.get("retrieval_store"),
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -700,6 +786,7 @@ def create_and_run_engagement(
         target_resolver=rt["target_resolver"],
         capability_registry=rt["capability_registry"],
         event_bus=rt["event_bus"],
+        retrieval_store=rt.get("retrieval_store"),
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -723,6 +810,7 @@ def create_and_run_engagement(
         compiled_graph=graph,
         kill_switch=rt["kill_switch"],
         checkpointer=checkpointer,
+        operator_session_manager=operator_session,
     )
 
     initial_state: AgentState = make_initial_state(
@@ -730,8 +818,8 @@ def create_and_run_engagement(
         max_iterations=max_iterations,
         max_pv_cycles_without_executor=agent_settings["max_pv_cycles_without_executor"],
         max_consecutive_rejects_per_reason=agent_settings["max_consecutive_rejects_per_reason"],
-        max_autonomous_runtime_seconds=agent_settings["max_autonomous_runtime_seconds"],
-        operator_mode=OperatorMode.AUTONOMOUS,
+        operator_mode=operator_mode,
+        operator_directives=operator_directives,
     )
 
     rt["audit_store"].append(
@@ -744,6 +832,9 @@ def create_and_run_engagement(
     final_state: AgentState | None = None
     runtime_exception: Exception | None = None
     try:
+        _register_engagement_session(
+            str(engagement.engagement_id), rt["event_bus"], operator_session
+        )
         final_state = supervisor.run(initial_state, thread_id=str(engagement.engagement_id))
     except Exception as exc:
         runtime_exception = exc
@@ -753,6 +844,7 @@ def create_and_run_engagement(
             exc=str(exc),
         )
     finally:
+        _deregister_engagement_session(str(engagement.engagement_id))
         normalized_state = _normalize_terminal_state(
             final_state,
             default_termination_reason=(
@@ -802,7 +894,12 @@ def get_engagement_preflight(
     )
 
 
-def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> str:
+def resume_engagement(
+    engagement_id: UUID,
+    config_path: Path | None = None,
+    operator_mode: OperatorMode | None = None,
+    operator_directives: dict[str, Any] | None = None,
+) -> str:
     """
     Resume an engagement from its last saved checkpoint.
 
@@ -846,6 +943,54 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
     saved_state: AgentState = existing.checkpoint.get("channel_values", {})
     name = saved_state.get("engagement_id", str(engagement_id))
 
+    # --- Approval-gate resume check ---
+    # If the previous run halted waiting for an approval ticket, check its status.
+    # If APPROVED: clear pending state and let execution continue.
+    # If still PENDING or DENIED: raise early so the operator is informed.
+    _pending_ticket_id = saved_state.get("pending_approval_ticket_id")
+    if _pending_ticket_id:
+        try:
+            from pwnpilot.data.approval_store import ApprovalStore as _ApprovalStore
+            from pwnpilot.data.models import ApprovalStatus as _ApprovalStatus
+            _a_store = _ApprovalStore(rt["db_session"] if "db_session" in rt else __import__("pwnpilot.runtime", fromlist=["get_db_session"]).get_db_session(config_path))
+            _tickets = _a_store.load_pending()
+            _ticket = next((t for t in _tickets if str(t.ticket_id) == str(_pending_ticket_id)), None)
+            if _ticket is None:
+                # Not in PENDING — look up any status
+                _approval_service_temp = rt["approval_service"]
+                try:
+                    from uuid import UUID as _UUID
+                    _ticket = _approval_service_temp.get_ticket(_UUID(_pending_ticket_id))
+                except Exception:
+                    _ticket = None
+            if _ticket is not None:
+                if _ticket.status.value if hasattr(_ticket.status, "value") else str(_ticket.status) == "approved":
+                    log.info("runtime.approval_gate_cleared", ticket_id=_pending_ticket_id)
+                    saved_state = dict(saved_state)
+                    saved_state["pending_approval_ticket_id"] = None
+                    saved_state["kill_switch"] = False
+                elif str(_ticket.status.value if hasattr(_ticket.status, "value") else _ticket.status) == "denied":
+                    log.info("runtime.approval_gate_denied", ticket_id=_pending_ticket_id)
+                    saved_state = dict(saved_state)
+                    saved_state["pending_approval_ticket_id"] = None
+                    saved_state["kill_switch"] = False
+                    saved_state["proposed_action"] = None  # let planner re-plan
+                else:
+                    raise ValueError(
+                        f"Engagement {engagement_id} is halted pending approval ticket "
+                        f"{_pending_ticket_id} (status={_ticket.status}). "
+                        f"Run: pwnpilot approve {_pending_ticket_id}"
+                    )
+            else:
+                log.warning("runtime.approval_ticket_not_found", ticket_id=_pending_ticket_id)
+                saved_state = dict(saved_state)
+                saved_state["pending_approval_ticket_id"] = None
+                saved_state["kill_switch"] = False
+        except ValueError:
+            raise
+        except Exception as _ae:
+            log.warning("runtime.approval_check_error", exc=str(_ae))
+
     now = datetime.now(timezone.utc)
     engagement = Engagement(
         engagement_id=engagement_id,
@@ -860,7 +1005,53 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
     eng_svc = EngagementService(engagement)
     policy_engine = PolicyEngine(eng_svc)
 
+    # Enforce authorization on resume.
+    _resume_auth = AuthorizationArtifact(
+        engagement_id=engagement_id,
+        approver_identity="resumed",
+        ticket_reference="resumed",
+        roe_document_hash=saved_state.get("roe_document_hash") or ("0" * 64),
+        valid_from=engagement.valid_from,
+        valid_until=engagement.valid_until,
+        signed_at=engagement.valid_from,
+    )
+    assert_authorized(_resume_auth)
+
+    _tool_runner = rt.get("tool_runner")
+    _adapters = getattr(_tool_runner, "_adapters", None)
+    _shell = _adapters.get("shell") if hasattr(_adapters, "get") else None
+    if _shell is not None and hasattr(_shell, "_permission_context"):
+        _permission_store = rt.get("permission_store")
+        if _permission_store is not None:
+            _shell._permission_context["permission_store"] = _permission_store
+        _shell._permission_context["engagement_id"] = engagement_id
+
     agent_settings = _agent_runtime_settings(rt["typed_cfg"])
+    operator_session = OperatorSessionManager(
+        engagement_id=engagement_id,
+        operator_id=os.environ.get("USER", "operator"),
+        event_bus=rt["event_bus"],
+    )
+    saved_mode_raw = str(saved_state.get("operator_mode", OperatorMode.AUTONOMOUS.value))
+    if operator_mode is not None:
+        operator_session.set_mode(operator_mode)
+    else:
+        try:
+            operator_session.set_mode(OperatorMode(saved_mode_raw))
+        except Exception:
+            operator_session.set_mode(OperatorMode.AUTONOMOUS)
+
+    resume_directives = dict(saved_state.get("operator_directives") or {})
+    if operator_directives:
+        resume_directives.update(operator_directives)
+    if resume_directives:
+        operator_session.submit_directive_from_dict(
+            objective=resume_directives.get("objective"),
+            requested_focus=resume_directives.get("requested_focus"),
+            constraints=resume_directives.get("constraints"),
+            paused_tool_families=resume_directives.get("paused_tool_families"),
+            notes=resume_directives.get("notes"),
+        )
 
     metrics = metrics_registry.get_or_create(thread_id)
     planner = PlannerNode(
@@ -882,6 +1073,8 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         adaptive_cooldown_enabled=agent_settings["adaptive_cooldown_enabled"],
         adaptive_cooldown_max=agent_settings["adaptive_cooldown_max"],
         metrics=metrics,
+        operator_session_manager=operator_session,
+        retrieval_store=rt.get("retrieval_store"),
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -908,6 +1101,8 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         target_family="resumed",
         target_resolver=rt["target_resolver"],
         capability_registry=rt["capability_registry"],
+        event_bus=rt["event_bus"],
+        retrieval_store=rt.get("retrieval_store"),
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -923,17 +1118,20 @@ def resume_engagement(engagement_id: UUID, config_path: Path | None = None) -> s
         compiled_graph=graph,
         kill_switch=rt["kill_switch"],
         checkpointer=checkpointer,
+        operator_session_manager=operator_session,
     )
 
     # Invoke with None: LangGraph resumes from the last checkpoint
     final_state: AgentState | None = None
     runtime_exception: Exception | None = None
     try:
+        _register_engagement_session(thread_id, rt["event_bus"], operator_session)
         final_state = supervisor.run(None, thread_id=thread_id)  # type: ignore[arg-type]
     except Exception as exc:
         runtime_exception = exc
         log.exception("runtime.resume_run_failed", engagement_id=thread_id, exc=str(exc))
     finally:
+        _deregister_engagement_session(thread_id)
         normalized_state = _normalize_terminal_state(
             final_state,
             default_termination_reason=(

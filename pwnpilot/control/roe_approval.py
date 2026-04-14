@@ -223,7 +223,6 @@ class ApprovalWorkflow:
         print(f"\n⏱️  EXECUTION LIMITS:")
         print(f"  Max iterations: {policy.max_iterations}")
         print(f"  Max retries: {policy.max_retries}")
-        print(f"  Timeout (seconds): {policy.timeout_seconds}")
         print(f"  Cloud allowed: {policy.cloud_allowed}")
 
         # Display confidence and warnings

@@ -18,7 +18,6 @@ def _base_state() -> dict:
         "last_reject_reason_fingerprint": None,
         "max_pv_cycles_without_executor": 40,
         "max_consecutive_rejects_per_reason": 12,
-        "max_autonomous_runtime_seconds": 3600,
         "run_started_at_epoch": time.time(),
         "previous_actions": [],
         "operator_mode": "autonomous",
@@ -120,18 +119,6 @@ def test_execution_resets_planner_validator_watchdog_state() -> None:
     assert state.get("planner_validator_cycle_streak") == 0
     assert state.get("reject_reason_streak_count") == 0
     assert state.get("last_reject_reason_fingerprint") is None
-
-
-def test_route_reports_when_runtime_budget_exceeded() -> None:
-    state = {
-        **_base_state(),
-        "run_started_at_epoch": time.time() - 11,
-        "max_autonomous_runtime_seconds": 10,
-    }
-
-    assert _route_after_execution(state) == "report"
-    assert state.get("termination_reason") == "runtime_budget_exceeded"
-    assert state.get("operator_directives", {}).get("supervisor_escalation", {}).get("reason") == "runtime_budget_limit"
 
 
 def test_force_report_routes_immediately() -> None:

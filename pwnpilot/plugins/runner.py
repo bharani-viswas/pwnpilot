@@ -3,8 +3,7 @@ Tool Runner — executes adapter commands in a hardened, isolated subprocess con
 
 Isolation:
 - subprocess.run with explicit list (no shell=True) — ADR-002, ADR-007
-- Process group timeout enforced by SIGKILL
-- Resource limits via resource module (CPU time, memory)
+- Resource limits via resource module (memory)
 - stdout/stderr streamed in 64 KB chunks to evidence store (never buffered in memory)
 - 256 MB evidence size cap per action
 
@@ -48,9 +47,7 @@ from pwnpilot.plugins.sdk import BaseAdapter
 log = structlog.get_logger(__name__)
 
 _CHUNK_SIZE: int = 64 * 1024
-_DEFAULT_CPU_LIMIT: int = 300
 _DEFAULT_MEM_LIMIT: int = 2 * 1024 * 1024 * 1024  # 2 GB
-_DEFAULT_TIMEOUT: int = 300
 
 _MAX_LOG_PREVIEW: int = 2048
 # Maximum total bytes of live-output chunks buffered per action to prevent
@@ -132,11 +129,15 @@ def _classify_outcome(
     ) or "cannot open display" in blob:
         reasons.append(FailureReason.TOOL_MODE_MISMATCH)
 
+    # Auth failure check: only inspect stderr so that 40x responses that appear
+    # in a tool's scan output (e.g. ZAP reporting "403 Forbidden" for a target URL)
+    # do not trigger a false AUTH_FAILURE on the tool itself.
+    stderr_blob = stderr.decode(errors="replace").lower()
     if (
-        "401 unauthorized" in blob
-        or "403 forbidden" in blob
-        or "access denied" in blob
-        or "authentication required" in blob
+        "401 unauthorized" in stderr_blob
+        or "403 forbidden" in stderr_blob
+        or "access denied" in stderr_blob
+        or "authentication required" in stderr_blob
     ):
         reasons.append(FailureReason.AUTH_FAILURE)
 
@@ -171,7 +172,16 @@ def _classify_outcome(
     if unique_reasons:
         return OutcomeStatus.DEGRADED, unique_reasons
 
-    if new_findings_count == 0 and exit_code == 0:
+    # A tool may produce structured output other than vulnerability findings
+    # (e.g. WhatWeb returns services/technologies, nmap returns hosts).
+    # Only mark NO_ACTIONABLE_OUTPUT if the parsed output is genuinely empty.
+    has_structured_output = bool(
+        parsed_output.get("services")
+        or parsed_output.get("hosts")
+        or parsed_output.get("technologies")
+        or parsed_output.get("routes")
+    )
+    if new_findings_count == 0 and exit_code == 0 and not has_structured_output:
         return OutcomeStatus.DEGRADED, [FailureReason.NO_ACTIONABLE_OUTPUT]
 
     return OutcomeStatus.SUCCESS, []
@@ -194,18 +204,16 @@ class ToolRunner:
         adapters: dict[str, BaseAdapter],
         evidence_store: EvidenceStore,
         kill_switch: KillSwitch,
-        cpu_limit: int = _DEFAULT_CPU_LIMIT,
         mem_limit: int = _DEFAULT_MEM_LIMIT,
-        timeout: int = _DEFAULT_TIMEOUT,
+        cpu_limit: int | None = None,
+        timeout: int | None = None,
         max_workers: int = 4,
         event_bus: object | None = None,
     ) -> None:
         self._adapters = adapters
         self._evidence = evidence_store
         self._kill_switch = kill_switch
-        self._cpu_limit = cpu_limit
         self._mem_limit = mem_limit
-        self._timeout = timeout
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._event_bus = event_bus  # ExecutionEventBus | None
 
@@ -443,7 +451,6 @@ class ToolRunner:
 
         def _preexec() -> None:
             try:
-                resource.setrlimit(resource.RLIMIT_CPU, (self._cpu_limit, self._cpu_limit))
                 resource.setrlimit(resource.RLIMIT_AS, (self._mem_limit, self._mem_limit))
             except Exception:
                 pass
@@ -509,16 +516,8 @@ class ToolRunner:
         t_err.start()
 
         timed_out = False
-        t_out.join(timeout=self._timeout)
-        t_err.join(timeout=self._timeout)
-        if t_out.is_alive() or t_err.is_alive():
-            timed_out = True
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            t_out.join()
-            t_err.join()
+        t_out.join()
+        t_err.join()
 
         proc.wait()
         stdout_bytes = b"".join(stdout_buf)

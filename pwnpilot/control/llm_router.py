@@ -246,9 +246,9 @@ MUST return ONLY valid JSON matching PlannerProposal schema:
         raw = self.complete(system, user)
         return self._parse_json(raw, "PlannerProposal")
 
-        def reflect(self, context: dict[str, Any]) -> dict[str, Any]:
-                """Return a corrective pivot-or-terminate decision for reject churn."""
-                system = """You are a stabilization reflector for an autonomous pentest agent.
+    def reflect(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Return a corrective pivot-or-terminate decision for reject churn."""
+        system = """You are a stabilization reflector for an autonomous pentest agent.
 
 Given repeated validator rejects, choose exactly one:
 1) pivot: recommend a different tool family to continue safely, or
@@ -265,8 +265,8 @@ Rules:
     "termination_reason": "reflector_terminate"
 }
 """
-                raw = self.complete(system, json.dumps(context, default=str))
-                return self._parse_json(raw, "ReflectorDecision")
+        raw = self.complete(system, json.dumps(context, default=str))
+        return self._parse_json(raw, "ReflectorDecision")
 
     def _format_tool_schemas(self, schemas: dict[str, Any]) -> str:
         """Format tool schemas into a readable reference section."""

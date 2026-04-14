@@ -66,7 +66,6 @@ The **policy** section defines operational parameters:
 |-----------|-------|---------|-------------|
 | `max_iterations` | 1-1000 | 50 | Maximum agent loop iterations (higher = more thorough) |
 | `max_retries` | 1-10 | 3 | Retry attempts per LLM call (for transient errors) |
-| `timeout_seconds` | 300+ | 3600 | Engagement timeout in seconds (5 min minimum) |
 | `cloud_allowed` | true/false | false | Allow cloud LLM fallback (may incur costs) |
 
 ---
@@ -158,7 +157,6 @@ This whitelists which actions the agent can execute. If an action isn't listed, 
 policy:
   max_iterations: 50
   max_retries: 3
-  timeout_seconds: 3600
   cloud_allowed: false
 ```
 
@@ -184,7 +182,6 @@ scope:
 policy:
   max_iterations: 75
   max_retries: 5
-  timeout_seconds: 7200
   cloud_allowed: false
 ```
 
@@ -275,13 +272,6 @@ policy:
 - **Validation**: Between 1-10
 - **Purpose**: Retry limit for failed LLM calls (handles transient errors)
 
-#### `policy.timeout_seconds`
-- **Type**: Integer (300+)
-- **Required**: No (default: 3600)
-- **Example**: `7200`
-- **Validation**: Minimum 300 seconds (5 minutes)
-- **Purpose**: Engagement timeout (prevents long-running/stuck processes)
-
 #### `policy.cloud_allowed`
 - **Type**: Boolean (true/false)
 - **Required**: No (default: false)
@@ -315,7 +305,6 @@ scope:
 policy:
   max_iterations: 100
   max_retries: 5
-  timeout_seconds: 14400
   cloud_allowed: false
 ```
 
@@ -341,7 +330,6 @@ scope:
 policy:
   max_iterations: 75
   max_retries: 3
-  timeout_seconds: 7200
   cloud_allowed: false
 ```
 
@@ -367,7 +355,6 @@ scope:
 policy:
   max_iterations: 200
   max_retries: 5
-  timeout_seconds: 28800
   cloud_allowed: true
 ```
 
@@ -399,11 +386,7 @@ policy:
 - ✅ **Good**: Authorizer is security lead or CISO (decision authority)
 - ❌ **Bad**: Authorizer is engineer doing the test (conflict of interest)
 
-### 7. Set Appropriate Timeouts
-- ✅ **Good**: 1-2 hours for typical web app, 4+ hours for network pentest
-- ❌ **Bad**: 300 seconds (5 min - insufficient for real testing)
-
-### 8. Validate Before Execution
+### 7. Validate Before Execution
 ```bash
 pwnpilot roe verify my-roe.yaml  # Always validate first!
 ```

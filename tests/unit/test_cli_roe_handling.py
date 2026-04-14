@@ -120,7 +120,6 @@ scope:
 policy:
   max_iterations: 30
   max_retries: 3
-  timeout_seconds: 3600
   cloud_allowed: true
 """
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:

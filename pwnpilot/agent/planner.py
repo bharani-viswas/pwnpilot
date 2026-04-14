@@ -202,6 +202,8 @@ class PlannerNode:
         adaptive_cooldown_max: int = 6,
         metrics: Any | None = None,
         repetition_detector: RepetitionDetector | None = None,
+        operator_session_manager: Any | None = None,
+        retrieval_store: Any | None = None,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
@@ -215,10 +217,21 @@ class PlannerNode:
         self._adaptive_cooldown_max = max(1, int(adaptive_cooldown_max))
         self._metrics = metrics
         self._repetition_detector = repetition_detector or _repetition_detector
+        self._operator_session = operator_session_manager
+        self._retrieval_store = retrieval_store
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
             return state
+
+        # Pull fresh operator directives/messages each planning iteration.
+        if self._operator_session is not None:
+            try:
+                patch = self._operator_session.state_patch()  # type: ignore[attr-defined]
+                if isinstance(patch, dict) and patch:
+                    state = {**state, **patch}
+            except Exception as exc:
+                log.warning("planner.operator_session_patch_failed", exc=str(exc))
 
         _t0 = time.monotonic()
         _input_hash = hashlib.sha256(
@@ -306,8 +319,22 @@ class PlannerNode:
             except Exception:
                 pass
 
-        # v2: Inject retrieval memory context (findings/strategies from persistence)
+        # v2: Inject retrieval memory context — query RetrievalStore for relevant context
         memory_context = state.get("memory_context") or {}
+        if self._retrieval_store is not None:
+            try:
+                engagement_id_str = str(state.get("engagement_id", ""))
+                recon_hint = recon if isinstance(recon, str) else str(recon or "")
+                from uuid import UUID as _UUID
+                retrieved = self._retrieval_store.query(
+                    _UUID(engagement_id_str),
+                    query_text=recon_hint[:500] or "penetration test findings",
+                    top_k=5,
+                )
+                if retrieved:
+                    memory_context = {"retrieved_context": retrieved}
+            except Exception as _re:
+                log.debug("planner.retrieval_query_error", exc=str(_re))
 
         # Build LLM prompt context with findings data
         context = {

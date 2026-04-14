@@ -447,11 +447,6 @@ Configuration is unified: just specify `model_name`, `api_key`, and optional `ap
 
 **Outputs:** Structured action envelope (not free-form text). The envelope parser validates before use.
 
-**Timeouts:** 
-- Primary model timeout: 120s (for local inference)
-- Fallback/cloud timeout: 60s
-- Both configurable via `config.yaml` or environment variables
-
 **Configuration example:**
 
 ```yaml
@@ -466,7 +461,6 @@ llm:
   
   cloud_allowed: true  # Allow fallback if primary fails
   max_retries: 3
-  timeout_seconds: 120
 ```
 
 See `examples/config.example.yaml` for comprehensive configuration examples.
@@ -514,9 +508,8 @@ class BaseAdapter:
 
 **Isolation strategy (v1):**
 - `subprocess.run` with explicit argument list (no `shell=True`).
-- Process group timeout enforced by `SIGKILL`.
 - stdout/stderr are streamed in 64 KB chunks directly to the evidence store (never fully buffered in memory). See §5.8 Evidence Store for the streaming write contract.
-- Resource limits via `resource` module (CPU time, memory).
+- Resource limits via `resource` module (memory).
 
 **Isolation strategy (v1.1 upgrade path):**
 - Rootless Podman containers per invocation.

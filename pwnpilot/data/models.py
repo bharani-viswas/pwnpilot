@@ -420,7 +420,6 @@ class EngagementPolicy(BaseModel):
     restricted_actions: list[str] = Field(default_factory=list)
     max_iterations: int
     max_retries: int
-    timeout_seconds: int
     cloud_allowed: bool
     confidence_score: float = Field(ge=0.0, le=1.0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

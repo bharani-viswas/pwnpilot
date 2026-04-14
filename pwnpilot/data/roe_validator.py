@@ -230,11 +230,6 @@ class Policy(BaseModel):
         le=10,
         description="Maximum retry attempts per LLM call"
     )
-    timeout_seconds: int = Field(
-        default=3600,
-        ge=300,
-        description="Timeout for engagement in seconds (minimum 300 = 5 min)"
-    )
     
     @field_validator('max_iterations', mode='after')
     @classmethod

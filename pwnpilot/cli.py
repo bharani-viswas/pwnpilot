@@ -176,6 +176,13 @@ def cmd_start(
     max_iterations: int = typer.Option(50, "--max-iter", help="Maximum agent loop iterations"),
     config_file: Optional[Path] = typer.Option(None, "--config", help="Config YAML path"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Policy simulation only (no execution)"),
+    guided: bool = typer.Option(False, "--guided", help="Start run in guided operator mode"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="Operator mode: autonomous|guided|monitor|replay (overrides --guided)"),
+    objective: Optional[str] = typer.Option(None, "--objective", help="Initial operator objective for planner guidance"),
+    focus: Optional[str] = typer.Option(None, "--focus", help="Initial operator focus area (e.g. auth endpoints)"),
+    constraint: list[str] = typer.Option([], "--constraint", help="Operator constraint (repeatable)"),
+    pause_tool_family: list[str] = typer.Option([], "--pause-tool-family", help="Temporarily pause a tool family (repeatable)"),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Free-form operator notes for planner context"),
 ) -> None:
     """Start a new engagement with the given scope.
     
@@ -183,6 +190,7 @@ def cmd_start(
     LEGACY: Use --cidr/--domain/--url/--roe-hash for direct scope specification.
     """
     from pwnpilot.runtime import create_and_run_engagement, get_engagement_preflight
+    from pwnpilot.agent.state import OperatorMode
     from pwnpilot.data.roe_validator import validate_roe_file
     from pwnpilot.agent.roe_interpreter import ROEInterpreter
     from pwnpilot.control.roe_approval import ApprovalWorkflow
@@ -363,6 +371,24 @@ def cmd_start(
                 "Consider adding loopback CIDRs or localhost domain scope when appropriate."
             )
 
+    _mode_str = (mode or ("guided" if guided else "autonomous")).lower()
+    try:
+        operator_mode = OperatorMode(_mode_str)
+    except ValueError:
+        console.print(f"[red]Unknown mode {_mode_str!r}. Choose: autonomous, guided, monitor, replay[/red]")
+        raise typer.Exit(code=1)
+    operator_directives: dict[str, object] = {}
+    if objective:
+        operator_directives["objective"] = objective
+    if focus:
+        operator_directives["requested_focus"] = focus
+    if constraint:
+        operator_directives["constraints"] = constraint
+    if pause_tool_family:
+        operator_directives["paused_tool_families"] = pause_tool_family
+    if notes:
+        operator_directives["notes"] = notes
+
     try:
         engagement_id = create_and_run_engagement(
             name=name,
@@ -376,6 +402,8 @@ def cmd_start(
             config_path=config_file,
             dry_run=dry_run,
             event_subscriber=_make_live_output_handler(),
+            operator_mode=operator_mode,
+            operator_directives=operator_directives or None,
         )
         console.print(f"\n[green]Engagement complete:[/green] {engagement_id}")
     except Exception as exc:
@@ -393,13 +421,46 @@ def cmd_start(
 def cmd_resume(
     engagement_id: str = typer.Argument(..., help="Engagement UUID to resume"),
     config_file: Optional[Path] = typer.Option(None, "--config", help="Config YAML path"),
+    guided: bool = typer.Option(False, "--guided", help="Resume in guided operator mode"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="Operator mode override: autonomous|guided|monitor|replay (overrides --guided)"),
+    objective: Optional[str] = typer.Option(None, "--objective", help="Operator objective override for resumed run"),
+    focus: Optional[str] = typer.Option(None, "--focus", help="Operator focus override for resumed run"),
+    constraint: list[str] = typer.Option([], "--constraint", help="Operator constraint (repeatable)"),
+    pause_tool_family: list[str] = typer.Option([], "--pause-tool-family", help="Pause a tool family on resumed run (repeatable)"),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Operator notes override for resumed run"),
 ) -> None:
     """Resume an interrupted engagement from the last LangGraph checkpoint."""
     from pwnpilot.runtime import resume_engagement
+    from pwnpilot.agent.state import OperatorMode
+
+    if mode:
+        try:
+            operator_mode: Optional[OperatorMode] = OperatorMode(mode.lower())
+        except ValueError:
+            console.print(f"[red]Unknown mode {mode!r}. Choose: autonomous, guided, monitor, replay[/red]")
+            raise typer.Exit(code=1)
+    else:
+        operator_mode = OperatorMode.GUIDED if guided else None
+    operator_directives: dict[str, object] = {}
+    if objective:
+        operator_directives["objective"] = objective
+    if focus:
+        operator_directives["requested_focus"] = focus
+    if constraint:
+        operator_directives["constraints"] = constraint
+    if pause_tool_family:
+        operator_directives["paused_tool_families"] = pause_tool_family
+    if notes:
+        operator_directives["notes"] = notes
 
     console.print(f"[bold]Resuming engagement:[/bold] {engagement_id}")
     try:
-        resume_engagement(UUID(engagement_id), config_path=config_file)
+        resume_engagement(
+            UUID(engagement_id),
+            config_path=config_file,
+            operator_mode=operator_mode,
+            operator_directives=operator_directives or None,
+        )
         console.print(f"[green]Resume complete for {engagement_id}")
     except Exception as exc:
         console.print(f"[red]Error: {exc}")
@@ -443,6 +504,27 @@ def cmd_deny(
 
 # ---------------------------------------------------------------------------
 # Report
+
+@app.command("grant-shell")
+def cmd_grant_shell(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    command: str = typer.Argument(..., help="Shell command name to grant (e.g. 'curl')"),
+    operator: str = typer.Option("operator", "--operator", help="Operator identity"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Grant permission to use a shell command not in the default allow-list."""
+    from pwnpilot.runtime import _build_runtime
+    from pwnpilot.data.permission_store import PermissionStore
+
+    rt = _build_runtime(config_file)
+    ps: PermissionStore = rt["permission_store"]
+    ps.grant_permission(UUID(engagement_id), "shell_command", command, granted_by=operator)
+    console.print(f"[green]Granted shell command '{command}' for engagement {engagement_id}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -544,7 +626,21 @@ def cmd_tui(
     """Launch the live Textual TUI dashboard."""
     from pwnpilot.tui.app import run_dashboard
 
-    run_dashboard(engagement_id=engagement_id, refresh_interval=refresh)
+    live_event_bus = None
+    live_operator_session = None
+    if engagement_id:
+        from pwnpilot.runtime import get_engagement_session
+        session = get_engagement_session(engagement_id)
+        if session:
+            live_event_bus = session.get("event_bus")
+            live_operator_session = session.get("operator_session")
+
+    run_dashboard(
+        engagement_id=engagement_id,
+        refresh_interval=refresh,
+        event_bus=live_event_bus,
+        operator_session=live_operator_session,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +1048,89 @@ def cmd_roe_export(
         console.print(f"[green]✓ Audit report exported:[/green] {written}")
     except Exception as exc:
         console.print(f"[red]Error exporting report:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@app.command("retention-apply")
+def cmd_retention_apply(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    classification: str = typer.Option("unknown", "--classification", "-c",
+                                       help="Engagement classification: ctf|lab|web_api|internal|external|iot|unknown"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Apply retention TTL policy to an engagement's evidence and audit data."""
+    from pwnpilot.runtime import _build_runtime
+    from pwnpilot.governance.retention import EngagementClassification
+
+    rt = _build_runtime(config_file)
+    rm = rt["retention_manager"]
+    try:
+        cls = EngagementClassification(classification.lower())
+    except ValueError:
+        valid = [e.value for e in EngagementClassification]
+        console.print(f"[red]Unknown classification {classification!r}. Choose: {valid}[/red]")
+        raise typer.Exit(code=1)
+    rm.apply_ttl(UUID(engagement_id), classification=cls)
+    ttl = rm.ttl_days(cls)
+    console.print(f"[green]✓ Retention TTL applied:[/green] {ttl} days ({classification}) for {engagement_id}")
+
+
+@app.command("retention-hold")
+def cmd_retention_hold(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    holder: str = typer.Option(..., "--holder", help="Identity placing the hold (name or email)"),
+    reason: str = typer.Option(..., "--reason", help="Reason for legal hold"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Place a legal hold on an engagement, preventing data deletion."""
+    from pwnpilot.runtime import _build_runtime
+
+    rt = _build_runtime(config_file)
+    rm = rt["retention_manager"]
+    hold = rm.place_legal_hold(UUID(engagement_id), holder=holder, reason=reason)
+    console.print(f"[green]✓ Legal hold placed by {hold.holder}[/green] on {engagement_id}: {reason}")
+
+
+@app.command("retention-release")
+def cmd_retention_release(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    operator: str = typer.Option("operator", "--operator", help="Operator releasing the hold"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Release a legal hold on an engagement."""
+    from pwnpilot.runtime import _build_runtime
+
+    rt = _build_runtime(config_file)
+    rm = rt["retention_manager"]
+    rm.release_legal_hold(UUID(engagement_id))
+    console.print(f"[green]✓ Legal hold released[/green] for {engagement_id}")
+
+
+@app.command("replay")
+def cmd_replay(
+    engagement_id: str = typer.Argument(..., help="Engagement UUID to build replay snapshot for"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output JSON file (default: replay-{engagement_id}.json)"),
+    config_file: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Build a deterministic ReplaySnapshot from persisted audit data for post-mortem inspection."""
+    import json
+    from pwnpilot.runtime import get_db_session
+    from pwnpilot.data.audit_store import AuditStore
+    from pwnpilot.data.operator_decision_store import OperatorDecisionStore
+    from pwnpilot.services.replay_service import ReplayService
+
+    output_path = output or Path(f"replay-{engagement_id}.json")
+    try:
+        session = get_db_session(config_path=config_file)
+        audit_store = AuditStore(session)
+        decision_store = OperatorDecisionStore(session)
+        svc = ReplayService(audit_store=audit_store, operator_decision_store=decision_store)
+        snapshot = svc.build_snapshot(UUID(engagement_id))
+        snapshot_dict = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else vars(snapshot)
+        output_path.write_text(json.dumps(snapshot_dict, indent=2, default=str))
+        console.print(f"[green]✓ Replay snapshot written:[/green] {output_path}")
+    except Exception as exc:
+        console.print(f"[red]Error building replay snapshot:[/red] {exc}")
         raise typer.Exit(code=1)
 
 

@@ -46,7 +46,6 @@ def valid_roe_dict():
             "cloud_allowed": False,
             "max_iterations": 50,
             "max_retries": 3,
-            "timeout_seconds": 3600,
         },
     }
 
@@ -72,7 +71,6 @@ def complex_roe_dict():
             "cloud_allowed": True,
             "max_iterations": 100,
             "max_retries": 5,
-            "timeout_seconds": 7200,
         },
     }
 
@@ -88,7 +86,6 @@ def mock_litellm_valid_response():
         "restricted_actions": ["MODIFY_DATA", "DELETE_DATA"],
         "max_iterations": 50,
         "max_retries": 3,
-        "timeout_seconds": 3600,
         "cloud_allowed": False,
     }
 
@@ -104,7 +101,6 @@ def mock_litellm_injection_response():
         "restricted_actions": ["MODIFY_DATA", "UNKNOWN_ACTION"],  # Injection attempt
         "max_iterations": 50,
         "max_retries": 3,
-        "timeout_seconds": 3600,
         "cloud_allowed": False,
     }
 
@@ -120,7 +116,6 @@ def mock_litellm_hallucination_response():
         "restricted_actions": ["MODIFY_DATA", "DELETE_DATA"],
         "max_iterations": 200,  # Different from ROE (50)
         "max_retries": 3,
-        "timeout_seconds": 3600,
         "cloud_allowed": False,
     }
 
@@ -149,7 +144,6 @@ class TestROEInterpreterBasics:
             restricted_actions=["MODIFY_DATA"],
             max_iterations=50,
             max_retries=3,
-            timeout_seconds=3600,
             cloud_allowed=False,
         )
         
@@ -168,7 +162,6 @@ class TestROEInterpreterBasics:
             restricted_actions=[],
             max_iterations=50,
             max_retries=3,
-            timeout_seconds=3600,
             cloud_allowed=False,
         )
         
@@ -277,7 +270,6 @@ class TestInjectionDetection:
             "restricted_actions": ["INVALID_ACTION"],
             "max_iterations": 50,
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -342,7 +334,6 @@ class TestHallucinationDetection:
             "restricted_actions": [],
             "max_iterations": 200,  # Wrong
             "max_retries": 3,
-            "timeout_seconds": 5000,  # Wrong
             "cloud_allowed": True,  # Wrong
         }
         
@@ -369,7 +360,6 @@ class TestHallucinationDetection:
             "restricted_actions": [],
             "max_iterations": 2000,  # Out of range [1-1000]
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -403,7 +393,6 @@ class TestConflictDetection:
             "restricted_actions": [],
             "max_iterations": 50,
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -430,7 +419,6 @@ class TestConflictDetection:
             "restricted_actions": [],
             "max_iterations": 5,  # Unusually low
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -495,7 +483,6 @@ class TestConfidenceScoring:
             "restricted_actions": [],
             "max_iterations": 5,  # 1 more conflict
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -552,7 +539,6 @@ class TestEdgeCases:
             "restricted_actions": [],
             "max_iterations": 50,
             "max_retries": 3,
-            "timeout_seconds": 3600,
             "cloud_allowed": False,
         }
         
@@ -579,7 +565,6 @@ class TestEdgeCases:
             "restricted_actions": ["MODIFY_DATA", "DELETE_DATA", "ENCRYPT_DATA"],
             "max_iterations": 100,
             "max_retries": 5,
-            "timeout_seconds": 7200,
             "cloud_allowed": True,
         }
         

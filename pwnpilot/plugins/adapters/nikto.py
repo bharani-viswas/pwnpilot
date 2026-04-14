@@ -2,7 +2,7 @@
 Nikto adapter — web server vulnerability scanner.
 
 Risk class: active_scan
-Input:  target host or URL, port, ssl, maxtime, tuning class
+Input:  target host or URL, port, ssl, tuning class
 Output: list of findings with OSVDB/CVE references
 
 Parses text output from Nikto (lines starting with '+').
@@ -50,13 +50,6 @@ class NiktoAdapter(BaseAdapter):
                     "default": 80,
                 },
                 "ssl": {"type": "boolean", "default": False},
-                "maxtime": {
-                    "type": "integer",
-                    "minimum": 10,
-                    "maximum": 3600,
-                    "default": 300,
-                    "description": "Maximum scan time in seconds",
-                },
                 "tuning": {
                     "type": "string",
                     "default": "x",
@@ -91,12 +84,6 @@ class NiktoAdapter(BaseAdapter):
 
         ssl = bool(params.get("ssl", False))
 
-        maxtime = int(params.get("maxtime", 300))
-        if not 10 <= maxtime <= 3600:
-            raise ValueError(
-                f"nikto: maxtime must be 10–3600 seconds, got {maxtime}"
-            )
-
         tuning = str(params.get("tuning", "x")).lower()
         if not _SAFE_TUNING_RE.match(tuning):
             raise ValueError(f"nikto: invalid tuning options: {tuning!r}")
@@ -106,7 +93,6 @@ class NiktoAdapter(BaseAdapter):
             extra={
                 "port": port,
                 "ssl": ssl,
-                "maxtime": maxtime,
                 "tuning": tuning,
             },
         )
@@ -120,7 +106,6 @@ class NiktoAdapter(BaseAdapter):
             "nikto",
             "-host", params.target,
             "-port", str(params.extra["port"]),
-            "-maxtime", str(params.extra["maxtime"]),
             "-nointeractive",
         ]
         if params.extra.get("ssl"):
