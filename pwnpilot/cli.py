@@ -306,9 +306,8 @@ def cmd_start(
                 
                 try:
                     workflow.display_policies(session.session_id, interpretation_result)
-                    workflow.request_approval(session.session_id)
-                    
                     if not roe_skip_approval:
+                        workflow.request_approval(session.session_id)
                         console.print("\n[bold cyan]Step 3: Verifying sudo password...[/bold cyan]")
                         password = typer.prompt("Sudo password", hide_input=True)
                         approval_record = workflow.approve_policies(
@@ -318,7 +317,7 @@ def cmd_start(
                         )
                         console.print("[green]✓ Approval recorded and sudo verified.[/green]")
                     else:
-                        console.print("[yellow]Skipping sudo verification (admin override).[/yellow]")
+                        console.print("[yellow]Skipping approval prompt and sudo verification (admin override).[/yellow]")
                         approval_record = None
                     
                     # Extract scope from interpreted policy

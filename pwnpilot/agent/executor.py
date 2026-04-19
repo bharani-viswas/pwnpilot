@@ -30,6 +30,13 @@ import structlog
 from pwnpilot.agent.state import AgentState
 from pwnpilot.control.approval import ApprovalService
 from pwnpilot.control.invocation_compiler import InvocationCompiler
+from pwnpilot.control.payload_engine import (
+    classify_reflection_outcome,
+    generate_payload_candidates,
+    mutate_payload,
+    preflight_validate_payload,
+)
+from pwnpilot.control.session_memory import prune_low_value_memory, summarize_tactical_memory
 from pwnpilot.control.target_resolver import TargetResolver
 from pwnpilot.agent.action_validator import ActionValidationError, ActionValidator
 from pwnpilot.data.retrieval_store import RetrievalStore
@@ -599,6 +606,11 @@ class ExecutorNode:
         invocation_compiler: InvocationCompiler | None = None,
         event_bus: object | None = None,
         retrieval_store: Any | None = None,
+        task_tree_store: Any | None = None,
+        payload_cfg: Any | None = None,
+        attack_surface_graph: Any | None = None,
+        memory_summary_every_n_actions: int = 4,
+        memory_prune_keep_last_actions: int = 60,
     ) -> None:
         self._policy = policy_engine
         self._runner = tool_runner
@@ -614,6 +626,11 @@ class ExecutorNode:
         self._invocation_compiler = invocation_compiler or InvocationCompiler()
         self._event_bus = event_bus  # ExecutionEventBus | None
         self._retrieval_store = retrieval_store
+        self._task_tree_store = task_tree_store
+        self._payload_cfg = payload_cfg
+        self._attack_surface_graph = attack_surface_graph
+        self._memory_summary_every_n_actions = max(1, int(memory_summary_every_n_actions))
+        self._memory_prune_keep_last_actions = max(10, int(memory_prune_keep_last_actions))
         # ActionValidator is lazily initialised once the tool_runner adapters are available
         self._action_validator: ActionValidator | None = None
         if hasattr(tool_runner, "_adapters") and tool_runner._adapters:
@@ -736,6 +753,48 @@ class ExecutorNode:
 
         target_for_tool = compile_result.target or target_for_tool
         proposal_params_compiled = compile_result.params if isinstance(compile_result.params, dict) else {}
+
+        # Phase 6C: payload generation + preflight (bounded, policy-safe).
+        payload_generation_mode = "none"
+        mutation_round = 0
+        reflection_summary = ""
+        semantic_outcome_code = "uncertain"
+        generated_payload = None
+        payload_enabled = bool(getattr(self._payload_cfg, "enabled", True))
+        allowed_classes = {
+            str(x).strip().lower() for x in getattr(self._payload_cfg, "allow_classes", ["sqli", "xss"])
+        }
+        if payload_enabled:
+            action_type_guess = str(proposal.action_type or "").strip().lower()
+            vuln_class = str(proposal.params.get("vuln_class", "")).strip().lower()
+            if not vuln_class and proposal.tool_name == "sqlmap":
+                vuln_class = "sqli"
+            if not vuln_class and proposal.tool_name in {"zap", "nuclei"} and action_type_guess == "exploit":
+                vuln_class = "xss"
+            if vuln_class in allowed_classes and action_type_guess in {"exploit", "active_scan"}:
+                candidates = generate_payload_candidates(
+                    vuln_class=vuln_class,
+                    target=target_for_tool,
+                    previous_payloads=list(state.get("generated_payloads", []) or []),
+                    max_candidates=int(getattr(self._payload_cfg, "max_candidates", 4)),
+                )
+                if candidates:
+                    candidate = candidates[0]
+                    ok, reason = preflight_validate_payload(
+                        payload=str(candidate.get("payload", "")),
+                        vuln_class=vuln_class,
+                        roe_disallow_patterns=[],
+                    )
+                    if ok:
+                        generated_payload = str(candidate.get("payload", ""))
+                        proposal_params_compiled = {
+                            **proposal_params_compiled,
+                            "payload": generated_payload,
+                            "payload_vuln_class": vuln_class,
+                        }
+                        payload_generation_mode = "generated_template"
+                    else:
+                        payload_generation_mode = f"preflight_rejected:{reason}"
 
         # Construct typed ActionRequest
         try:
@@ -1120,6 +1179,21 @@ class ExecutorNode:
             if hasattr(result.outcome_status, "value")
             else str(result.outcome_status)
         )
+        semantic_outcome_code = classify_reflection_outcome(
+            stdout=str(result.parsed_output),
+            stderr="",
+            exit_code=int(result.exit_code or 0),
+        )
+        reflection_summary = f"semantic_outcome={semantic_outcome_code}"
+        max_mutation_rounds = int(getattr(self._payload_cfg, "max_mutation_rounds", 3)) if self._payload_cfg is not None else 3
+        if payload_generation_mode.startswith("generated_template") and semantic_outcome_code in {
+            "syntax_mismatch",
+            "likely_blocked_by_waf",
+        } and max_mutation_rounds > 0:
+            mutation_round = 1
+            if generated_payload:
+                mutated = mutate_payload(generated_payload, round_idx=mutation_round)
+                reflection_summary = f"semantic_outcome={semantic_outcome_code}; mutated_payload_preview={mutated[:80]}"
         exploit_signal_score, confirmation_candidate_count = _score_exploitation_progress(result.parsed_output)
         action_type_value = action.action_type.value if hasattr(action.action_type, "value") else str(action.action_type)
         recon_progress = bool(has_structured_output) and action_type_value in {"recon_passive", "active_scan"}
@@ -1297,6 +1371,10 @@ class ExecutorNode:
                 "requires_followup_validation": bool(
                     confirmation_candidate_count > 0 or exploit_signal_score > 0
                 ),
+                "semantic_outcome_code": semantic_outcome_code,
+                "reflection_summary": reflection_summary,
+                "payload_generation_mode": payload_generation_mode,
+                "mutation_round": mutation_round,
                 "objective_tags": objective_tags,
                 "objective_low_value": bool(low_value_only and not finding_progress),
                 "parser_confidence": result.parser_confidence,
@@ -1333,6 +1411,49 @@ class ExecutorNode:
                     self._metrics.record_timeout()
                 if error_class == "PARSE_ERROR":
                     self._metrics.record_parser_error()
+
+        # Phase 6D: update attack-surface graph snapshot from execution output.
+        graph_snapshot: dict[str, Any] = {}
+        if self._attack_surface_graph is not None:
+            try:
+                findings_for_graph = result.parsed_output.get("findings", []) if isinstance(result.parsed_output, dict) else []
+                self._attack_surface_graph.update_from_execution(
+                    engagement_id=str(engagement_id),
+                    parsed_output=result.parsed_output,
+                    findings=findings_for_graph,
+                )
+                graph_snapshot = self._attack_surface_graph.snapshot(str(engagement_id))
+            except Exception as graph_exc:
+                log.debug("executor.attack_surface_graph_error", exc=str(graph_exc))
+
+        # Phase 6B: maintain strategic task tree memory.
+        memory_write_refs: list[str] = []
+        if self._task_tree_store is not None:
+            try:
+                objectives = list(state.get("assessment_objectives", []) or [])
+                if objectives:
+                    top_obj = objectives[0] if isinstance(objectives[0], dict) else {}
+                    node_id = self._task_tree_store.create_node(
+                        engagement_id=engagement_id,
+                        objective_id=str(top_obj.get("id", "objective-0")),
+                        tactic=str(top_obj.get("objective_class", "generic")),
+                        target_asset=str(target_for_tool),
+                        current_hypothesis=str(proposal.rationale),
+                        confidence=0.65 if outcome_status_value == "success" else 0.45,
+                        supporting_evidence_ids=run_evidence_ids,
+                    )
+                    memory_write_refs.append(node_id)
+                    if outcome_status_value == "success":
+                        self._task_tree_store.advance_node(
+                            node_id=node_id,
+                            new_state="in_progress",
+                            confidence=0.72,
+                            supporting_evidence_ids=run_evidence_ids,
+                        )
+                    elif semantic_outcome_code in {"no_attack_surface", "syntax_mismatch"}:
+                        self._task_tree_store.invalidate_node(node_id, reason=semantic_outcome_code)
+            except Exception as task_exc:
+                log.debug("executor.task_tree_write_error", exc=str(task_exc))
 
         self._audit_event(
             state,
@@ -1423,6 +1544,16 @@ class ExecutorNode:
         # the readiness policy's min_evidence_artifacts gate counts them correctly.
         updated_evidence_ids = list(state.get("evidence_ids") or []) + run_evidence_ids
 
+        should_refresh_tactical_summary = (
+            len(previous) % self._memory_summary_every_n_actions == 0
+            or "tactical_summary" not in dict(state.get("memory_context", {}) or {})
+        )
+        tactical_summary = (
+            summarize_tactical_memory(previous)
+            if should_refresh_tactical_summary
+            else dict(state.get("memory_context", {}) or {}).get("tactical_summary", {})
+        )
+
         output = {
             **state,
             "last_result": result.model_dump(mode="json"),
@@ -1436,13 +1567,28 @@ class ExecutorNode:
             "assessment_objectives": assessment_objectives,
             "objective_progress": objective_progress,
             "depth_metrics": depth_metrics,
+            "memory_context": {
+                **dict(state.get("memory_context", {}) or {}),
+                "tactical_summary": tactical_summary,
+                "memory_write_refs": memory_write_refs,
+            },
+            "attack_surface_graph": graph_snapshot,
             "last_execution_hints": execution_hints,
+            "generated_payloads": (
+                list(state.get("generated_payloads", []) or [])
+                + ([generated_payload] if generated_payload else [])
+            )[-30:],
             # Clear active action fields after completion
             "active_action_id": None,
             "active_tool_name": None,
             "active_tool_command": None,
             "error": None,
         }
+
+        output["previous_actions"] = prune_low_value_memory(
+            output.get("previous_actions", []),
+            keep_last=self._memory_prune_keep_last_actions,
+        )
 
         # Emit recovery hints for planner consumption
         for hint in execution_hints:

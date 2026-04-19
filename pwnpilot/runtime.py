@@ -40,6 +40,10 @@ from pwnpilot.data.approval_store import ApprovalStore
 from pwnpilot.control.engagement import EngagementService
 from pwnpilot.control.embedding_router import EmbeddingRouter
 from pwnpilot.control.llm_router import LLMRouter
+from pwnpilot.control.attack_surface_graph import AttackSurfaceGraphStore
+from pwnpilot.control.policy_prior import PolicyPriorScorer
+from pwnpilot.control.rag_retriever import build_rag_retriever
+from pwnpilot.control.specialist_router import SpecialistRouter
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.audit_store import AuditStore
 from pwnpilot.data.evidence_store import EvidenceStore
@@ -211,6 +215,25 @@ def _agent_runtime_settings(typed_cfg: Any) -> dict[str, Any]:
     }
 
 
+def _memory_runtime_settings(typed_cfg: Any) -> dict[str, int]:
+    memory_cfg = getattr(typed_cfg, "memory", None)
+    return {
+        "task_tree_max_open_nodes": int(getattr(memory_cfg, "task_tree_max_open_nodes", 20)),
+        "summarize_every_n_actions": int(getattr(memory_cfg, "summarize_every_n_actions", 4)),
+        "prune_keep_last_actions": int(getattr(memory_cfg, "prune_keep_last_actions", 60)),
+    }
+
+
+def _payload_runtime_settings(typed_cfg: Any) -> dict[str, Any]:
+    payload_cfg = getattr(typed_cfg, "payload", None)
+    return {
+        "enabled": bool(getattr(payload_cfg, "enabled", True)),
+        "allow_classes": list(getattr(payload_cfg, "allow_classes", ["sqli", "xss"])),
+        "max_candidates": int(getattr(payload_cfg, "max_candidates", 4)),
+        "max_mutation_rounds": int(getattr(payload_cfg, "max_mutation_rounds", 3)),
+    }
+
+
 def _emit_terminal_lifecycle_events(
     audit_store: AuditStore,
     engagement_id: UUID,
@@ -248,6 +271,26 @@ def _emit_terminal_lifecycle_events(
         log.error("runtime.terminal_event_write_failed", exc=str(exc), event_type=engagement_event)
 
     if report_complete:
+        try:
+            audit_store.append(
+                engagement_id=engagement_id,
+                actor="system",
+                event_type="ReportGenerationSucceeded",
+                payload={
+                    "engagement_id": str(engagement_id),
+                    "bundle_path": _normalize_optional_text(state.get("report_bundle_path")),
+                    "summary_path": _normalize_optional_text(state.get("report_summary_path")),
+                    "completion_state": completion_state,
+                },
+            )
+            log.info(
+                "runtime.report_generation_succeeded",
+                engagement_id=str(engagement_id),
+                bundle_path=_normalize_optional_text(state.get("report_bundle_path")),
+                summary_path=_normalize_optional_text(state.get("report_summary_path")),
+            )
+        except Exception as exc:
+            log.error("runtime.report_success_event_write_failed", exc=str(exc))
         return
 
     try:
@@ -663,6 +706,8 @@ def _build_runtime(
     permission_store = PermissionStore(session)
     from pwnpilot.data.retrieval_store import RetrievalStore
     retrieval_store = RetrievalStore(session)
+    from pwnpilot.data.task_tree_store import TaskTreeStore
+    task_tree_store = TaskTreeStore(session)
     correlation_engine = CorrelationEngine(finding_store, recon_store)
     retention_manager = RetentionManager(evidence_store, audit_store)
     from pwnpilot.data.operator_decision_store import OperatorDecisionStore
@@ -750,6 +795,16 @@ def _build_runtime(
     planner_available_tools = capability_registry.filter_runtime_compatible(planner_available_tools)
     planner_tools_catalog = _filter_tools_catalog(full_tools_catalog, planner_available_tools)
     target_resolver = TargetResolver()
+    attack_surface_graph = AttackSurfaceGraphStore()
+    specialist_router = (
+        SpecialistRouter()
+        if bool(getattr(getattr(typed_cfg, "specialists", None), "enabled", True))
+        else None
+    )
+    policy_prior = PolicyPriorScorer(
+        enabled=bool(getattr(getattr(typed_cfg, "learning", None), "enabled", False)),
+        policy_file=str(getattr(getattr(typed_cfg, "learning", None), "policy_file", "")),
+    )
 
     # LLM router — unified multi-provider support via LiteLLM
     redactor = Redactor()
@@ -780,6 +835,13 @@ def _build_runtime(
         max_retries=typed_cfg.embedding.max_retries,
     )
 
+    # RAG retriever — dual-mode ATT&CK + engagement history retrieval
+    rag_retriever = build_rag_retriever(
+        rag_cfg=typed_cfg.rag,
+        retrieval_store=retrieval_store,
+        embedding_router=embedding_router if typed_cfg.rag.mode in {"embedding", "hybrid"} else None,
+    )
+
     # Approval service — wired to DB for crash durability, v2 decisions recorded
     approval_store = ApprovalStore(session)
     approval_service = ApprovalService(
@@ -805,6 +867,8 @@ def _build_runtime(
         "recon_store": recon_store,
         "finding_store": finding_store,
         "retrieval_store": retrieval_store,
+        "task_tree_store": task_tree_store,
+        "rag_retriever": rag_retriever,
         "correlation_engine": correlation_engine,
         "retention_manager": retention_manager,
         "permission_store": permission_store,
@@ -818,6 +882,9 @@ def _build_runtime(
         "planner_tools_catalog": planner_tools_catalog,
         "capability_registry": capability_registry,
         "target_resolver": target_resolver,
+        "attack_surface_graph": attack_surface_graph,
+        "specialist_router": specialist_router,
+        "policy_prior": policy_prior,
         "runtime_mode": runtime_mode,
         "has_display": has_display,
         "llm_router": llm_router,
@@ -926,6 +993,8 @@ def create_and_run_engagement(
 
     # Build agent nodes
     agent_settings = _agent_runtime_settings(rt["typed_cfg"])
+    memory_settings = _memory_runtime_settings(rt["typed_cfg"])
+    payload_settings = _payload_runtime_settings(rt["typed_cfg"])
     engagement_summary = {
         "engagement_id": str(engagement.engagement_id),
         "name": name,
@@ -967,6 +1036,12 @@ def create_and_run_engagement(
         metrics=metrics,
         operator_session_manager=operator_session,
         retrieval_store=rt.get("retrieval_store"),
+        rag_retriever=rt.get("rag_retriever"),
+        task_tree_store=rt.get("task_tree_store"),
+        specialist_router=rt.get("specialist_router"),
+        policy_prior=rt.get("policy_prior"),
+        task_tree_context_limit=memory_settings["task_tree_max_open_nodes"],
+        tactical_memory_window=max(6, memory_settings["summarize_every_n_actions"] * 3),
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -996,6 +1071,11 @@ def create_and_run_engagement(
         capability_registry=rt["capability_registry"],
         event_bus=rt["event_bus"],
         retrieval_store=rt.get("retrieval_store"),
+        task_tree_store=rt.get("task_tree_store"),
+        payload_cfg=payload_settings,
+        attack_surface_graph=rt.get("attack_surface_graph"),
+        memory_summary_every_n_actions=memory_settings["summarize_every_n_actions"],
+        memory_prune_keep_last_actions=memory_settings["prune_keep_last_actions"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1224,6 +1304,8 @@ def resume_engagement(
         _shell._permission_context["engagement_id"] = engagement_id
 
     agent_settings = _agent_runtime_settings(rt["typed_cfg"])
+    memory_settings = _memory_runtime_settings(rt["typed_cfg"])
+    payload_settings = _payload_runtime_settings(rt["typed_cfg"])
     operator_session = OperatorSessionManager(
         engagement_id=engagement_id,
         operator_id=os.environ.get("USER", "operator"),
@@ -1268,6 +1350,12 @@ def resume_engagement(
         metrics=metrics,
         operator_session_manager=operator_session,
         retrieval_store=rt.get("retrieval_store"),
+        rag_retriever=rt.get("rag_retriever"),
+        task_tree_store=rt.get("task_tree_store"),
+        specialist_router=rt.get("specialist_router"),
+        policy_prior=rt.get("policy_prior"),
+        task_tree_context_limit=memory_settings["task_tree_max_open_nodes"],
+        tactical_memory_window=max(6, memory_settings["summarize_every_n_actions"] * 3),
     )
     validator = ValidatorNode(
         llm_router=rt["llm_router"],
@@ -1296,6 +1384,11 @@ def resume_engagement(
         capability_registry=rt["capability_registry"],
         event_bus=rt["event_bus"],
         retrieval_store=rt.get("retrieval_store"),
+        task_tree_store=rt.get("task_tree_store"),
+        payload_cfg=payload_settings,
+        attack_surface_graph=rt.get("attack_surface_graph"),
+        memory_summary_every_n_actions=memory_settings["summarize_every_n_actions"],
+        memory_prune_keep_last_actions=memory_settings["prune_keep_last_actions"],
     )
     output_dir = Path(rt["typed_cfg"].storage.report_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

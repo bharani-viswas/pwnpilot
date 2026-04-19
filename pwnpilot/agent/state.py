@@ -86,6 +86,8 @@ class AgentState(TypedDict, total=False):
     assessment_objectives: list[dict[str, Any]]
     objective_progress: dict[str, Any]
     depth_metrics: dict[str, Any]
+    attack_surface_graph: dict[str, Any]
+    generated_payloads: list[str]
 
     # -----------------------------------------------------------------------
     # Repetition detection
@@ -121,6 +123,8 @@ class AgentState(TypedDict, total=False):
     kill_switch: bool
     force_report: bool
     report_complete: bool
+    report_bundle_path: str | None
+    report_summary_path: str | None
     report_trigger_reason: str | None
     stall_state: str
     termination_reason: str | None
@@ -175,6 +179,8 @@ def make_initial_state(
         assessment_objectives=[],
         objective_progress={},
         depth_metrics={},
+        attack_surface_graph={},
+        generated_payloads=[],
         repeated_action_count=0,
         last_repeated_action_key=None,
         previous_actions=[],
@@ -188,6 +194,8 @@ def make_initial_state(
         kill_switch=False,
         force_report=False,
         report_complete=False,
+        report_bundle_path=None,
+        report_summary_path=None,
         report_trigger_reason=None,
         stall_state="ok",
         termination_reason=None,

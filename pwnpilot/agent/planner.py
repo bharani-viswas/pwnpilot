@@ -76,6 +76,12 @@ _OBJECTIVE_TOOL_CANDIDATES: dict[str, tuple[str, ...]] = {
     "generic": ("nuclei", "zap", "nikto", "sqlmap"),
 }
 
+_SPECIALIST_TOOL_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "recon": ("nmap", "whatweb", "nuclei", "nikto", "gobuster"),
+    "injection": ("sqlmap", "zap", "nuclei"),
+    "auth_session": ("zap", "nuclei", "sqlmap"),
+}
+
 _SCAN_CHURN_HINT_CODES = frozenset({
     "wildcard_detected",
     "no_forms_detected",
@@ -303,6 +309,12 @@ class PlannerNode:
         repetition_detector: RepetitionDetector | None = None,
         operator_session_manager: Any | None = None,
         retrieval_store: Any | None = None,
+        rag_retriever: Any | None = None,
+        task_tree_store: Any | None = None,
+        specialist_router: Any | None = None,
+        policy_prior: Any | None = None,
+        task_tree_context_limit: int = 8,
+        tactical_memory_window: int = 12,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
@@ -318,6 +330,12 @@ class PlannerNode:
         self._repetition_detector = repetition_detector or _repetition_detector
         self._operator_session = operator_session_manager
         self._retrieval_store = retrieval_store
+        self._rag_retriever = rag_retriever
+        self._task_tree_store = task_tree_store
+        self._specialist_router = specialist_router
+        self._policy_prior = policy_prior
+        self._task_tree_context_limit = max(1, int(task_tree_context_limit))
+        self._tactical_memory_window = max(1, int(tactical_memory_window))
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -435,6 +453,91 @@ class PlannerNode:
             except Exception as _re:
                 log.debug("planner.retrieval_query_error", exc=str(_re))
 
+        # RAG context — ATT&CK knowledge base + engagement history via RagRetriever
+        rag_context: list[dict] = []
+        if self._rag_retriever is not None:
+            try:
+                from uuid import UUID as _UUID2
+                engagement_id_str = str(state.get("engagement_id", ""))
+                recon_hint = recon if isinstance(recon, str) else str(recon or "")
+                if self._audit:
+                    try:
+                        self._audit.append(
+                            engagement_id=_UUID2(engagement_id_str),
+                            actor="planner",
+                            event_type="rag.retrieve.started",
+                            payload={"query": recon_hint[:200]},
+                        )
+                    except Exception:
+                        pass
+                eng_uuid: _UUID2 | None = None
+                try:
+                    eng_uuid = _UUID2(engagement_id_str)
+                except (ValueError, TypeError):
+                    pass
+                rag_context = self._rag_retriever.retrieve(
+                    query_text=recon_hint[:500] or "penetration test attack techniques",
+                    engagement_id=eng_uuid,
+                )
+                if self._audit:
+                    try:
+                        self._audit.append(
+                            engagement_id=_UUID2(engagement_id_str),
+                            actor="planner",
+                            event_type="rag.retrieve.completed",
+                            payload={
+                                "result_count": len(rag_context),
+                                "top_technique": rag_context[0].get("technique_id") if rag_context else None,
+                                "top_confidence": rag_context[0].get("confidence") if rag_context else None,
+                            },
+                        )
+                        if not rag_context:
+                            self._audit.append(
+                                engagement_id=_UUID2(engagement_id_str),
+                                actor="planner",
+                                event_type="rag.retrieve.fallback",
+                                payload={"reason": "empty_result", "fallback": "legacy_memory_context"},
+                            )
+                    except Exception:
+                        pass
+            except Exception as _rag_err:
+                log.debug("planner.rag_retrieval_error", exc=str(_rag_err))
+                if self._audit:
+                    try:
+                        from uuid import UUID as _UUID3
+                        self._audit.append(
+                            engagement_id=_UUID3(str(state.get("engagement_id", ""))),
+                            actor="planner",
+                            event_type="rag.retrieve.error",
+                            payload={"error": str(_rag_err)},
+                        )
+                    except Exception:
+                        pass
+
+        # Phase 6B: strategic task-tree memory context
+        task_tree_context: dict[str, Any] = {}
+        if self._task_tree_store is not None:
+            try:
+                from uuid import UUID as _UUID4
+                task_tree_context = self._task_tree_store.summarize_for_planner(
+                    _UUID4(str(state.get("engagement_id", ""))),
+                    limit=self._task_tree_context_limit,
+                )
+            except Exception as task_exc:
+                log.debug("planner.task_tree_summary_error", exc=str(task_exc))
+
+        # Phase 6B: tactical rolling memory summary
+        tactical_memory: dict[str, Any] = {}
+        try:
+            from pwnpilot.control.session_memory import summarize_tactical_memory
+
+            tactical_memory = summarize_tactical_memory(
+                previous_actions=previous,
+                max_items=self._tactical_memory_window,
+            )
+        except Exception:
+            tactical_memory = {}
+
         # Build LLM prompt context with findings data
         context = {
             "engagement": self._engagement,
@@ -453,13 +556,40 @@ class PlannerNode:
         if operator_context:
             context["operator_guidance"] = operator_context
 
-        # Inject retrieval memory context
+        # Inject retrieval memory context (backward compat — legacy key)
         if memory_context:
             context["memory_context"] = memory_context
+
+        # Inject RAG context (preferred key — ATT&CK + engagement history)
+        if rag_context:
+            context["rag_context"] = rag_context
+
+        if task_tree_context:
+            context["task_tree_context"] = task_tree_context
+
+        if tactical_memory:
+            context["tactical_memory"] = tactical_memory
 
         objective_focus = self._current_objective_focus(state)
         if objective_focus:
             context["objective_focus"] = objective_focus
+
+        # Phase 6D: specialist routing hint
+        specialist_decision: dict[str, Any] = {}
+        if self._specialist_router is not None:
+            try:
+                graph_snapshot = (state.get("attack_surface_graph") or {}) if isinstance(state, dict) else {}
+                specialist_decision = self._specialist_router.select_profile(
+                    graph_snapshot=graph_snapshot,
+                    objective_focus=objective_focus,
+                    rag_context=rag_context,
+                )
+                if specialist_decision:
+                    context["specialist_guidance"] = specialist_decision
+            except Exception as spec_exc:
+                log.debug("planner.specialist_router_error", exc=str(spec_exc))
+
+        specialist_profile = str(specialist_decision.get("specialist_profile", "")).strip().lower()
         
         # Extract canonical tool parameter schemas for LLM (NEW: Schema guidance for accurate params)
         if self._tools_catalog:
@@ -617,6 +747,38 @@ class PlannerNode:
                     f"Switched from '{proposed_tool}' because it recently failed as unavailable.",
                 )
 
+        # Phase 6D: specialist-guided pivot (behavioral, not just metadata)
+        # If specialist profile is known and current proposal does not align,
+        # try a deterministic in-family fallback to reduce low-value churn.
+        if specialist_profile in _SPECIALIST_TOOL_CANDIDATES:
+            specialist_candidates = list(_SPECIALIST_TOOL_CANDIDATES.get(specialist_profile, ()))
+            current_tool = str(raw_proposal.get("tool_name", "")).strip()
+            if current_tool and current_tool not in specialist_candidates:
+                specialist_tool = self._select_fallback_tool(
+                    blocked_tool=current_tool,
+                    cooldown_map=cooldown_map,
+                    target=str(raw_proposal.get("target", "")),
+                    action_type=str(raw_proposal.get("action_type", "")),
+                    previous=previous,
+                    candidate_tools=specialist_candidates,
+                    blocked_families=blocked_families,
+                )
+                if specialist_tool and specialist_tool != current_tool:
+                    raw_proposal = self._rebuild_fallback_proposal(
+                        raw_proposal,
+                        specialist_tool,
+                        (
+                            f"Specialist router selected '{specialist_profile}' profile; "
+                            f"pivoting tool from '{current_tool}' to '{specialist_tool}'."
+                        ),
+                    )
+                    log.info(
+                        "planner.specialist_pivot",
+                        specialist_profile=specialist_profile,
+                        from_tool=current_tool,
+                        to_tool=specialist_tool,
+                    )
+
         # Guardrail for prolonged validator reject churn: force a tool pivot.
         # This prevents planner/validator deadlocks where the loop keeps proposing
         # semantically similar low-value actions.
@@ -711,6 +873,38 @@ class PlannerNode:
         # Normalize params before proposal validation.
         proposal_tool = str(raw_proposal.get("tool_name", "")).strip()
         proposal_params = raw_proposal.get("params")
+
+        # Phase 6A/6D/6E proposal metadata enrichment.
+        technique_ids = [
+            str(item.get("technique_id", "")).strip()
+            for item in rag_context
+            if isinstance(item, dict) and str(item.get("technique_id", "")).strip()
+        ]
+        raw_proposal["attack_technique_ids"] = technique_ids[:5]
+        raw_proposal["retrieval_sources"] = sorted(
+            {
+                str(item.get("source", "")).strip()
+                for item in rag_context
+                if isinstance(item, dict) and str(item.get("source", "")).strip()
+            }
+        )
+        if rag_context:
+            top_conf = max(
+                float(item.get("confidence", 0.0) or 0.0)
+                for item in rag_context
+                if isinstance(item, dict)
+            )
+            raw_proposal["retrieval_confidence"] = round(top_conf, 4)
+        if specialist_decision:
+            raw_proposal["specialist_profile"] = str(
+                specialist_decision.get("specialist_profile", "")
+            ).strip() or None
+        if self._policy_prior is not None:
+            try:
+                raw_proposal["policy_prior_score"] = float(self._policy_prior.score(raw_proposal, state))
+            except Exception:
+                raw_proposal["policy_prior_score"] = None
+
         if isinstance(proposal_params, dict):
             raw_proposal["params"] = self._sanitize_tool_params(proposal_tool, proposal_params)
         else:

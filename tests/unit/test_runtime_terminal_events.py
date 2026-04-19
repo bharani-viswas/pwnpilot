@@ -45,10 +45,14 @@ def test_emit_completed_and_no_report_failure_when_report_complete() -> None:
         {
             "report_complete": True,
             "termination_reason": "convergence",
+            "report_bundle_path": "reports/report_test.json",
+            "report_summary_path": "reports/report_test.md",
         },
     )
 
     assert store.events[0][0] == "EngagementCompleted"
+    assert store.events[1][0] == "ReportGenerationSucceeded"
+    assert store.events[1][1]["bundle_path"] == "reports/report_test.json"
     assert all(event_type != "ReportGenerationFailed" for event_type, _ in store.events)
 
 

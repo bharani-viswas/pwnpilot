@@ -312,6 +312,11 @@ class PlannerProposal(BaseModel):
     tool_name: str
     target: str
     strategy_step_id: str | None = None
+    attack_technique_ids: list[str] = Field(default_factory=list)
+    retrieval_sources: list[str] = Field(default_factory=list)
+    retrieval_confidence: float | None = None
+    specialist_profile: str | None = None
+    policy_prior_score: float | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     rationale: str
     estimated_risk: RiskLevel

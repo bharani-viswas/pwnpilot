@@ -120,6 +120,8 @@ class ReporterNode:
         output = {
             **state,
             "report_complete": True,
+            "report_bundle_path": str(bundle_path),
+            "report_summary_path": str(summary_path),
             "run_verdict": run_metadata["run_verdict"],
             "readiness_gate_results": run_metadata["readiness_gate_results"],
             "degradation_reasons": run_metadata["degradation_reasons"],

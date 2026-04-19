@@ -124,6 +124,71 @@ embedding:
   timeout_seconds: 30
 
 # =============================================================================
+# RAG (RETRIEVAL-AUGMENTED GENERATION) CONFIGURATION
+# =============================================================================
+rag:
+  # Enable or disable RAG enrichment for the planner.
+  # When disabled, the planner receives no ATT&CK or historical context.
+  enabled: true
+
+  # Retrieval mode:
+  #   "lexical"   — TF-IDF keyword matching (default, no embedding model required)
+  #   "embedding" — Cosine similarity via EmbeddingRouter (requires embedding config)
+  #   "hybrid"    — RRF-merged lexical + embedding results (best quality)
+  mode: "lexical"
+
+  # Maximum number of retrieval results per planner query
+  top_k: 5
+
+  # Minimum normalised confidence score to include a result (0.0 - 1.0)
+  min_confidence: 0.01
+
+  # Path to MITRE ATT&CK STIX 2.1 JSON bundle.
+  # Leave empty to use the bundled default (pwnpilot/data/attack_enterprise_v16.json).
+  # Download the latest bundle from: https://github.com/mitre/cti
+  # Example: "/opt/pwnpilot/attack_enterprise_v16.json"
+  attack_stix_path: ""
+
+  # Also search per-engagement finding history (in addition to ATT&CK KB)
+  enable_internal_history: true
+
+# =============================================================================
+# MEMORY (PHASE 6B) CONFIGURATION
+# =============================================================================
+memory:
+  enabled: true
+  summarize_every_n_actions: 4
+  prune_keep_last_actions: 60
+  task_tree_max_open_nodes: 20
+
+# =============================================================================
+# PAYLOAD ENGINE (PHASE 6C) CONFIGURATION
+# =============================================================================
+payload:
+  enabled: true
+  allow_classes:
+    - "sqli"
+    - "xss"
+  max_candidates: 4
+  max_mutation_rounds: 3
+
+# =============================================================================
+# SPECIALIST ROUTER (PHASE 6D) CONFIGURATION
+# =============================================================================
+specialists:
+  enabled: true
+  default_profile: "recon"
+  per_specialist_budget: 3
+
+# =============================================================================
+# LEARNING ADVISORY (PHASE 6E) CONFIGURATION
+# =============================================================================
+learning:
+  enabled: false
+  advisory_only: true
+  policy_file: ""
+
+# =============================================================================
 # TOOLS CONFIGURATION — Resource Limits & Plugin Discovery
 # =============================================================================
 tools:

@@ -187,6 +187,109 @@ class EmbeddingConfig(BaseModel):
         return self.fallback_model_name
 
 
+class RAGConfig(BaseModel):
+    """
+    Configuration for the Retrieval-Augmented Generation (RAG) subsystem.
+
+    Controls ATT&CK knowledge base ingestion, retrieval mode, and feature gating.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable RAG retrieval for planner context enrichment.",
+    )
+    mode: str = Field(
+        default="lexical",
+        description=(
+            "Retrieval mode: 'lexical' (TF-IDF, default), "
+            "'embedding' (cosine similarity via EmbeddingRouter), "
+            "or 'hybrid' (RRF-merged lexical + embedding)."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Maximum number of results to retrieve per query.",
+    )
+    min_confidence: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=1.0,
+        description="Minimum normalised confidence score to include a result.",
+    )
+    attack_stix_path: str = Field(
+        default="",
+        description=(
+            "Path to MITRE ATT&CK STIX 2.1 JSON bundle. "
+            "Leave empty to use the bundled default (data/attack_enterprise_v16.json). "
+            "Download from https://github.com/mitre/cti"
+        ),
+    )
+    enable_internal_history: bool = Field(
+        default=True,
+        description=(
+            "Also search per-engagement finding history (RetrievalStore) "
+            "in addition to ATT&CK knowledge base."
+        ),
+    )
+
+
+class MemoryConfig(BaseModel):
+    """Phase 6B memory controls for tactical + strategic persistence."""
+
+    enabled: bool = Field(default=True, description="Enable session memory and task-tree enrichment.")
+    summarize_every_n_actions: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        description="Summarize tactical memory every N executed actions.",
+    )
+    prune_keep_last_actions: int = Field(
+        default=60,
+        ge=10,
+        le=1000,
+        description="Keep this many most-recent actions before low-value pruning.",
+    )
+    task_tree_max_open_nodes: int = Field(
+        default=20,
+        ge=5,
+        le=200,
+        description="Max open task-tree nodes injected into planner context.",
+    )
+
+
+class PayloadConfig(BaseModel):
+    """Phase 6C payload generation and mutation controls."""
+
+    enabled: bool = Field(default=True, description="Enable payload generation/reflection loop.")
+    allow_classes: list[str] = Field(
+        default_factory=lambda: ["sqli", "xss"],
+        description="Vulnerability classes allowed for generated payloads.",
+    )
+    max_candidates: int = Field(default=4, ge=1, le=20)
+    max_mutation_rounds: int = Field(default=3, ge=0, le=10)
+
+
+class SpecialistConfig(BaseModel):
+    """Phase 6D specialist routing controls."""
+
+    enabled: bool = Field(default=True, description="Enable specialist routing hints in planner.")
+    default_profile: str = Field(default="recon", description="Fallback specialist profile.")
+    per_specialist_budget: int = Field(default=3, ge=1, le=20)
+
+
+class LearningConfig(BaseModel):
+    """Phase 6E advisory policy prior controls (research track)."""
+
+    enabled: bool = Field(default=False, description="Enable advisory policy-prior scoring.")
+    advisory_only: bool = Field(default=True, description="Policy prior never bypasses policy engine.")
+    policy_file: str = Field(
+        default="",
+        description="JSON file with offline trajectory-derived tool success priors.",
+    )
+
+
 class PolicyConfig(BaseModel):
     active_scan_rate_limit: int = Field(
         default=10,
@@ -356,6 +459,11 @@ class PwnpilotConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    payload: PayloadConfig = Field(default_factory=PayloadConfig)
+    specialists: SpecialistConfig = Field(default_factory=SpecialistConfig)
+    learning: LearningConfig = Field(default_factory=LearningConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
