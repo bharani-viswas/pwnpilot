@@ -89,6 +89,17 @@ def _load_config(config_path: Path | None = None) -> dict[str, Any]:
     candidates = ([config_path] if config_path else []) + _CONFIG_SEARCH_PATHS
     for path in candidates:
         if path and path.exists() and path.is_file():
+            # I-5: Warn if config is loaded from CWD fallback
+            if path == Path("config.yaml"):
+                resolved = path.resolve()
+                log.warning(
+                    "runtime.config_cwd_fallback",
+                    config_source="cwd_fallback",
+                    resolved_path=str(resolved),
+                    message="Config loaded from current working directory (CWD). "
+                            "This may not be the intended config. "
+                            f"Set PWNPILOT_CONFIG env var or place config in ~/.pwnpilot/ to override.",
+                )
             with path.open() as fh:
                 return yaml.safe_load(fh) or {}
     return {}
@@ -442,6 +453,61 @@ def _derive_engagement_outcome(state: AgentState | dict[str, Any]) -> str:
     return "completed"
 
 
+def _extract_payload_telemetry(previous_actions: list[Any]) -> dict[str, Any]:
+    """Extract and aggregate payload telemetry from action history."""
+    total_generations = 0
+    preflight_rejected = 0
+    tools_used: set[str] = set()
+    techniques_attempted: set[str] = set()
+    mutation_rounds = 0
+    semantic_outcomes: dict[str, int] = {}
+    
+    for action in previous_actions:
+        if not isinstance(action, dict):
+            continue
+        
+        # Count payload generations
+        if action.get("payload_generation_mode"):
+            total_generations += 1
+        
+        # Track tools that generated payloads
+        if action.get("generated_payloads"):
+            tool_name = action.get("tool_name", "unknown")
+            if tool_name:
+                tools_used.add(tool_name)
+            
+            # Track attempted techniques
+            attempt_technique = action.get("attempt_technique")
+            if attempt_technique:
+                techniques_attempted.add(attempt_technique)
+        
+        # Count preflight rejections
+        if action.get("preflight_rejected"):
+            preflight_rejected += 1
+        
+        # Track mutation rounds
+        if action.get("mutation_round"):
+            mutation_round_num = action.get("mutation_round", 0)
+            mutation_rounds = max(mutation_rounds, mutation_round_num)
+        
+        # Aggregate semantic outcomes
+        if action.get("reflection_summary"):
+            reflection = action.get("reflection_summary", {})
+            if isinstance(reflection, dict):
+                semantic_outcome = reflection.get("semantic_outcome")
+                if semantic_outcome:
+                    semantic_outcomes[semantic_outcome] = semantic_outcomes.get(semantic_outcome, 0) + 1
+    
+    return {
+        "total_generations": total_generations,
+        "preflight_rejected": preflight_rejected,
+        "tools_used": sorted(list(tools_used)),
+        "techniques_attempted": sorted(list(techniques_attempted)),
+        "mutation_rounds": mutation_rounds,
+        "semantic_outcomes": semantic_outcomes,
+    }
+
+
 def _persist_postmortem_artifact(
     audit_store: AuditStore,
     output_dir: Path,
@@ -462,6 +528,11 @@ def _persist_postmortem_artifact(
         engagement_outcome = _derive_engagement_outcome(state)
         fatal_error = raw_error if engagement_outcome == "failed" else None
         diagnostic_error = raw_error if engagement_outcome != "failed" else None
+        
+        # Extract payload telemetry from previous_actions
+        previous_actions = state.get("previous_actions", []) or []
+        payload_telemetry = _extract_payload_telemetry(previous_actions)
+        
         payload = {
             "engagement_id": str(engagement_id),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -487,6 +558,7 @@ def _persist_postmortem_artifact(
             },
             "last_result": state.get("last_result"),
             "last_execution_hints": state.get("last_execution_hints", []),
+            "payload_telemetry": payload_telemetry,
             "recent_audit_events": [
                 {
                     "timestamp": evt.timestamp.isoformat(),
@@ -738,32 +810,18 @@ def _build_runtime(
         if bool(getattr(getattr(typed_cfg, "tools", None), "static_fallback_when_empty", False)):
             from pwnpilot.plugins.adapters.cve_enrich import CveEnrichAdapter
             from pwnpilot.plugins.adapters.dns import DnsAdapter
-            from pwnpilot.plugins.adapters.gobuster import GobusterAdapter
-            from pwnpilot.plugins.adapters.nikto import NiktoAdapter
-            from pwnpilot.plugins.adapters.nmap import NmapAdapter
-            from pwnpilot.plugins.adapters.nuclei import NucleiAdapter
-            from pwnpilot.plugins.adapters.searchsploit import SearchsploitAdapter
             from pwnpilot.plugins.adapters.shell import ShellAdapter
-            from pwnpilot.plugins.adapters.sqlmap import SqlmapAdapter
-            from pwnpilot.plugins.adapters.whatweb import WhatWebAdapter
-            from pwnpilot.plugins.adapters.whois import WhoisAdapter
-            from pwnpilot.plugins.adapters.zap import ZapAdapter
 
             adapters = {
-                "nmap": NmapAdapter(),
-                "nikto": NiktoAdapter(),
-                "nuclei": NucleiAdapter(),
-                "searchsploit": SearchsploitAdapter(),
                 "shell": ShellAdapter(permission_context={"permission_store": permission_store}),
-                "sqlmap": SqlmapAdapter(),
-                "whatweb": WhatWebAdapter(),
-                "whois": WhoisAdapter(),
                 "dns": DnsAdapter(),
-                "gobuster": GobusterAdapter(),
-                "zap": ZapAdapter(),
                 "cve_enrich": CveEnrichAdapter(),
             }
-            log.warning("runtime.static_fallback_enabled", tools=sorted(adapters.keys()))
+            log.warning(
+                "runtime.static_fallback_enabled",
+                tools=sorted(adapters.keys()),
+                reason="hard cutover keeps only non-CLI Python-native adapters",
+            )
 
     # Tool runner — pass memory/CPU limits from config
     tools_cfg = getattr(typed_cfg, "tools", None)

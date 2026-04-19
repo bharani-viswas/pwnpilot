@@ -618,6 +618,63 @@ During SOC 2 Type II audit, provide auditor with:
 
 ---
 
+## Legal Holds and Retention Compliance
+
+Legal holds prevent retention TTL cleanup from deleting evidence for protected engagements.
+
+### Compliance Controls
+
+1. Hold placement is attributable (`holder`, `reason`, `placed_at`).
+2. Active holds (`released_at IS NULL`) block deletion paths.
+3. Hold release captures releasing actor (`released_by`) and timestamp.
+4. Hold records remain for audit history even after release.
+
+### Verification Queries
+
+```sql
+-- Active holds
+SELECT engagement_id, holder, reason, placed_at
+FROM legal_holds
+WHERE released_at IS NULL;
+
+-- Released holds
+SELECT engagement_id, released_by, released_at
+FROM legal_holds
+WHERE released_at IS NOT NULL
+ORDER BY released_at DESC;
+```
+
+### Evidence Protection Check
+
+Before retention jobs, verify no active holds exist for deletion candidates.
+
+---
+
+## ROE Document Integrity Verification
+
+ROE documents are verified by hash before use to detect tampering.
+
+### Control Behavior
+
+1. Compute hash of persisted ROE content.
+2. Compare against stored hash using constant-time compare (`hmac.compare_digest`).
+3. On mismatch, reject use and log integrity failure.
+
+### Audit Expectation
+
+- ROE verification events should be present in audit records.
+- Any mismatch must trigger incident triage and operator review.
+
+### Manual Validation
+
+```bash
+pwnpilot roe verify <roe-file>
+```
+
+Expected outcome: verification succeeds before engagement start.
+
+---
+
 ## Compliance Checklist
 
 Use this checklist during compliance review:

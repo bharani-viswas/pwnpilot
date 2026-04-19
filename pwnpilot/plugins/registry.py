@@ -23,6 +23,7 @@ class ToolDescriptor:
     optional_params: list[str] = field(default_factory=list)
     description: str = ""
     parameter_schema: dict[str, Any] = field(default_factory=dict)
+    capabilities: dict[str, Any] = field(default_factory=dict)
     preferred_target_types: list[str] = field(default_factory=list)
     preconditions: list[str] = field(default_factory=list)
     low_value_hint_codes: list[str] = field(default_factory=list)
@@ -52,6 +53,7 @@ class ToolDescriptor:
             "optional_params": list(self.optional_params),
             "description": self.description,
             "parameter_schema": dict(self.parameter_schema),
+            "capabilities": dict(self.capabilities),
             "preferred_target_types": list(self.preferred_target_types),
             "preconditions": list(self.preconditions),
             "low_value_hint_codes": list(self.low_value_hint_codes),

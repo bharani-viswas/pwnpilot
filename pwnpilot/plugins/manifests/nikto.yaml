@@ -1,0 +1,52 @@
+name: nikto
+version: 2.x
+risk_class: active_scan
+description: Web server vulnerability scanner with OSVDB/CVE references
+binary: nikto
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    port:
+      type: integer
+      minimum: 1
+      maximum: 65535
+      default: 80
+    ssl:
+      type: boolean
+      default: false
+    tuning:
+      type: string
+      default: x
+  x_supported_target_types:
+  - url
+  - domain
+  - ip
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- nikto
+- -host
+- '{target}'
+- -port
+- '{port}'
+- -nointeractive
+- when: ssl
+  parts:
+  - -ssl
+- when: tuning and tuning != 'x'
+  parts:
+  - -Tuning
+  - '{tuning}'
+parse:
+  strategy: nikto_text
+checksum_sha256: 4ecb6be262c50f67b1bd10eea810cd07862b3e1ea092f882dc6dda91ba999f60
+signature_b64: Um35HX/3OyT0nHjJKJA4+QIM6jcduhMKxSHRloYrU+AGv0SdU1c5PKAy81IpMVeD10mteW/o4XP+VWskGNT1CA==

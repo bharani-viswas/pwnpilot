@@ -1,0 +1,38 @@
+name: whatweb
+version: '0.5'
+risk_class: passive_recon
+description: Web technology fingerprinting and banner detection
+binary: whatweb
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    aggressiveness:
+      type: integer
+      minimum: 1
+      maximum: 4
+      default: 2
+  x_supported_target_types:
+  - url
+output_schema:
+  type: object
+  properties:
+    services:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- whatweb
+- --aggression
+- '{aggressiveness}'
+- --log-json=-
+- --no-errors
+- --color=never
+- '{target}'
+parse:
+  strategy: whatweb_jsonl
+checksum_sha256: 4a83dafd12618bf9f11487a520b46370862c5a352a9d0c6d31ec242fb9da059a
+signature_b64: rO7+nsyzPK0jY58rkNonNOqCgK2koVtn4/qNVMp+vdnbznjWIVlJmRMFEQic5oEDIguSkKYONAP/bizeCnVsBA==

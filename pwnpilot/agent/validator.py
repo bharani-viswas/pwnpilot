@@ -19,6 +19,7 @@ import re
 import time
 from numbers import Real
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import structlog
@@ -299,6 +300,22 @@ class ValidatorNode:
             return
 
     def _deterministic_capability_check(self, proposal: dict[str, Any]) -> dict[str, str] | None:
+        # C-3: Deterministic exploit-before-recon guard
+        # Reject exploit/post-exploit actions if no recon has been performed yet
+        action_type = str(proposal.get("action_type", "")).strip().lower()
+        if action_type in {"exploit", "post_exploit"}:
+            # Check if recon has been performed by looking at engagement state
+            # For now, this is checked via the proposal context - if there are no discovered_hosts,
+            # we haven't done recon yet
+            discovered_hosts = proposal.get("discovered_hosts") or []
+            if not discovered_hosts:
+                return {
+                    "rationale": "Cannot perform exploit action before reconnaissance has discovered hosts/services.",
+                    "rejection_reason_code": "exploit_before_recon",
+                    "rejection_reason_detail": "no discovered_hosts in engagement state",
+                    "rejection_class": "sequencing",
+                }
+        
         available_tools = self._policy_context.get("available_tools") or []
         tools_catalog = self._policy_context.get("tools_catalog") or []
         capability_contracts = self._policy_context.get("capability_contracts") or []
@@ -488,6 +505,41 @@ class ValidatorNode:
                     }
 
         target = str(proposal.get("target", ""))
+        
+        # C-2: Deterministic localhost/loopback rejection
+        # Extract target host from URL if needed
+        target_host = target
+        if target.startswith("http://") or target.startswith("https://"):
+            parsed = urlparse(target)
+            target_host = parsed.hostname or target
+        
+        # Check if target is a loopback address
+        try:
+            # Try to parse as IP address
+            ip_obj = ipaddress.ip_address(target_host)
+            if ip_obj.is_loopback:
+                engagement_scope = self._policy_context.get("engagement_scope") or {}
+                allowed_loopback = bool(engagement_scope.get("allow_localhost", False))
+                if not allowed_loopback:
+                    return {
+                        "rationale": f"Target '{target}' is a loopback/localhost address, which is outside the engagement scope.",
+                        "rejection_reason_code": "invalid_target_localhost",
+                        "rejection_reason_detail": f"target_host={target_host} is loopback",
+                        "rejection_class": "scope",
+                    }
+        except ValueError:
+            # Not an IP address, check if it's a hostname like "localhost" or "127.0.0.1"
+            if target_host.lower() in {"localhost", "127.0.0.1", "::1"}:
+                engagement_scope = self._policy_context.get("engagement_scope") or {}
+                allowed_loopback = bool(engagement_scope.get("allow_localhost", False))
+                if not allowed_loopback:
+                    return {
+                        "rationale": f"Target '{target}' is a loopback/localhost address, which is outside the engagement scope.",
+                        "rejection_reason_code": "invalid_target_localhost",
+                        "rejection_reason_detail": f"target_host={target_host} is localhost",
+                        "rejection_class": "scope",
+                    }
+        
         supported = list(tool_meta.get("supported_target_types", []))
         if supported:
             target_type = _classify_target_type(target)

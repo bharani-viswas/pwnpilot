@@ -7,6 +7,7 @@ Output: command stdout/stderr summary and execution metadata
 """
 from __future__ import annotations
 
+import hmac
 import os
 import re
 from typing import Any
@@ -139,7 +140,8 @@ class ShellAdapter(BaseAdapter):
                 raise ValueError(
                     f"shell: unsafe mode requires {_UNSAFE_TOKEN_ENV} to be configured on the runtime host."
                 )
-            if permission_token != expected_token:
+            # H-1: Use constant-time comparison to prevent timing attacks
+            if not hmac.compare_digest(permission_token.encode(), expected_token.encode()):
                 raise ValueError("shell: unsafe mode denied; invalid permission token.")
             if not _SAFE_COMMAND_RE.match(command):
                 raise ValueError(f"shell: invalid command name: {command!r}")

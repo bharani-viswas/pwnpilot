@@ -1,0 +1,80 @@
+name: gobuster
+version: 3.x
+risk_class: active_scan
+description: Directory and DNS brute-force discovery scanner
+binary: gobuster
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    mode:
+      type: string
+      enum:
+      - dir
+      - dns
+      default: dir
+    wordlist:
+      type: string
+      default: wordlists/dirb/common.txt
+    extensions:
+      type: string
+      default: ''
+    threads:
+      type: integer
+      minimum: 1
+      maximum: 50
+      default: 20
+    exclude_length:
+      type: integer
+      minimum: 1
+      maximum: 10000000
+    force_wildcard:
+      type: boolean
+      default: false
+  x_supported_target_types:
+  - ip
+  - domain
+  - url
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- gobuster
+- -m
+- '{mode}'
+- -w
+- '{wordlist}'
+- -t
+- '{threads}'
+- -q
+- -np
+- when: mode == 'dir'
+  parts:
+  - -u
+  - '{target}'
+- when: mode == 'dns'
+  parts:
+  - -d
+  - '{target}'
+- when: mode == 'dir' and exclude_length
+  parts:
+  - -bl
+  - '{exclude_length}'
+- when: mode == 'dir' and force_wildcard
+  parts:
+  - -fw
+- when: mode == 'dir' and extensions
+  parts:
+  - -x
+  - '{extensions}'
+parse:
+  strategy: gobuster_text
+checksum_sha256: fd50a69320472df01a541b816d6af7c95e725893ea2cc36b9e8997e9c09a3ba1
+signature_b64: v1IkvmdAguj6O50LR6bMXuLmTseI9y1Ko8hH7iYc9J1P7RO511ClvxI1hY//6UA7WyPDVTJZbFO6jbMY+gLuCg==

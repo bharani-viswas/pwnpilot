@@ -228,7 +228,10 @@ Note: `recon_passive` has a soft rate limit (warns and logs on breach, does not 
 - Deny by default if action class is unknown.
 - Call `is_in_scope` before evaluating gate.
 - Check token/tool budget limits.
-- **Rate limiting:** `active_scan` actions are governed by a per-engagement token bucket. Default: 10 `active_scan` actions per 60-second window (`rate_limit_active_scan_per_minute: 10`). The token bucket is stored in memory (SQLite-backed for persistence across resume). Requests that would exceed the limit receive `PolicyDecision(verdict=DENY, reason=RATE_LIMIT_EXCEEDED)`.
+- **Rate limiting:** `active_scan` actions are governed by a per-engagement token bucket. Default: 10 `active_scan` actions per 60-second window (`rate_limit_active_scan_per_minute: 10`).
+- **Persistence model:** token events are stored in `rate_limit_records` via `RateLimitStore` so limits survive restart/resume.
+- **Fallback model:** if the persistent store is unavailable, policy falls back to in-memory counters and logs degraded durability.
+- Requests that would exceed the limit receive `PolicyDecision(verdict=DENY, reason=RATE_LIMIT_EXCEEDED)`.
 - Check rate limits.
 - Return a `PolicyDecision(verdict, reason, gate_type)`.
 
@@ -500,6 +503,12 @@ class BaseAdapter:
 - Third-party plugins must supply their own signing key, which the operator explicitly adds to the `trust_store/` directory and approves via `pwnpilot plugin trust <name>`.
 - `plugins/trust.py` verifies the manifest signature against the trust store before loading any adapter. An adapter with an unrecognised or invalid signature raises `PluginTrustError` and is not loaded.
 
+**Runtime integration:**
+- `plugins/manifest_loader.py` discovers and validates manifests at startup.
+- `services/generic_cli_adapter.py` executes tools declared with `adapter_type=generic_cli` using deterministic command templates.
+- Parser selection is manifest-driven (`parser_type`) and resolved via parser registry.
+- Capability routing is capability-tag based, not tool-name hardcoded.
+
 ---
 
 ### 5.7 Tool Runner (`plugins/runner.py`)
@@ -562,6 +571,7 @@ class BaseAdapter:
 - Findings list with evidence links.
 - Audit chain summary + verification status.
 - Risk score breakdown.
+- Payload telemetry summary (`total_generations`, `preflight_rejected`, `tools_used`, `techniques_attempted`, `mutation_rounds`, `semantic_outcomes`).
 
 **Signing:**
 - `signer.py` computes SHA-256 over the JSON bundle and signs with the operator's Ed25519 private key.
@@ -608,6 +618,8 @@ class BaseAdapter:
 - TTL per engagement classification (e.g. CTF: 30 days, external: 90 days).
 - Legal hold: block deletion, document hold reason and holder.
 - Secure delete: overwrite evidence files before `unlink`.
+- Legal-hold state is persisted in `legal_holds` via `LegalHoldStore` and survives restart.
+- Released holds remain as historical compliance records.
 
 ---
 

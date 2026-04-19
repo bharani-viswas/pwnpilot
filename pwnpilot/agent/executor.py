@@ -403,6 +403,10 @@ def _base_target_match(left: str, right: str) -> bool:
     return bool(left_base) and left_base == right_base
 
 
+def _payload_state_key(tool_name: str, target: str) -> str:
+    return f"{str(tool_name or '').strip().lower()}::{_normalize_base_url(target)}"
+
+
 def _recent_no_forms_hint(previous_actions: list[dict[str, Any]], target: str, lookback: int = 8) -> bool:
     recent = previous_actions[-max(1, lookback):]
     for action in reversed(recent):
@@ -688,10 +692,12 @@ class ExecutorNode:
         resolved_target_snapshot: dict[str, Any] = {}
         target_for_tool = proposal.target
         supported_target_types: list[str] = []
+        tool_contract: dict[str, Any] = {}
         if self._target_resolver:
             if self._capability_registry:
                 contract = self._capability_registry.contract_for(proposal.tool_name)
                 if isinstance(contract, dict):
+                    tool_contract = contract
                     supported_target_types = list(contract.get("supported_target_types", []))
             resolved = self._target_resolver.resolve(proposal.target)
             resolved_target_snapshot = resolved.model_dump()
@@ -699,6 +705,10 @@ class ExecutorNode:
                 proposal.target,
                 supported_target_types=supported_target_types,
             )
+        elif self._capability_registry:
+            contract = self._capability_registry.contract_for(proposal.tool_name)
+            if isinstance(contract, dict):
+                tool_contract = contract
 
         compile_result = self._invocation_compiler.compile(
             tool_name=proposal.tool_name,
@@ -760,18 +770,37 @@ class ExecutorNode:
         reflection_summary = ""
         semantic_outcome_code = "uncertain"
         generated_payload = None
+        pending_mutation_payload = dict(state.get("pending_mutation_payload", {}) or {})
+        mutation_key = _payload_state_key(proposal.tool_name, target_for_tool)
+        carried_payload = str(pending_mutation_payload.pop(mutation_key, "")).strip()
+        capabilities = tool_contract.get("capabilities", {}) if isinstance(tool_contract, dict) else {}
+        accepts_payload = bool(capabilities.get("accepts_payload", False))
         payload_enabled = bool(getattr(self._payload_cfg, "enabled", True))
         allowed_classes = {
             str(x).strip().lower() for x in getattr(self._payload_cfg, "allow_classes", ["sqli", "xss"])
         }
-        if payload_enabled:
+        if payload_enabled and accepts_payload:
             action_type_guess = str(proposal.action_type or "").strip().lower()
             vuln_class = str(proposal.params.get("vuln_class", "")).strip().lower()
-            if not vuln_class and proposal.tool_name == "sqlmap":
+            if not vuln_class and accepts_payload:
                 vuln_class = "sqli"
-            if not vuln_class and proposal.tool_name in {"zap", "nuclei"} and action_type_guess == "exploit":
-                vuln_class = "xss"
-            if vuln_class in allowed_classes and action_type_guess in {"exploit", "active_scan"}:
+            if carried_payload and vuln_class in allowed_classes and action_type_guess in {"exploit", "active_scan"}:
+                ok, reason = preflight_validate_payload(
+                    payload=carried_payload,
+                    vuln_class=vuln_class,
+                    roe_disallow_patterns=list(state.get("roe_disallow_patterns", []) or []),
+                )
+                if ok:
+                    generated_payload = carried_payload
+                    proposal_params_compiled = {
+                        **proposal_params_compiled,
+                        "payload": generated_payload,
+                        "payload_vuln_class": vuln_class,
+                    }
+                    payload_generation_mode = "carried_mutation"
+                else:
+                    payload_generation_mode = f"carried_preflight_rejected:{reason}"
+            if not generated_payload and vuln_class in allowed_classes and action_type_guess in {"exploit", "active_scan"}:
                 candidates = generate_payload_candidates(
                     vuln_class=vuln_class,
                     target=target_for_tool,
@@ -783,7 +812,7 @@ class ExecutorNode:
                     ok, reason = preflight_validate_payload(
                         payload=str(candidate.get("payload", "")),
                         vuln_class=vuln_class,
-                        roe_disallow_patterns=[],
+                        roe_disallow_patterns=list(state.get("roe_disallow_patterns", []) or []),
                     )
                     if ok:
                         generated_payload = str(candidate.get("payload", ""))
@@ -1194,6 +1223,7 @@ class ExecutorNode:
             if generated_payload:
                 mutated = mutate_payload(generated_payload, round_idx=mutation_round)
                 reflection_summary = f"semantic_outcome={semantic_outcome_code}; mutated_payload_preview={mutated[:80]}"
+                pending_mutation_payload[mutation_key] = mutated
         exploit_signal_score, confirmation_candidate_count = _score_exploitation_progress(result.parsed_output)
         action_type_value = action.action_type.value if hasattr(action.action_type, "value") else str(action.action_type)
         recon_progress = bool(has_structured_output) and action_type_value in {"recon_passive", "active_scan"}
@@ -1578,6 +1608,7 @@ class ExecutorNode:
                 list(state.get("generated_payloads", []) or [])
                 + ([generated_payload] if generated_payload else [])
             )[-30:],
+            "pending_mutation_payload": pending_mutation_payload,
             # Clear active action fields after completion
             "active_action_id": None,
             "active_tool_name": None,

@@ -43,9 +43,20 @@ class TestPluginRegistryLoader:
         )
         registry = loader.load_registry(enabled_tools=[], disabled_tools=[])
 
-        # First-party manifests are currently not signed; strict mode should reject all.
-        assert registry.enabled_tools == {}
-        assert any(desc.trust_status == "rejected" for desc in registry.tools.values())
+        # Manifest-based CLI tools are now signed; they should be accepted in strict mode.
+        # Python-native adapters without checksum_sha256 (shell, dns, cve_enrich) should be rejected.
+        enabled = registry.enabled_tools
+        assert "nmap" in enabled
+        assert "gobuster" in enabled
+        assert "sqlmap" in enabled
+        assert "shell" not in enabled
+        assert "dns" not in enabled
+        assert "cve_enrich" not in enabled
+        
+        # Check that non-CLI adapters are properly rejected
+        assert registry.tools["shell"].trust_status == "rejected"
+        assert registry.tools["dns"].trust_status == "rejected"
+        assert registry.tools["cve_enrich"].trust_status == "rejected"
 
     def test_package_and_entrypoints_discovery_includes_third_party_candidate(self, monkeypatch):
         module_name = "mock_ext_plugin"

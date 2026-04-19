@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 
@@ -20,8 +21,32 @@ log = structlog.get_logger(__name__)
 # Threshold: same normalised signature seen this many times → suppress
 _DEFAULT_REPEAT_THRESHOLD: int = 3
 
-# Threshold for "similar" tool+target without identical params
-_SIMILARITY_THRESHOLD: int = 5
+# I-3: Increased threshold from 5 to 12 for URL-targeting tools to avoid
+# false deduplication on minor path variants (/rest vs / on same host).
+_SIMILARITY_THRESHOLD: int = 12
+
+
+def _normalize_url_path(target: str) -> str:
+    """
+    Normalize URL paths for URL-targeting tools to reduce false positives.
+    
+    For web URLs, extract the base (scheme://host) and ignore query strings.
+    This prevents `/path?id=1` and `/path?id=2` from being considered identical.
+    """
+    if not target or not isinstance(target, str):
+        return target
+    
+    target_lower = target.strip().lower()
+    if target_lower.startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(target_lower)
+            # Return base without path for broader similarity checking
+            # This way same host = base URL, different paths are still tracked
+            return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            return target_lower
+    
+    return target_lower
 
 
 def _action_signature(
@@ -40,8 +65,13 @@ def _action_signature(
 
 
 def _broad_signature(tool_name: str, target: str) -> str:
-    """Loose key: tool + target only, ignoring action type."""
-    key = f"{tool_name.strip().lower()}:{str(target).strip().lower()}"
+    """
+    Loose key: tool + normalized target only, ignoring action type.
+    
+    I-3: Normalize URL paths to distinguish between different paths on same host.
+    """
+    normalized_target = _normalize_url_path(target)
+    key = f"{tool_name.strip().lower()}:{normalized_target}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 

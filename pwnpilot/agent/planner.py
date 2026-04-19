@@ -73,7 +73,7 @@ _OBJECTIVE_TOOL_CANDIDATES: dict[str, tuple[str, ...]] = {
     "exposure": ("nuclei", "nikto", "zap"),
     "headers": ("zap", "nuclei", "nikto"),
     "session": ("zap", "nuclei", "sqlmap"),
-    "generic": ("nuclei", "zap", "nikto", "sqlmap"),
+    "generic": ("nuclei", "zap", "sqlmap", "nikto"),  # I-4: Inject sqlmap earlier
 }
 
 _SPECIALIST_TOOL_CANDIDATES: dict[str, tuple[str, ...]] = {
@@ -144,6 +144,55 @@ def _action_has_meaningful_progress(action: dict[str, Any]) -> bool:
         return True
 
     return False
+
+
+def _derive_rag_filters(recon_summary: dict[str, Any]) -> tuple[list[str] | None, list[str] | None]:
+    if not isinstance(recon_summary, dict):
+        return None, None
+
+    has_http_signal = False
+    services = recon_summary.get("services", [])
+    if isinstance(services, list):
+        for service in services:
+            if not isinstance(service, dict):
+                continue
+            service_name = str(service.get("service_name", "")).strip().lower()
+            if service_name in {"http", "https", "http-alt"}:
+                has_http_signal = True
+                break
+
+    if not has_http_signal:
+        attack_surface = recon_summary.get("attack_surface", {})
+        if isinstance(attack_surface, dict):
+            web_targets = attack_surface.get("web_targets", [])
+            has_http_signal = isinstance(web_targets, list) and bool(web_targets)
+
+    if not has_http_signal:
+        return None, None
+
+    platform_filter = ["Linux", "Network", "Containers"]
+    tactic_filter = [
+        "initial-access",
+        "execution",
+        "credential-access",
+        "collection",
+        "exfiltration",
+    ]
+    return platform_filter, tactic_filter
+
+
+def _apply_rag_min_confidence(
+    rag_context: list[dict[str, Any]],
+    min_confidence: float,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in rag_context:
+        if not isinstance(item, dict):
+            continue
+        confidence = float(item.get("confidence", 0.0) or 0.0)
+        if confidence >= min_confidence:
+            filtered.append(item)
+    return filtered
 
 # v2: RepetitionDetector singleton used by PlannerNode
 _repetition_detector = RepetitionDetector(repeat_threshold=3, similarity_threshold=5)
@@ -315,6 +364,7 @@ class PlannerNode:
         policy_prior: Any | None = None,
         task_tree_context_limit: int = 8,
         tactical_memory_window: int = 12,
+        rag_min_confidence: float = 0.15,
     ) -> None:
         self._llm = llm_router
         self._engagement = engagement_summary
@@ -336,6 +386,7 @@ class PlannerNode:
         self._policy_prior = policy_prior
         self._task_tree_context_limit = max(1, int(task_tree_context_limit))
         self._tactical_memory_window = max(1, int(tactical_memory_window))
+        self._rag_min_confidence = max(0.0, float(rag_min_confidence))
 
     def __call__(self, state: AgentState) -> AgentState:
         if state.get("kill_switch"):
@@ -475,10 +526,21 @@ class PlannerNode:
                     eng_uuid = _UUID2(engagement_id_str)
                 except (ValueError, TypeError):
                     pass
-                rag_context = self._rag_retriever.retrieve(
-                    query_text=recon_hint[:500] or "penetration test attack techniques",
-                    engagement_id=eng_uuid,
-                )
+                platform_filter, tactic_filter = _derive_rag_filters(state.get("recon_summary", {}) or {})
+                try:
+                    rag_context = self._rag_retriever.retrieve(
+                        query_text=recon_hint[:500] or "penetration test attack techniques",
+                        engagement_id=eng_uuid,
+                        tactic_filter=tactic_filter,
+                        platform_filter=platform_filter,
+                    )
+                except TypeError:
+                    # Backward-compatible fallback for simplified test stubs.
+                    rag_context = self._rag_retriever.retrieve(
+                        query_text=recon_hint[:500] or "penetration test attack techniques",
+                        engagement_id=eng_uuid,
+                    )
+                rag_context = _apply_rag_min_confidence(rag_context, self._rag_min_confidence)
                 if self._audit:
                     try:
                         self._audit.append(
@@ -489,6 +551,9 @@ class PlannerNode:
                                 "result_count": len(rag_context),
                                 "top_technique": rag_context[0].get("technique_id") if rag_context else None,
                                 "top_confidence": rag_context[0].get("confidence") if rag_context else None,
+                                "platform_filter": platform_filter or [],
+                                "tactic_filter": tactic_filter or [],
+                                "min_confidence": self._rag_min_confidence,
                             },
                         )
                         if not rag_context:

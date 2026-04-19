@@ -1,0 +1,55 @@
+name: nuclei
+version: 3.x
+risk_class: active_scan
+description: Template-driven vulnerability scanner
+binary: nuclei
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    severity:
+      type: string
+      enum:
+      - info
+      - low
+      - medium
+      - high
+      - critical
+      default: medium
+    rate_limit:
+      type: integer
+      minimum: 1
+      maximum: 500
+      default: 50
+    template_tags:
+      type: array
+      default: []
+  x_supported_target_types:
+  - url
+  - domain
+  - ip
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- nuclei
+- -u
+- '{target}'
+- -severity
+- '{severity}'
+- -rate-limit
+- '{rate_limit}'
+- -jsonl
+- -silent
+- -no-color
+parse:
+  strategy: nuclei_jsonl
+checksum_sha256: 5468144da82eb30eda21effb5b204a0bb0ba825fee9459f70d4a80287d1cac8b
+signature_b64: HVSppa/c8RqMk+oU+ixj3CTlQuZWhU5RF0kwBrpOFhdDlfJYCZesCjC5oaa1bAZi+vB1bHDX0IKL8L7ymS7dCg==

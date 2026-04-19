@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from pwnpilot.agent.action_envelope import ActionEnvelopeError, parse_action_envelope
@@ -14,7 +15,14 @@ from pwnpilot.governance.authorization import (
     assert_authorized,
 )
 from pwnpilot.governance.kill_switch import KillSwitch
+from pwnpilot.plugins.generic_adapter import GenericCLIAdapter
+from pwnpilot.plugins.manifest_loader import load_manifest_file
 from pwnpilot.secrets.redactor import Redactor
+
+
+def _nmap_adapter() -> GenericCLIAdapter:
+    manifest_path = Path(__file__).resolve().parents[2] / "pwnpilot" / "plugins" / "manifests" / "nmap.yaml"
+    return GenericCLIAdapter(load_manifest_file(manifest_path))
 
 
 class TestKillSwitch:
@@ -155,8 +163,7 @@ class TestActionEnvelope:
 
 class TestActionValidator:
     def setup_method(self):
-        from pwnpilot.plugins.adapters.nmap import NmapAdapter
-        self.validator = ActionValidator({"nmap": NmapAdapter()})
+        self.validator = ActionValidator({"nmap": _nmap_adapter()})
 
     def test_valid_action_passes(self):
         action = ActionRequest(

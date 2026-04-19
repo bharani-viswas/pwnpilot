@@ -188,7 +188,7 @@ class TestPlannerNode:
                 return {
                     "action_type": "active_scan",
                     "tool_name": "gobuster",
-                    "target": "http://localhost:3000",
+                    "target": "http://10.0.0.1:3000",
                     "params": {},
                     "rationale": "repeat",
                     "estimated_risk": "medium",
@@ -223,7 +223,7 @@ class TestPlannerNode:
             "previous_actions": [
                 {
                     "tool_name": "gobuster",
-                    "target": "http://localhost:3000",
+                    "target": "http://10.0.0.1:3000",
                     "action_type": "active_scan",
                     "execution_hint_codes": [],
                     "failure_reasons": ["TargetUnreachable"],
@@ -231,7 +231,7 @@ class TestPlannerNode:
                 },
                 {
                     "tool_name": "gobuster",
-                    "target": "http://localhost:3000",
+                    "target": "http://10.0.0.1:3000",
                     "action_type": "active_scan",
                     "execution_hint_codes": [],
                     "failure_reasons": ["TargetUnreachable"],
@@ -295,7 +295,7 @@ class TestPlannerNode:
                 return {
                     "action_type": "active_scan",
                     "tool_name": "gobuster",
-                    "target": "http://localhost:3000",
+                    "target": "http://10.0.0.1:3000",
                     "params": {},
                     "rationale": "try gobuster",
                     "estimated_risk": "low",
@@ -610,10 +610,10 @@ class TestValidatorNode:
         state = {**_base_state(), "proposed_action": {
             "action_type": "active_scan",
             "tool_name": "nikto",
-            "target": "http://localhost:3000",
+            "target": "http://10.0.0.1:3000",
             "rationale": "test",
             "estimated_risk": "medium",
-            "params": {"target": "http://localhost:3000", "ssl": False, "port": 3000},
+            "params": {"target": "http://10.0.0.1:3000", "ssl": False, "port": 3000},
         }}
         result = validator(state)
         assert result["validation_result"]["verdict"] == "approve"

@@ -1,0 +1,53 @@
+name: zap
+version: '2.14'
+risk_class: active_scan
+description: OWASP ZAP baseline web application security scan
+binary: zap-baseline.py
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    max_duration:
+      type: integer
+      minimum: 1
+      maximum: 60
+      default: 5
+    ajax_spider:
+      type: boolean
+      default: false
+    min_level:
+      type: string
+      enum:
+      - PASS
+      - INFO
+      - WARN
+      - FAIL
+      default: WARN
+  x_supported_target_types:
+  - url
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- zap-baseline.py
+- -t
+- '{target}'
+- -m
+- '{max_duration}'
+- -l
+- '{min_level}'
+- -I
+- when: ajax_spider
+  parts:
+  - -j
+parse:
+  strategy: zap_text
+checksum_sha256: 4cd6a52c523ae923e1c1a9f4cac96ee74b70f4c48cc0c1e6fe88188418cc0956
+signature_b64: TJI/3tJ6EKIN0s/L8O/Fw8qQ+0twI6+6FvlEOv9eQ9dRkphingAEevSclvew7MOtkqpCxsEY0M25vaev969ZDQ==

@@ -11,6 +11,8 @@ from typing import Any, Iterator
 
 import structlog
 
+from pwnpilot.plugins.generic_adapter import GenericCLIAdapter
+from pwnpilot.plugins.manifest_loader import load_manifests_dir
 from pwnpilot.plugins.policy import PluginTrustPolicy
 from pwnpilot.plugins.registry import ToolDescriptor, ToolRegistry
 from pwnpilot.plugins.sdk import BaseAdapter
@@ -33,6 +35,18 @@ _FALLBACK_BINARIES = {
     "cve_enrich": "",
 }
 
+_MANIFEST_RUNTIME_TOOLS = {
+    "gobuster",
+    "nikto",
+    "nmap",
+    "nuclei",
+    "searchsploit",
+    "sqlmap",
+    "whatweb",
+    "whois",
+    "zap",
+}
+
 
 class PluginLoader:
     """Discovers adapters and registers them through one trust-gated path."""
@@ -43,14 +57,23 @@ class PluginLoader:
         package_name: str = "pwnpilot.plugins.adapters",
         entrypoint_group: str = "pwnpilot.plugins",
         discovery_mode: str = "package",
+        manifest_dir: str | None = None,
     ) -> None:
         self._trust_policy = trust_policy
         self._package_name = package_name
         self._entrypoint_group = entrypoint_group
         self._discovery_mode = discovery_mode
+        self._manifest_dir = manifest_dir or str(Path(__file__).resolve().parent / "manifests")
 
     def load_registry(self, enabled_tools: list[str], disabled_tools: list[str]) -> ToolRegistry:
         registry = ToolRegistry()
+        for spec in load_manifests_dir(Path(self._manifest_dir)):
+            adapter = GenericCLIAdapter(spec)
+            descriptor = self._build_descriptor_for_instance(adapter, GenericCLIAdapter, "first_party")
+            if descriptor is None:
+                continue
+            registry.add(descriptor)
+
         for module_name, source, object_hint in self._discover_candidates():
             for adapter_cls in self._load_adapter_classes(module_name, object_hint):
                 descriptor = self._build_descriptor(adapter_cls, source)
@@ -67,6 +90,10 @@ class PluginLoader:
             pkg = importlib.import_module(self._package_name)
             for mod in pkgutil.iter_modules(pkg.__path__, prefix=f"{self._package_name}."):
                 if mod.name.endswith(".__init__"):
+                    continue
+                short_name = mod.name.rsplit(".", maxsplit=1)[-1]
+                if short_name in _MANIFEST_RUNTIME_TOOLS:
+                    # Hard cutover: legacy class adapters for these tools are disabled.
                     continue
                 yield mod.name, "first_party", None
 
@@ -105,12 +132,53 @@ class PluginLoader:
     def _build_descriptor(self, adapter_cls: type[BaseAdapter], source: str) -> ToolDescriptor | None:
         try:
             adapter = adapter_cls()
-            manifest = adapter.manifest
         except Exception as exc:
             log.warning("plugins.adapter_init_failed", adapter=str(adapter_cls), exc=str(exc))
             return None
 
-        verification_ok, verification_error = self._verify_adapter(adapter_cls, manifest)
+        return self._build_descriptor_for_instance(adapter, adapter_cls, source)
+
+    def _build_descriptor_for_instance(
+        self,
+        adapter: BaseAdapter,
+        adapter_cls: type[BaseAdapter],
+        source: str,
+    ) -> ToolDescriptor | None:
+        manifest = adapter.manifest
+        capabilities = self._extract_capabilities(adapter)
+
+        if manifest.name in _MANIFEST_RUNTIME_TOOLS and adapter_cls is not GenericCLIAdapter:
+            log.warning(
+                "plugins.legacy_cli_adapter_rejected",
+                tool=manifest.name,
+                adapter=str(adapter_cls),
+                reason="legacy class-based CLI adapters are disabled by hard cutover",
+            )
+            return None
+
+        # For GenericCLIAdapter (manifest-based tools), handle trust differently
+        # since they are first-party and don't have file-based verification
+        if adapter_cls is GenericCLIAdapter:
+            verification_ok = bool(manifest.checksum_sha256 and manifest.signature_b64)
+            verification_error = ""
+            
+            if verification_ok:
+                try:
+                    from pwnpilot.plugins.trust import _load_trusted_key
+                    import base64
+                    
+                    pub_key = _load_trusted_key(manifest.name)
+                    sig = base64.b64decode(manifest.signature_b64)
+                    message = manifest.checksum_sha256.encode()
+                    pub_key.verify(sig, message)
+                except Exception as exc:
+                    verification_ok = False
+                    verification_error = f"manifest signature verification failed: {str(exc)}"
+            else:
+                verification_error = "manifest missing checksum_sha256 or signature_b64"
+        else:
+            verification_ok, verification_error = self._verify_adapter(adapter_cls, manifest)
+        
         verified_at = datetime.now(timezone.utc).isoformat()
         decision = self._trust_policy.decide(source, verification_ok, verification_error)
         if not decision.allowed:
@@ -130,13 +198,14 @@ class PluginLoader:
                 compatible_action_types=list(getattr(manifest, "compatible_action_types", []) or []),
                 manifest_version=manifest.version,
                 manifest_schema_version=manifest.schema_version,
-                binary_name=self._infer_binary_name(manifest.name),
+                binary_name=self._resolve_binary_name(adapter, manifest.name),
                 categories=self._infer_categories(manifest.risk_class),
                 supported_target_types=self._infer_target_types(manifest.input_schema),
                 required_params=list(manifest.input_schema.get("required", [])),
                 optional_params=self._infer_optional_params(manifest.input_schema),
                 description=manifest.description,
                 parameter_schema=dict(manifest.input_schema.get("properties", {})),
+                capabilities=capabilities,
                 preferred_target_types=self._infer_preferred_target_types(manifest.input_schema),
                 preconditions=self._infer_preconditions(manifest.input_schema),
                 low_value_hint_codes=self._infer_low_value_hint_codes(manifest.input_schema),
@@ -160,13 +229,14 @@ class PluginLoader:
             compatible_action_types=list(getattr(manifest, "compatible_action_types", []) or []),
             manifest_version=manifest.version,
             manifest_schema_version=manifest.schema_version,
-            binary_name=self._infer_binary_name(manifest.name),
+            binary_name=self._resolve_binary_name(adapter, manifest.name),
             categories=self._infer_categories(manifest.risk_class),
             supported_target_types=self._infer_target_types(manifest.input_schema),
             required_params=list(manifest.input_schema.get("required", [])),
             optional_params=self._infer_optional_params(manifest.input_schema),
             description=manifest.description,
             parameter_schema=dict(manifest.input_schema.get("properties", {})),
+            capabilities=capabilities,
             preferred_target_types=self._infer_preferred_target_types(manifest.input_schema),
             preconditions=self._infer_preconditions(manifest.input_schema),
             low_value_hint_codes=self._infer_low_value_hint_codes(manifest.input_schema),
@@ -177,6 +247,17 @@ class PluginLoader:
             verified_at=verified_at,
         )
         return descriptor
+
+    def _resolve_binary_name(self, adapter: BaseAdapter, tool_name: str) -> str:
+        direct = getattr(adapter, "binary_name", "")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        return self._infer_binary_name(tool_name)
+
+    def _extract_capabilities(self, adapter: BaseAdapter) -> dict[str, Any]:
+        spec = getattr(adapter, "_spec", None)
+        capabilities = getattr(spec, "capabilities", {}) if spec is not None else {}
+        return dict(capabilities) if isinstance(capabilities, dict) else {}
 
     def _verify_adapter(self, adapter_cls: type[BaseAdapter], manifest: Any) -> tuple[bool, str]:
         try:

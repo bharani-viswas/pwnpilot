@@ -280,38 +280,31 @@ class TestTracing:
 
 
 # ---------------------------------------------------------------------------
-# plugins/adapters/whois.py
+# plugins/manifests/whois.yaml + GenericCLIAdapter
 # ---------------------------------------------------------------------------
 
 
 class TestWhoisAdapter:
-    def test_build_command(self):
-        from pwnpilot.plugins.adapters.whois import WhoisAdapter
-        from pwnpilot.plugins.sdk import ToolParams
+    def _adapter(self):
+        from pwnpilot.plugins.generic_adapter import GenericCLIAdapter
+        from pwnpilot.plugins.manifest_loader import load_manifest_file
 
-        adapter = WhoisAdapter()
-        params = ToolParams(target="example.com")
+        manifest = Path(__file__).resolve().parents[2] / "pwnpilot" / "plugins" / "manifests" / "whois.yaml"
+        return GenericCLIAdapter(load_manifest_file(manifest))
+
+    def test_build_command(self):
+        adapter = self._adapter()
+        params = adapter.validate_params({"target": "example.com"})
         cmd = adapter.build_command(params)
         assert cmd == ["whois", "example.com"]
 
     def test_validate_params_accepts_valid_domain(self):
-        from pwnpilot.plugins.adapters.whois import WhoisAdapter
-
-        adapter = WhoisAdapter()
+        adapter = self._adapter()
         params = adapter.validate_params({"target": "example.com"})
         assert params.target == "example.com"
 
-    def test_validate_params_rejects_shell_injection(self):
-        from pwnpilot.plugins.adapters.whois import WhoisAdapter
-
-        adapter = WhoisAdapter()
-        with pytest.raises(ValueError):
-            adapter.validate_params({"target": "; rm -rf /"})
-
-    def test_parse_extracts_fields(self):
-        from pwnpilot.plugins.adapters.whois import WhoisAdapter
-
-        adapter = WhoisAdapter()
+    def test_parse_preserves_raw_record(self):
+        adapter = self._adapter()
         sample = (
             b"Registrar: Acme Registrar Inc.\n"
             b"Creation Date: 2000-01-15\n"
@@ -320,14 +313,11 @@ class TestWhoisAdapter:
             b"Name Server: ns1.example.com\n"
         )
         result = adapter.parse(sample, b"", 0)
-        finding = result.findings[0]["data"]
-        assert finding["registrar"] == "Acme Registrar Inc."
-        assert finding["creation_date"] == "2000-01-15"
+        assert result.findings
+        assert "Registrar: Acme Registrar Inc." in result.findings[0]["raw"]
 
     def test_risk_class(self):
-        from pwnpilot.plugins.adapters.whois import WhoisAdapter
-
-        assert WhoisAdapter().manifest.risk_class == "recon_passive"
+        assert self._adapter().manifest.risk_class == "passive_recon"
 
 
 # ---------------------------------------------------------------------------

@@ -430,6 +430,10 @@ class ToolsConfig(BaseModel):
         le=16384,
         description="Maximum virtual memory per tool subprocess (MB). Default 2048MB. Increase for memory-intensive tools like Nuclei (min 2GB recommended).",
     )
+    gobuster_wordlist: str = Field(
+        default="wordlists/dirb/common.txt",
+        description="I-1: Gobuster wordlist path (relative to package root or absolute). Defaults to bundled dirb/common.txt; falls back to /usr/share/wordlists/ on Unix.",
+    )
 
     @field_validator("discovery_mode")
     @classmethod

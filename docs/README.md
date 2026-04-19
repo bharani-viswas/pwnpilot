@@ -42,6 +42,7 @@ pwnpilot orchestrates a team of LLM-backed agents — Planner, Validator, Execut
   - [pwnpilot version](#pwnpilot-version)
 - [Tool Adapters](#tool-adapters)
 - [Plugin System](#plugin-system)
+- [Documentation Map](#documentation-map)
 - [Reporting & Signing](#reporting--signing)
 - [TUI Dashboard](#tui-dashboard)
 - [Database Backends](#database-backends)
@@ -370,6 +371,8 @@ Security-sensitive values are typically injected via section/key overrides:
 | `storage` | `report_dir` | `reports` | Report output directory |
 | `logging` | `level` | `INFO` | Log level (DEBUG/INFO/WARNING/ERROR) |
 
+For complete configuration coverage (precedence, deployment profiles, and tool-specific options), see [Configuration Reference](CONFIGURATION_REFERENCE.md).
+
 ---
 
 ## Rules of Engagement (ROE)
@@ -648,6 +651,22 @@ cp vendor.pub pwnpilot/plugins/trust_store/vendor.pub
 pwnpilot plugin trust vendor
 ```
 
+For manifest schema, runtime registration, and adapter patterns, see [Plugin Development Guide](PLUGIN_DEVELOPMENT.md).
+
+---
+
+## Documentation Map
+
+- [Architecture](ARCHITECTURE.md)
+- [Deployment Guide](DEPLOYMENT.md)
+- [Database Schema](CURRENT_SCHEMA.md)
+- [Database Operations](DB_OPERATIONS.md)
+- [Legal Holds Guide](LEGAL_HOLDS.md)
+- [Payload Telemetry Guide](PAYLOAD_TELEMETRY.md)
+- [Configuration Reference](CONFIGURATION_REFERENCE.md)
+- [Plugin Development Guide](PLUGIN_DEVELOPMENT.md)
+- [ROE Compliance Guide](roe-compliance.md)
+
 ---
 
 ## Reporting & Signing
@@ -710,7 +729,7 @@ alembic upgrade head
 alembic current
 ```
 
-Five tables are managed by Alembic: `recon_hosts`, `findings`, `evidence`, `audit_events`, `approval_tickets`.
+Core Alembic tables include `recon_hosts`, `findings`, `evidence_index`, `audit_events`, `approval_tickets`, `roe_files`, `engagement_policies`, `roe_approval_records`, `rate_limit_records`, and `legal_holds`.
 
 ---
 

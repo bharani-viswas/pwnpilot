@@ -1,0 +1,49 @@
+name: nmap
+version: '7.94'
+risk_class: active_scan
+description: Network port scanner and service/OS detection
+binary: nmap
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    ports:
+      type: string
+      default: 1-1024
+    scan_type:
+      type: string
+      default: sV
+    timing:
+      type: integer
+      minimum: 0
+      maximum: 5
+      default: 3
+  x_supported_target_types:
+  - ip
+  - domain
+  - cidr
+output_schema:
+  type: object
+  properties:
+    hosts:
+      type: array
+    services:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- nmap
+- -{scan_type}
+- -T{timing}
+- -p{ports}
+- -oX
+- - null
+- --open
+- '{target}'
+parse:
+  strategy: nmap_xml
+checksum_sha256: 10871baac4ca748d350ec2dc3758dac010da539289585ff0a20ac1919fbfcd6e
+signature_b64: jwA91sOd9+H/R8K3CEyStgzuBB0pfiLCEi+f2taFpSDAevhNwgdFA0RBmM7k870v1LHhDkk6hTkFoqTQ8sgdCg==

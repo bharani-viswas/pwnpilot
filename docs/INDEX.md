@@ -20,6 +20,17 @@ Welcome to PwnPilot documentation! This guide provides complete information abou
   - Service management
   - Monitoring and logging
 
+- **[Database Operations Guide](DB_OPERATIONS.md)** - Database lifecycle operations
+  - Alembic migration procedures
+  - Backup and restore runbooks
+  - Persistence-table operations
+  - Recovery and cleanup workflows
+
+- **[Legal Holds Guide](LEGAL_HOLDS.md)** - Hold lifecycle and retention governance
+  - Placement and release lifecycle
+  - TTL interaction and evidence protection
+  - Compliance verification workflows
+
 ### Usage Guides
 - **[ROE User Guide](roe-usage.md)** - Rules of Engagement (ROE) creation and usage
   - ROE file format
@@ -44,6 +55,21 @@ Welcome to PwnPilot documentation! This guide provides complete information abou
   - Table structures
   - Fields and indexes
   - Relationships
+
+- **[Configuration Reference](CONFIGURATION_REFERENCE.md)** - Runtime configuration reference
+  - Precedence and override model
+  - Policy and tool options
+  - Production guidance
+
+- **[Payload Telemetry Guide](PAYLOAD_TELEMETRY.md)** - Postmortem telemetry analysis
+  - Metric definitions
+  - Extraction commands
+  - Interpretation guidance
+
+- **[Plugin Development Guide](PLUGIN_DEVELOPMENT.md)** - Plugin and adapter extension model
+  - Manifest basics
+  - Runtime loading path
+  - Parser strategy integration
 
 - **[Architecture](ARCHITECTURE.md)** - System architecture and design
   - Component overview

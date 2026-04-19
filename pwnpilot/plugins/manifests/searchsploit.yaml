@@ -1,0 +1,35 @@
+name: searchsploit
+version: '2024'
+risk_class: passive_recon
+description: Search Exploit-DB entries by service/product query
+binary: searchsploit
+input_schema:
+  type: object
+  required:
+  - query
+  properties:
+    query:
+      type: string
+    exact:
+      type: boolean
+      default: false
+  x_supported_target_types:
+  - text
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- searchsploit
+- --json
+- when: exact
+  parts:
+  - --exact
+- '{query}'
+parse:
+  strategy: searchsploit_json
+checksum_sha256: cc96e2ce48765318edf322595b54f440390b9fcc60c7c8ac3ba47680ed319757
+signature_b64: HJm9sPqh2jq59amYcD+f2VuU8y+FpsDKxgJ8cZn1Ls/S1VLY9TcFQmcn/cPQsvj7VTtMIRLHdAMwI7ck92V4BQ==

@@ -26,7 +26,11 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+import structlog
+
 from pwnpilot.plugins.sdk import BaseAdapter, ParsedOutput, PluginManifest, ToolParams
+
+log = structlog.get_logger(__name__)
 
 # Strict CVE identifier validation — CVE-YYYY-NNNNN (4–7 digits)
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$", re.IGNORECASE)
@@ -73,6 +77,18 @@ class CveEnrichAdapter(BaseAdapter):
             },
         },
     )
+
+    def __init__(self) -> None:
+        """I-2: Emit warning if NVD_API_KEY is not set."""
+        super().__init__()
+        if not os.environ.get("NVD_API_KEY"):
+            log.warning(
+                "cve_enrich.nvd_api_unauthenticated",
+                code="nvd_api_unauthenticated",
+                rate_limit="5req/30s",
+                message="NVD_API_KEY not set; using unauthenticated rate limit (5 req/30s). "
+                        "Set the NVD_API_KEY environment variable to increase to 50 req/30s.",
+            )
 
     @property
     def manifest(self) -> PluginManifest:

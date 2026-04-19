@@ -42,7 +42,7 @@ from pwnpilot.data.models import (
 )
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.plugins.binaries import candidate_binaries, resolve_binary_for_tool
-from pwnpilot.plugins.sdk import BaseAdapter
+from pwnpilot.plugins.sdk import BaseAdapter, ParsedOutput
 
 log = structlog.get_logger(__name__)
 
@@ -284,6 +284,58 @@ class ToolRunner:
         )
 
         start = time.monotonic()
+        
+        # E-1: Handle non-CLI adapters (build_command returns empty list)
+        # For adapters like cve_enrich that perform their own API calls
+        if not cmd:
+            # Try to call adapter.enrich() method directly if available
+            if hasattr(adapter, 'enrich') and callable(getattr(adapter, 'enrich')):
+                try:
+                    target = str(params.target) if params.target else ""
+                    parsed = adapter.enrich(target)
+                    duration_ms = int((time.monotonic() - start) * 1000)
+                    
+                    # Emit action.completed
+                    self._emit(ExecutionEvent(
+                        engagement_id=action.engagement_id,
+                        action_id=action.action_id,
+                        event_type=ExecutionEventType.ACTION_COMPLETED,
+                        tool_name=action.tool_name,
+                        command="",
+                        payload={
+                            "duration_ms": duration_ms,
+                            "exit_code": 0,
+                            "outcome": "success",
+                        },
+                    ))
+                    
+                    result = ToolExecutionResult(
+                        action_id=action.action_id,
+                        tool_name=action.tool_name,
+                        exit_code=0,
+                        stdout_idx="",
+                        stderr_idx="",
+                        parsed_output=parsed,
+                        duration_ms=duration_ms,
+                        error_class=None,
+                    )
+                    return result
+                except Exception as exc:
+                    log.error("runner.enrich_error", exc=str(exc), tool=action.tool_name)
+                    parsed = ParsedOutput(parser_error=str(exc))
+                    duration_ms = int((time.monotonic() - start) * 1000)
+                    result = ToolExecutionResult(
+                        action_id=action.action_id,
+                        tool_name=action.tool_name,
+                        exit_code=1,
+                        stdout_idx="",
+                        stderr_idx="",
+                        parsed_output=parsed,
+                        duration_ms=duration_ms,
+                        error_class=ErrorClass.PARSE_ERROR,
+                    )
+                    return result
+        
         stdout_bytes, stderr_bytes, exit_code, timed_out = self._run_subprocess(
             cmd,
             action.tool_name,

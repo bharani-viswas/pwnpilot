@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest import mock
 from uuid import uuid4
 
@@ -9,7 +10,8 @@ from sqlalchemy.orm import sessionmaker
 from pwnpilot.data.evidence_store import EvidenceStore
 from pwnpilot.data.models import ActionRequest, ActionType, RiskLevel
 from pwnpilot.governance.kill_switch import KillSwitch
-from pwnpilot.plugins.adapters.nmap import NmapAdapter
+from pwnpilot.plugins.generic_adapter import GenericCLIAdapter
+from pwnpilot.plugins.manifest_loader import load_manifest_file
 from pwnpilot.plugins.binaries import candidate_binaries, resolve_binary_for_tool
 from pwnpilot.plugins.runner import ToolRunner
 
@@ -17,6 +19,11 @@ from pwnpilot.plugins.runner import ToolRunner
 def _session():
     engine = create_engine("sqlite:///:memory:")
     return sessionmaker(bind=engine)()
+
+
+def _nmap_adapter() -> GenericCLIAdapter:
+    manifest_path = Path(__file__).resolve().parents[2] / "pwnpilot" / "plugins" / "manifests" / "nmap.yaml"
+    return GenericCLIAdapter(load_manifest_file(manifest_path))
 
 
 class TestBinaryResolver:
@@ -50,7 +57,7 @@ class TestToolRunnerBinaryResolution:
         session = _session()
         evidence_store = EvidenceStore(base_dir=tmp_path / "ev", session=session)
         runner = ToolRunner(
-            adapters={"nmap": NmapAdapter()},
+            adapters={"nmap": _nmap_adapter()},
             evidence_store=evidence_store,
             kill_switch=KillSwitch(),
         )

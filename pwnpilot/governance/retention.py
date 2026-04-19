@@ -37,10 +37,13 @@ import threading
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import structlog
+
+if TYPE_CHECKING:
+    from pwnpilot.governance.legal_hold_store import LegalHoldStore
 
 log = structlog.get_logger(__name__)
 
@@ -70,11 +73,13 @@ _TTL_DAYS: dict[EngagementClassification, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Legal hold record (in-process; for full production use, persist to DB)
+# Legal hold record (persisted to DB via LegalHoldStore; H-3)
 # ---------------------------------------------------------------------------
 
 
 class LegalHold:
+    """In-memory representation of a legal hold (persisted to DB)."""
+    
     def __init__(self, engagement_id: str, holder: str, reason: str) -> None:
         self.engagement_id = engagement_id
         self.holder = holder
@@ -100,11 +105,19 @@ class RetentionManager:
     Args:
         evidence_store: EvidenceStore instance for reading evidence index entries.
         audit_store:    AuditStore instance for recording retention events.
+        legal_hold_store: Optional LegalHoldStore for persistent hold storage (H-3).
     """
 
-    def __init__(self, evidence_store: Any, audit_store: Any) -> None:
+    def __init__(
+        self,
+        evidence_store: Any,
+        audit_store: Any,
+        legal_hold_store: LegalHoldStore | None = None,
+    ) -> None:
         self._evidence = evidence_store
         self._audit = audit_store
+        self._legal_hold_store = legal_hold_store
+        # Fallback in-memory cache
         self._holds: dict[str, LegalHold] = {}
         self._lock = threading.Lock()
 
@@ -121,6 +134,11 @@ class RetentionManager:
         second hold for the same engagement.
         """
         key = str(engagement_id)
+        
+        # H-3: Persist to store if available
+        if self._legal_hold_store:
+            self._legal_hold_store.place_hold(engagement_id, holder, reason)
+        
         with self._lock:
             if key in self._holds and self._holds[key].is_active:
                 log.warning(
@@ -150,6 +168,11 @@ class RetentionManager:
     ) -> None:
         """Release an active legal hold.  No-op if no hold is active."""
         key = str(engagement_id)
+        
+        # H-3: Update in store if available
+        if self._legal_hold_store:
+            self._legal_hold_store.release_hold(engagement_id, released_by)
+        
         with self._lock:
             hold = self._holds.get(key)
             if not hold or not hold.is_active:
@@ -170,13 +193,36 @@ class RetentionManager:
         )
 
     def has_active_hold(self, engagement_id: UUID) -> bool:
+        """Check if an engagement has an active legal hold."""
         key = str(engagement_id)
+        
+        # H-3: Check store first if available
+        if self._legal_hold_store:
+            return self._legal_hold_store.has_active_hold(engagement_id)
+        
+        # Fallback to in-memory
         with self._lock:
             hold = self._holds.get(key)
             return hold is not None and hold.is_active
 
     def get_hold(self, engagement_id: UUID) -> LegalHold | None:
-        return self._holds.get(str(engagement_id))
+        """Get the legal hold object if one exists."""
+        key = str(engagement_id)
+        
+        # H-3: Check store first if available
+        if self._legal_hold_store:
+            hold_data = self._legal_hold_store.get_hold(engagement_id)
+            if hold_data:
+                hold = LegalHold(key, hold_data["holder"], hold_data["reason"])
+                hold.placed_at = datetime.fromisoformat(hold_data["placed_at"]) if hold_data["placed_at"] else datetime.now(timezone.utc)
+                if hold_data["released_at"]:
+                    hold.released_at = datetime.fromisoformat(hold_data["released_at"])
+                hold.released_by = hold_data["released_by"]
+                return hold
+            return None
+        
+        # Fallback to in-memory
+        return self._holds.get(key)
 
     # ------------------------------------------------------------------
     # TTL expiry check

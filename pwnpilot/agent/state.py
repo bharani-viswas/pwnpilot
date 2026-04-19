@@ -88,6 +88,8 @@ class AgentState(TypedDict, total=False):
     depth_metrics: dict[str, Any]
     attack_surface_graph: dict[str, Any]
     generated_payloads: list[str]
+    pending_mutation_payload: dict[str, str]
+    roe_disallow_patterns: list[str]
 
     # -----------------------------------------------------------------------
     # Repetition detection
@@ -181,6 +183,8 @@ def make_initial_state(
         depth_metrics={},
         attack_surface_graph={},
         generated_payloads=[],
+        pending_mutation_payload={},
+        roe_disallow_patterns=[],
         repeated_action_count=0,
         last_repeated_action_key=None,
         previous_actions=[],

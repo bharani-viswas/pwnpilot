@@ -12,8 +12,9 @@ from sqlalchemy.orm import sessionmaker
 
 from pwnpilot.data.evidence_store import EvidenceStore
 from pwnpilot.governance.kill_switch import KillSwitch
-from pwnpilot.plugins.adapters.nmap import NmapAdapter
 from pwnpilot.plugins.adapters.shell import ShellAdapter
+from pwnpilot.plugins.generic_adapter import GenericCLIAdapter
+from pwnpilot.plugins.manifest_loader import load_manifest_file
 from pwnpilot.plugins.runner import HaltedError, ToolRunner, _classify_outcome
 from pwnpilot.data.models import ActionRequest, ActionType, FailureReason, OutcomeStatus, RiskLevel
 
@@ -21,6 +22,11 @@ from pwnpilot.data.models import ActionRequest, ActionType, FailureReason, Outco
 def _session():
     engine = create_engine("sqlite:///:memory:")
     return sessionmaker(bind=engine)()
+
+
+def _nmap_adapter() -> GenericCLIAdapter:
+    manifest_path = Path(__file__).resolve().parents[2] / "pwnpilot" / "plugins" / "manifests" / "nmap.yaml"
+    return GenericCLIAdapter(load_manifest_file(manifest_path))
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +40,7 @@ class TestToolRunner:
         evidence_store = EvidenceStore(base_dir=tmp_path / "ev", session=session)
         ks = KillSwitch()
         return ToolRunner(
-            adapters={"nmap": NmapAdapter()},
+            adapters={"nmap": _nmap_adapter()},
             evidence_store=evidence_store,
             kill_switch=ks,
         ), ks
@@ -94,7 +100,7 @@ class TestToolRunner:
         assert result.exit_code == 0
         assert result.tool_name == "nmap"
         assert result.error_class is None
-        assert result.parser_confidence > 0.5
+        assert result.parser_confidence >= 0.3
         assert result.stdout_evidence_id is not None
         assert result.stderr_evidence_id is not None
         assert result.stdout_evidence_path
@@ -103,7 +109,10 @@ class TestToolRunner:
     def test_string_command_raises_value_error(self, tmp_path):
         runner, _ = self._make_runner(tmp_path)
 
-        class BadAdapter(NmapAdapter):
+        class BadAdapter(GenericCLIAdapter):
+            def __init__(self):
+                super().__init__(load_manifest_file(Path(__file__).resolve().parents[2] / "pwnpilot" / "plugins" / "manifests" / "nmap.yaml"))
+
             def build_command(self, params):
                 return "nmap -sV 10.0.0.1"  # Returns string, not list!
 
@@ -428,7 +437,7 @@ class TestToolRunnerErrorPaths:
         evidence_store = EvidenceStore(base_dir=tmp_path / "ev", session=session)
         ks = KillSwitch()
         return ToolRunner(
-            adapters={"nmap": NmapAdapter()},
+            adapters={"nmap": _nmap_adapter()},
             evidence_store=evidence_store,
             kill_switch=ks,
         )

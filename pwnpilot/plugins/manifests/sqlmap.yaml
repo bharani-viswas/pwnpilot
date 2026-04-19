@@ -1,0 +1,68 @@
+name: sqlmap
+version: 1.x
+risk_class: active_scan
+description: Automated SQL injection detection (manifest runtime)
+binary: sqlmap
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+    data:
+      type: string
+      default: ''
+    payload:
+      type: string
+      default: ''
+    level:
+      type: integer
+      minimum: 1
+      maximum: 3
+      default: 1
+    risk:
+      type: integer
+      minimum: 1
+      maximum: 2
+      default: 1
+    forms:
+      type: boolean
+      default: false
+  x_supported_target_types:
+  - url
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: true
+  payload_delivery:
+    method: arg
+    arg_flag: --data
+args:
+- sqlmap
+- -u
+- '{target}'
+- --level
+- '{level}'
+- --risk
+- '{risk}'
+- --batch
+- --no-cast
+- when: data
+  parts:
+  - --data
+  - '{data}'
+- when: payload and not data
+  parts:
+  - --data
+  - '{payload}'
+- when: forms
+  parts:
+  - --forms
+parse:
+  strategy: sqlmap_text
+checksum_sha256: 9893740d1d63a5fc097897008543efc30e4964425959e4f937a5c3ae3b51a70d
+signature_b64: y62yq41c9xo5eR8Vd1w99jKht68kg/XSOd3r4LHx5cGCzz0JQeVA0n4Sp+lnnp+AOSvCKguJuaP1ODDo9FLHDQ==

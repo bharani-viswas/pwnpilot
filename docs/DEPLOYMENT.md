@@ -11,6 +11,16 @@ Production deployment procedures, verification, and operations for PwnPilot.
 - [Monitoring & Troubleshooting](#monitoring--troubleshooting)
 - [Operational Procedures](#operational-procedures)
 
+## Document Scope
+
+This guide focuses on installation, service setup, and day-1/day-2 operational checks.
+
+For deep operational workflows, use these companion guides:
+- [DB_OPERATIONS.md](DB_OPERATIONS.md): schema lifecycle, backup/restore, and advanced SQL procedures
+- [LEGAL_HOLDS.md](LEGAL_HOLDS.md): legal-hold lifecycle and governance controls
+- [PAYLOAD_TELEMETRY.md](PAYLOAD_TELEMETRY.md): telemetry extraction and interpretation
+- [CONFIGURATION_REFERENCE.md](CONFIGURATION_REFERENCE.md): full config surface and precedence details
+
 ---
 
 ## Pre-Deployment
@@ -296,6 +306,22 @@ bash /tmp/verify.sh
 
 ## System Configuration
 
+### Configuration Precedence and Safe Overrides
+
+At runtime, configuration is resolved in this order:
+1. `PWNPILOT_CONFIG`
+2. `./config.yaml` in the current working directory
+3. `~/.pwnpilot/config.yaml`
+4. `/etc/pwnpilot/config.yaml`
+
+If a config is loaded from the current working directory, pwnpilot emits a warning so operators can avoid accidental environment drift in production. For deterministic deployments, set `PWNPILOT_CONFIG` explicitly in your systemd environment file.
+
+Example (`/etc/pwnpilot/pwnpilot.env`):
+
+```bash
+PWNPILOT_CONFIG=/etc/pwnpilot/config.yaml
+```
+
 ### LLM Provider Setup
 
 #### OpenAI Configuration
@@ -405,9 +431,91 @@ sudo journalctl -u pwnpilot -f     # Follow logs
 sudo journalctl -u pwnpilot -n 50  # Last 50 lines
 ```
 
+### NVD API Key for CVE Enrichment
+
+If `NVD_API_KEY` is not set, CVE enrichment still works but is rate-limited by the anonymous NVD quota and may run significantly slower.
+
+```bash
+# Recommended for production enrichment performance
+echo 'NVD_API_KEY=<your-nvd-key>' | sudo tee -a /etc/pwnpilot/pwnpilot.env
+sudo systemctl restart pwnpilot
+```
+
+Operational note: authenticated NVD usage typically allows a much higher request budget than anonymous usage.
+
+### Tool Wordlist Overrides
+
+`gobuster` wordlist path can be overridden in config:
+
+```yaml
+tools:
+  gobuster:
+    wordlist: "/usr/share/wordlists/dirb/common.txt"
+```
+
+Use a smaller list for faster scans or a larger list for deeper enumeration.
+
+### Persistence Tables and Migrations
+
+New persistence tables must be present in deployed environments:
+- `rate_limit_records`
+- `legal_holds`
+
+Apply and verify migration state:
+
+```bash
+cd /opt/pwnpilot
+alembic upgrade head
+alembic current
+alembic history
+```
+
+If these tables are missing, rate-limit restart durability and legal-hold persistence will not function.
+
+For table-level schema details and migration rollback procedures, see [DB_OPERATIONS.md](DB_OPERATIONS.md).
+
+### Legal Hold Operations in Production
+
+Before scheduled retention cleanup windows:
+1. Verify active holds.
+2. Confirm expected protected engagements.
+3. Proceed with retention job only after validation.
+
+Example inspection query:
+
+```bash
+sqlite3 /var/lib/pwnpilot/pwnpilot.db \
+  "SELECT engagement_id, holder, placed_at FROM legal_holds WHERE released_at IS NULL;"
+```
+
+For hold placement/release runbooks and compliance workflows, see [LEGAL_HOLDS.md](LEGAL_HOLDS.md).
+
 ---
 
 ## Monitoring & Troubleshooting
+
+### Payload Telemetry Monitoring
+
+Postmortem artifacts include payload telemetry to diagnose payload effectiveness and policy friction:
+- `total_generations`
+- `preflight_rejected`
+- `tools_used`
+- `techniques_attempted`
+- `mutation_rounds`
+- `semantic_outcomes`
+
+Quick extraction:
+
+```bash
+jq '.payload_telemetry' reports/postmortem_<engagement-id>.json
+```
+
+Common interpretation:
+- High `preflight_rejected`: ROE patterns may be too restrictive.
+- High `mutation_rounds`: target defenses or payload strategy mismatch.
+- Limited `tools_used`: planner routing or capability discovery gap.
+
+For complete metric definitions and tuning strategies, see [PAYLOAD_TELEMETRY.md](PAYLOAD_TELEMETRY.md).
 
 ### Health Check Commands
 
@@ -459,6 +567,28 @@ alembic upgrade head
 
 # Verify
 pwnpilot check
+```
+
+#### Issue: Rate Limits Not Surviving Restart
+
+```bash
+# Confirm migration level and table presence
+alembic current
+sqlite3 /var/lib/pwnpilot/pwnpilot.db \
+  ".tables" | grep rate_limit_records
+```
+
+If missing, run `alembic upgrade head` and restart service.
+
+For persistent rate-limit internals and cleanup semantics, see [DB_OPERATIONS.md](DB_OPERATIONS.md).
+
+#### Issue: Evidence Expected but Missing from Reports
+
+Zero-byte evidence artifacts are excluded from report aggregation by design. Check evidence metadata first:
+
+```bash
+sqlite3 /var/lib/pwnpilot/pwnpilot.db \
+  "SELECT file_path, size_bytes FROM evidence_index WHERE engagement_id='<engagement-id>' ORDER BY timestamp DESC LIMIT 20;"
 ```
 
 #### Issue: Permission Denied
@@ -609,6 +739,6 @@ cat report.json
 
 ---
 
-**Last Updated:** April 12, 2026  
-**Version:** 1.0  
+**Last Updated:** April 19, 2026  
+**Version:** 1.1  
 **Status:** Current with PwnPilot v0.1.0

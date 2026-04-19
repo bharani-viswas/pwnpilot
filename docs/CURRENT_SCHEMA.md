@@ -215,6 +215,44 @@ This document describes the current state of the pwnpilot database schema as of 
 
 ---
 
+### 9. rate_limit_records (Migration 4)
+**Purpose**: Persistent storage for per-engagement rate-limit counters.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-----------|-------|
+| id | String(36) | PK | UUID for record |
+| engagement_id | String(36) | Indexed | Engagement identifier |
+| action_class | String(64) | Indexed | Action class bucket |
+| timestamp | Float | Indexed | Unix epoch |
+
+**Indexes**:
+- `ix_rate_limit_records_engagement_id` (engagement_id)
+- `ix_rate_limit_records_action_class` (action_class)
+- `ix_rate_limit_records_timestamp` (timestamp)
+- `ix_rate_limit_records_composite` (engagement_id, action_class)
+
+---
+
+### 10. legal_holds (Migration 5)
+**Purpose**: Persistent legal holds that block TTL-based evidence deletion.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-----------|-------|
+| id | String(36) | PK | UUID for hold |
+| engagement_id | String(36) | Unique, Indexed | One hold per engagement |
+| holder | String(256) | - | Hold owner |
+| reason | Text | - | Business/legal reason |
+| placed_at | DateTime | TZ-aware | Hold creation timestamp |
+| released_at | DateTime | Nullable | Release timestamp |
+| released_by | String(256) | Nullable | Releasing actor |
+
+**Indexes**:
+- `ix_legal_holds_engagement_id` (engagement_id, unique)
+- `ix_legal_holds_placed_at` (placed_at)
+- `ix_legal_holds_released_at` (released_at)
+
+---
+
 ## Key Design Patterns
 
 ### 1. Immutable Audit Trail
@@ -254,6 +292,8 @@ All foreign keys reference a base `engagements` table (defined in pwnpilot data 
 - `engagement_policies.roe_id` → roe_files.roe_id
 - `roe_approval_records.engagement_id` → engagements.engagement_id
 - `roe_approval_records.roe_id` → roe_files.roe_id
+- `rate_limit_records.engagement_id` → engagements.engagement_id (application-enforced relationship)
+- `legal_holds.engagement_id` → engagements.engagement_id (application-enforced relationship)
 
 ---
 
@@ -270,5 +310,5 @@ The following columns store structured data as JSON strings:
 
 ---
 
-**Last Updated**: April 12, 2026
-**Schema Version**: 8f2a1c3b4d5e (add_roe_tables migration)
+**Last Updated**: April 20, 2026
+**Schema Version**: 0b2c3d4e5f6a (add_legal_holds_table migration)

@@ -1,0 +1,29 @@
+name: whois
+version: 5.x
+risk_class: passive_recon
+description: WHOIS domain registration and ownership lookup
+binary: whois
+input_schema:
+  type: object
+  required:
+  - target
+  properties:
+    target:
+      type: string
+  x_supported_target_types:
+  - domain
+  - ip
+output_schema:
+  type: object
+  properties:
+    findings:
+      type: array
+capabilities:
+  accepts_payload: false
+args:
+- whois
+- '{target}'
+parse:
+  strategy: whois_text
+checksum_sha256: e980d83a9329081a8a10ec7c1c2a218af1c949fe3b9f647eb1c7c7282fbff215
+signature_b64: K4qjN0amLG+XziDNsp61z9gGYrLSaRXRvIIfJrzcJe6o4ODcauhMGXFdmwEv22ThPx52t17syg52mTk8Qq/1AA==

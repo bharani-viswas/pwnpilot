@@ -18,7 +18,8 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Final
+from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 import structlog
 
@@ -30,6 +31,9 @@ from pwnpilot.data.models import (
     PolicyDecision,
     PolicyVerdict,
 )
+
+if TYPE_CHECKING:
+    from pwnpilot.data.rate_limit_store import RateLimitStore
 
 log = structlog.get_logger(__name__)
 
@@ -81,9 +85,14 @@ class PolicyEngine:
     execution.  It must be called for every action before execution begins.
     """
 
-    def __init__(self, engagement_service: EngagementService) -> None:
+    def __init__(
+        self,
+        engagement_service: EngagementService,
+        rate_limit_store: RateLimitStore | None = None,
+    ) -> None:
         self._engagement_svc = engagement_service
-        # Per-engagement rate limiters keyed by (engagement_id, action_class)
+        self._rate_limit_store = rate_limit_store
+        # Per-engagement rate limiters keyed by (engagement_id, action_class) — fallback in-memory
         self._hard_buckets: dict[str, _TokenBucket] = defaultdict(
             lambda: _TokenBucket(capacity=_HARD_RATE_LIMIT)
         )
@@ -139,6 +148,30 @@ class PolicyEngine:
         )
         return decision
 
+    def reset_engagement(self, engagement_id: UUID | str) -> None:
+        """
+        Clear rate-limit counters for a completed engagement.
+        
+        Called when an engagement finishes to prevent in-memory counter leaks
+        across engagements in the same process.
+        """
+        eng_id = str(engagement_id)
+        
+        # Clear in-memory buckets
+        keys_to_delete = [k for k in self._hard_buckets.keys() if k.startswith(f"{eng_id}:")]
+        for key in keys_to_delete:
+            del self._hard_buckets[key]
+        
+        # Clear in-memory soft counts
+        with self._soft_lock:
+            soft_keys_to_delete = [k for k in self._soft_counts.keys() if k.startswith(f"{eng_id}:")]
+            for key in soft_keys_to_delete:
+                del self._soft_counts[key]
+        
+        # Clear from persistent store
+        if self._rate_limit_store:
+            self._rate_limit_store.reset_engagement(engagement_id)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -166,22 +199,48 @@ class PolicyEngine:
 
         if atype == ActionType.ACTIVE_SCAN:
             bucket_key = f"{eng_id}:active_scan"
-            if not self._hard_buckets[bucket_key].try_consume():
-                log.warning(
-                    "policy.rate_limit_exceeded",
-                    action_type=atype,
-                    engagement_id=eng_id,
-                    limit=_HARD_RATE_LIMIT,
-                )
-                return PolicyDecision(
-                    verdict=PolicyVerdict.DENY,
-                    reason=(
-                        f"RATE_LIMIT_EXCEEDED: active_scan limit of "
-                        f"{_HARD_RATE_LIMIT}/min exceeded."
-                    ),
-                    gate_type=GateType.RATE_LIMIT,
-                    action_id=action.action_id,
-                )
+            
+            # Try persistent store first, fall back to in-memory
+            if self._rate_limit_store:
+                count = self._rate_limit_store.count_recent(eng_id, "active_scan")
+                if count >= _HARD_RATE_LIMIT:
+                    log.warning(
+                        "policy.rate_limit_exceeded",
+                        action_type=atype,
+                        engagement_id=eng_id,
+                        limit=_HARD_RATE_LIMIT,
+                        source="persistent_store",
+                    )
+                    return PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            f"RATE_LIMIT_EXCEEDED: active_scan limit of "
+                            f"{_HARD_RATE_LIMIT}/min exceeded."
+                        ),
+                        gate_type=GateType.RATE_LIMIT,
+                        action_id=action.action_id,
+                    )
+                self._rate_limit_store.record_action(eng_id, "active_scan")
+            else:
+                # Fallback: use in-memory bucket
+                if not self._hard_buckets[bucket_key].try_consume():
+                    log.warning(
+                        "policy.rate_limit_exceeded",
+                        action_type=atype,
+                        engagement_id=eng_id,
+                        limit=_HARD_RATE_LIMIT,
+                        source="in_memory",
+                    )
+                    return PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            f"RATE_LIMIT_EXCEEDED: active_scan limit of "
+                            f"{_HARD_RATE_LIMIT}/min exceeded."
+                        ),
+                        gate_type=GateType.RATE_LIMIT,
+                        action_id=action.action_id,
+                    )
+            
             return PolicyDecision(
                 verdict=PolicyVerdict.ALLOW,
                 reason="active_scan allowed within rate limit.",
@@ -191,16 +250,33 @@ class PolicyEngine:
 
         if atype == ActionType.RECON_PASSIVE:
             soft_key = f"{eng_id}:recon_passive"
-            with self._soft_lock:
-                self._soft_counts[soft_key] += 1
-                count = self._soft_counts[soft_key]
-            if count > _SOFT_RATE_LIMIT:
-                log.warning(
-                    "policy.soft_rate_limit_breach",
-                    action_type=atype,
-                    count=count,
-                    limit=_SOFT_RATE_LIMIT,
-                )
+            
+            # Soft rate limit — use persistent store if available
+            if self._rate_limit_store:
+                count = self._rate_limit_store.count_recent(eng_id, "recon_passive")
+                if count > _SOFT_RATE_LIMIT:
+                    log.warning(
+                        "policy.soft_rate_limit_breach",
+                        action_type=atype,
+                        count=count,
+                        limit=_SOFT_RATE_LIMIT,
+                        source="persistent_store",
+                    )
+                self._rate_limit_store.record_action(eng_id, "recon_passive")
+            else:
+                # Fallback: use in-memory
+                with self._soft_lock:
+                    self._soft_counts[soft_key] += 1
+                    count = self._soft_counts[soft_key]
+                if count > _SOFT_RATE_LIMIT:
+                    log.warning(
+                        "policy.soft_rate_limit_breach",
+                        action_type=atype,
+                        count=count,
+                        limit=_SOFT_RATE_LIMIT,
+                        source="in_memory",
+                    )
+            
             return PolicyDecision(
                 verdict=PolicyVerdict.ALLOW,
                 reason="recon_passive allowed.",
