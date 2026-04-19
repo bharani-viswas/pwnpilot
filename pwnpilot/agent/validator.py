@@ -282,7 +282,6 @@ class ValidatorNode:
         try:
             engagement_id = UUID(str(state.get("engagement_id", "")))
             self._event_bus.publish(
-                engagement_id,
                 ExecutionEvent(
                     engagement_id=engagement_id,
                     event_type=ExecutionEventType.VALIDATOR_REJECTED,
@@ -293,7 +292,7 @@ class ValidatorNode:
                         "rationale": rationale,
                         "nonproductive_cycle_streak": int(next_streak),
                     },
-                ),
+                )
             )
         except Exception:
             # Rejection telemetry must never interrupt validator decisions.
@@ -363,15 +362,22 @@ class ValidatorNode:
         risk_class = str(tool_meta.get("risk_class", "")).strip().lower()
         action_type = str(proposal.get("action_type", "")).strip().lower()
         if risk_class and action_type and risk_class != action_type:
-            return {
-                "rationale": (
-                    f"Tool '{tool_name}' has risk class '{risk_class}' but the proposal action_type is "
-                    f"'{action_type}'. Choose a tool whose risk class matches the requested action."
-                ),
-                "rejection_reason_code": "RISK_CLASS_MISMATCH",
-                "rejection_reason_detail": f"tool risk_class={risk_class}, action_type={action_type}",
-                "rejection_class": "capability",
-            }
+            # Allow if the tool explicitly declares this action_type as compatible.
+            compatible = [
+                str(v).strip().lower()
+                for v in (tool_meta.get("compatible_action_types") or [])
+                if str(v).strip()
+            ]
+            if action_type not in compatible:
+                return {
+                    "rationale": (
+                        f"Tool '{tool_name}' has risk class '{risk_class}' but the proposal action_type is "
+                        f"'{action_type}'. Choose a tool whose risk class matches the requested action."
+                    ),
+                    "rejection_reason_code": "RISK_CLASS_MISMATCH",
+                    "rejection_reason_detail": f"tool risk_class={risk_class}, action_type={action_type}",
+                    "rejection_class": "capability",
+                }
 
         required = list(tool_meta.get("required_params", []))
         params = proposal.get("params") if isinstance(proposal.get("params"), dict) else {}

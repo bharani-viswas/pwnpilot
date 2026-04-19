@@ -279,8 +279,6 @@ def test_start_roe_interpretation_and_approval_branches(tmp_path: Path) -> None:
     roe_file = tmp_path / "roe.yaml"
     roe_file.write_text("engagement: {}\nscope: {}\npolicy: {}\n", encoding="utf-8")
 
-    preflight = {"target_family": "web", "sequence": [], "missing_recommended_tools": []}
-
     fake_cfg = SimpleNamespace(llm=SimpleNamespace(api_key="", model_name="m", api_base_url=""))
 
     class _InterpreterInvalid:
@@ -340,22 +338,20 @@ def test_start_roe_interpretation_and_approval_branches(tmp_path: Path) -> None:
         with patch("pwnpilot.cli.load_config", return_value=fake_cfg):
             with patch("pwnpilot.agent.roe_interpreter.ROEInterpreter", _InterpreterGood):
                 with patch("pwnpilot.control.roe_approval.ApprovalWorkflow", _WorkflowGood):
-                    with patch("pwnpilot.runtime.get_engagement_preflight", return_value=preflight):
-                        with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
-                            with patch("typer.prompt", return_value="secret"):
-                                ok = runner.invoke(app, ["start", "--name", "t", "--roe-file", str(roe_file)])
+                    with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
+                        with patch("typer.prompt", return_value="secret"):
+                            ok = runner.invoke(app, ["start", "--name", "t", "--roe-file", str(roe_file)])
     assert ok.exit_code == 0
 
     with patch("pwnpilot.data.roe_validator.validate_roe_file", return_value=(True, "")):
         with patch("pwnpilot.cli.load_config", return_value=fake_cfg):
             with patch("pwnpilot.agent.roe_interpreter.ROEInterpreter", _InterpreterGood):
                 with patch("pwnpilot.control.roe_approval.ApprovalWorkflow", _WorkflowGood):
-                    with patch("pwnpilot.runtime.get_engagement_preflight", return_value=preflight):
-                        with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
-                            skip = runner.invoke(
-                                app,
-                                ["start", "--name", "t", "--roe-file", str(roe_file), "--roe-skip-approval"],
-                            )
+                    with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
+                        skip = runner.invoke(
+                            app,
+                            ["start", "--name", "t", "--roe-file", str(roe_file), "--roe-skip-approval"],
+                        )
     assert skip.exit_code == 0
 
 
@@ -404,21 +400,19 @@ def test_start_additional_error_and_legacy_branches(tmp_path: Path) -> None:
     assert legacy_missing_hash.exit_code == 1
 
     # legacy branch: implicit authoriser fallback and local URL warning
-    preflight = {"target_family": "web", "sequence": [], "missing_recommended_tools": []}
-    with patch("pwnpilot.runtime.get_engagement_preflight", return_value=preflight):
-        with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
-            legacy_ok = runner.invoke(
-                app,
-                [
-                    "start",
-                    "--name",
-                    "legacy",
-                    "--url",
-                    "http://localhost:3000",
-                    "--roe-hash",
-                    "a" * 64,
-                ],
-            )
+    with patch("pwnpilot.runtime.create_and_run_engagement", return_value=str(uuid4())):
+        legacy_ok = runner.invoke(
+            app,
+            [
+                "start",
+                "--name",
+                "legacy",
+                "--url",
+                "http://localhost:3000",
+                "--roe-hash",
+                "a" * 64,
+            ],
+        )
     assert legacy_ok.exit_code == 0
 
 

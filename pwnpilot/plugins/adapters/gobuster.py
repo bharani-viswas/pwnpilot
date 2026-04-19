@@ -187,6 +187,7 @@ class GobusterAdapter(BaseAdapter):
         findings: list[dict[str, Any]] = []
         execution_hints: list[dict[str, Any]] = []
         wildcard_detected = False
+        wildcard_force_enabled = False
 
         for raw in lines:
             line = raw.strip()
@@ -206,6 +207,7 @@ class GobusterAdapter(BaseAdapter):
                 continue
 
             if "force processing of wildcard responses" in line.lower():
+                wildcard_force_enabled = True
                 continue
 
             m_dir = _DIR_LINE_RE.match(line)
@@ -234,17 +236,33 @@ class GobusterAdapter(BaseAdapter):
                     }
                 )
 
-        if findings and wildcard_detected:
+        if findings and wildcard_detected and not wildcard_force_enabled:
+            suppressed_count = len(findings)
+            findings = []
+            execution_hints.append(
+                normalize_execution_hint(
+                    code="wildcard_findings_suppressed",
+                    message="Wildcard-tainted gobuster path results were suppressed until secondary validation is available.",
+                    severity="warning",
+                    recommended_action="Re-run with explicit wildcard override only when policy permits, then validate candidate paths with a deterministic follow-up request.",
+                )
+            )
+            confidence = 0.35
+            raw_summary = f"gobuster suppressed {suppressed_count} wildcard-tainted item(s)"
+        elif findings and wildcard_detected:
             confidence = 0.45
+            raw_summary = f"gobuster discovered {len(findings)} item(s) under wildcard-force mode"
         elif findings:
             confidence = 0.85
+            raw_summary = f"gobuster discovered {len(findings)} item(s)"
         else:
             confidence = 0.6
+            raw_summary = "gobuster discovered 0 item(s)"
 
         return ParsedOutput(
             findings=findings,
             execution_hints=execution_hints,
             new_findings_count=len(findings),
             confidence=confidence,
-            raw_summary=f"gobuster discovered {len(findings)} item(s)",
+            raw_summary=raw_summary,
         )

@@ -575,8 +575,8 @@ class BaseAdapter:
 
 **Vault (`secrets/vault.py`):**
 - Secrets encrypted at rest using `cryptography` Fernet symmetric key.
-- Key stored outside the repository (env var `INTRUDER_VAULT_KEY` or key file at path set by `INTRUDER_VAULT_KEY_FILE`; env var takes precedence; never committed).
-- **Key rotation:** The vault supports multi-key envelopes. When a new key is provided via `INTRUDER_VAULT_KEY_NEW`, the vault decrypts all secrets with the old key and re-encrypts them with the new key in a single atomic transaction on next startup. After successful rotation, the old key is invalidated. This follows the `cryptography.fernet.MultiFernet` pattern.
+- Key stored outside the repository (env var `PWNPILOT_VAULT_KEY` or key file at path set by `PWNPILOT_VAULT_KEY_FILE`; env var takes precedence; never committed).
+- **Key rotation:** The vault supports multi-key envelopes. When a new key is provided via `PWNPILOT_VAULT_KEY_NEW`, the vault decrypts all secrets with the old key and re-encrypts them with the new key in a single atomic transaction on next startup. After successful rotation, the old key is invalidated. This follows the `cryptography.fernet.MultiFernet` pattern.
 - Scoped short-lived tokens provided to adapters at execution time, not stored in adapter scope.
 - Keys are never logged, never included in audit payloads, and never passed through the redactor (they are excluded from LLM context entirely).
 
@@ -974,7 +974,7 @@ Push / PR
 **Rationale:** Prevents orphaned subprocesses and ensures all in-flight audit events are flushed before process exit.
 
 ### ADR-010: Structured JSON logging via structlog
-**Decision:** All log output uses `structlog` with `JSONRenderer` bound to stdout. Log level is configurable via `INTRUDER_LOG_LEVEL` env var.
+**Decision:** All log output uses `structlog` with `JSONRenderer` bound to stdout. Log level is configurable via `PWNPILOT_LOGGING__LEVEL` env var.
 **Rationale:** Structured logs are machine-parseable, compatible with log aggregation stacks, and preserve context (engagement_id, action_id) without string interpolation.
 
 ### ADR-011: pip hash-pinned requirements
@@ -982,7 +982,7 @@ Push / PR
 **Rationale:** Prevents dependency substitution attacks. Installation fails if any package hash does not match.
 
 ### ADR-012: Fernet multi-key envelope for key rotation
-**Decision:** The vault uses `cryptography.fernet.MultiFernet` to support decryption with multiple keys. Rotation is triggered by providing `INTRUDER_VAULT_KEY_NEW` at startup.
+**Decision:** The vault uses `cryptography.fernet.MultiFernet` to support decryption with multiple keys. Rotation is triggered by providing `PWNPILOT_VAULT_KEY_NEW` at startup.
 **Rationale:** Zero-downtime key rotation without losing access to previously encrypted secrets.
 
 ### ADR-013: LangGraph as multi-agent framework
@@ -1147,44 +1147,71 @@ This ensures the audit chain captures not just tool executions but every LLM rea
 
 ### 15.1 Config File Format
 - Primary config: `config.yaml` (TOML also accepted via `config.toml`).
-- Location search order: `$INTRUDER_CONFIG`, then `./config.yaml`, then `~/.pwnpilot/config.yaml`.
+- Location search order: `$PWNPILOT_CONFIG`, then `./config.yaml`, then `~/.pwnpilot/config.yaml`.
 - All values have explicit defaults; the application validates the config schema on startup using Pydantic and fails fast with a clear error if required fields are missing.
 
 ### 15.2 Environment Variable Overrides
-Every config key can be overridden by an environment variable prefixed `INTRUDER_`. Nested keys use `__` as separator (e.g., `INTRUDER_POLICY__MAX_ACTIVE_SCAN_PER_MINUTE=5`).
+Every config key can be overridden by an environment variable prefixed `PWNPILOT_`. Nested keys use `__` as separator (e.g., `PWNPILOT_POLICY__ACTIVE_SCAN_RATE_LIMIT=5`).
 
 ### 15.3 Canonical Config Schema (top-level keys)
 ```yaml
 database:
-  backend: sqlite | postgresql
   url: str
+  pool_size: int
+  max_overflow: int
   # SECURITY: Never embed credentials in this field for PostgreSQL.
   # Use the format: postgresql+psycopg2://user@host/db and set
   # PGPASSWORD or a .pgpass file, or use the vault:
-  # url: postgresql+psycopg2://${INTRUDER_DB_USER}:${INTRUDER_DB_PASS}@host/db
-  # where INTRUDER_DB_USER and INTRUDER_DB_PASS are injected from the vault at startup.
+  # url: postgresql+psycopg2://${PWNPILOT_DB_USER}:${PWNPILOT_DB_PASS}@host/db
+  # where PWNPILOT_DB_USER and PWNPILOT_DB_PASS are injected from the vault at startup.
 
 llm:
-  local_endpoint: str               # Ollama/vLLM base URL
-  local_model: str
-  local_timeout_s: int              # default 120
-  cloud_provider: openai | anthropic | none
-  cloud_model: str
-  cloud_timeout_s: int              # default 60
-  circuit_breaker_threshold: int    # consecutive local failures before open (default 3)
-  circuit_breaker_cooldown_s: int   # default 60
+  model_name: str
+  api_key: str
+  api_base_url: str
+  fallback_model_name: str
+  fallback_api_key: str
+  fallback_api_base_url: str
+  cloud_allowed: bool
+  max_retries: int
+  timeout_seconds: int
+
+embedding:
+  model_name: str
+  api_key: str
+  api_base_url: str
+  fallback_model_name: str
+  fallback_api_key: str
+  fallback_api_base_url: str
+  cloud_allowed: bool
+  max_retries: int
+  timeout_seconds: int
 
 policy:
-  max_active_scan_per_minute: int   # default 10
-  max_iterations: int               # default 50
-  approval_ttl_s: int               # default 3600
+  active_scan_rate_limit: int
+  recon_passive_soft_limit: int
+  require_approval_for_exploit: bool
+  require_approval_for_post_exploit: bool
 
-governance:
-  default_retention_days: int       # default 90
-  max_evidence_bytes: int           # default 268435456 (256 MB)
+agent:
+  max_iterations: int
+  convergence_threshold: int
+  per_step_budget: int
+  adaptive_cooldown_enabled: bool
+  adaptive_cooldown_max: int
+
+storage:
+  evidence_dir: str
+  report_dir: str
+
+logging:
+  level: DEBUG | INFO | WARNING | ERROR | CRITICAL
+  file: str
+  stdout_format: console | json
+  rotation_days: int
 
 secrets:
-  vault_key_env: INTRUDER_VAULT_KEY
+  vault_key_env: PWNPILOT_VAULT_KEY
   vault_key_file: str | null
 
 observability:
@@ -1196,9 +1223,9 @@ plugins:
   trust_store_path: str             # default plugins/trust_store/
   # allow_unsigned is intentionally not a config file option.
   # Unsigned plugins are always rejected. To load an unsigned plugin during
-  # development only, set the environment variable INTRUDER_DEV_ALLOW_UNSIGNED=1.
+  # development only, set the environment variable PWNPILOT_DEV_ALLOW_UNSIGNED=1.
   # This env var is checked at startup and emits a CRITICAL log warning.
-  # It is explicitly blocked if INTRUDER_ENV=production.
+  # It is explicitly blocked if PWNPILOT_ENV=production.
 ```
 
 ### 15.4 Startup Validation

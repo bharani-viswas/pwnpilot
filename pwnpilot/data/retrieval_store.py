@@ -97,7 +97,11 @@ class RetrievalStore:
         ).hexdigest()[:32]
 
         with self._lock:
-            existing = self._session.get(RetrievalDocumentRow, doc_id)
+            existing = (
+                self._session.query(RetrievalDocumentRow)
+                .filter(RetrievalDocumentRow.doc_id == doc_id)
+                .first()
+            )
             if existing:
                 return doc_id
 
@@ -111,8 +115,12 @@ class RetrievalStore:
                 tokens_json=json.dumps(tokens),
                 created_at=datetime.now(timezone.utc),
             )
-            self._session.add(row)
-            self._session.commit()
+            try:
+                self._session.add(row)
+                self._session.commit()
+            except Exception:
+                self._session.rollback()
+                raise
 
         log.debug("retrieval.indexed", engagement_id=str(engagement_id), category=category, doc_id=doc_id)
         return doc_id

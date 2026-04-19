@@ -97,6 +97,24 @@ class TargetResolver:
         # Fallback: keep canonical URL form if it exists, otherwise original input.
         return resolved.normalized_url or resolved.raw_input
 
+    def project_target_for_tool(self, tool_name: str, raw_target: str) -> str:
+        """Project a target into the canonical form expected by a specific tool."""
+        tool = str(tool_name or "").strip().lower()
+        resolved = self.resolve(raw_target)
+
+        if tool == "nmap":
+            if resolved.target_type == "url" and resolved.host:
+                return resolved.host
+            return resolved.host or resolved.normalized_url or resolved.raw_input
+
+        if tool == "gobuster":
+            return resolved.base_url or resolved.normalized_url or resolved.raw_input
+
+        if tool == "sqlmap":
+            return resolved.normalized_url or resolved.base_url or resolved.raw_input
+
+        return resolved.normalized_url or resolved.raw_input
+
     @staticmethod
     def _classify_non_url_target(raw: str) -> str:
         if not raw:

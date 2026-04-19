@@ -296,10 +296,20 @@ database:
   url: sqlite:///pwnpilot.db   # or postgresql://user:pass@localhost/pwnpilot
 
 llm:
-  local_url: http://localhost:11434
-  local_model: llama3
-  validator_model: mistral
-  cloud_allowed: false           # set true to enable cloud LLM fallback
+  model_name: ollama/llama3
+  api_key: ""
+  api_base_url: http://localhost:11434
+  fallback_model_name: gpt-4o-mini
+  fallback_api_key: ""
+  cloud_allowed: false
+
+embedding:
+  model_name: ollama/nomic-embed-text
+  api_key: ""
+  api_base_url: ""
+  fallback_model_name: text-embedding-3-small
+  fallback_api_key: ""
+  cloud_allowed: false
 
 policy:
   active_scan_rate_limit: 10     # max active_scan actions per minute
@@ -320,21 +330,24 @@ logging:
 Any config value can be overridden at runtime using `PWNPILOT_<SECTION>__<KEY>` env vars (double underscore separates nested keys):
 
 ```bash
-export PWNPILOT_LLM__LOCAL_MODEL=mistral
+export PWNPILOT_LLM__MODEL_NAME=ollama/mistral
 export PWNPILOT_DATABASE__URL=postgresql://user:pass@localhost/pwnpilot
 export PWNPILOT_POLICY__ACTIVE_SCAN_RATE_LIMIT=5
 export PWNPILOT_LLM__CLOUD_ALLOWED=true
+export PWNPILOT_EMBEDDING__MODEL_NAME=text-embedding-3-small
 ```
 
-Security-sensitive values use dedicated env vars:
+Security-sensitive values are typically injected via section/key overrides:
 
 | Variable | Purpose |
 |---|---|
 | `PWNPILOT_VAULT_KEY` | Master vault encryption key (base64) |
 | `PWNPILOT_VAULT_KEY_FILE` | Path to file containing vault key |
 | `PWNPILOT_SIGNING_KEY` | Ed25519 private key for report signing |
-| `PWNPILOT_OPENAI_API_KEY` | OpenAI API key (required when `cloud_allowed: true`) |
-| `PWNPILOT_ANTHROPIC_API_KEY` | Anthropic API key |
+| `PWNPILOT_LLM__API_KEY` | Primary LLM API key |
+| `PWNPILOT_LLM__FALLBACK_API_KEY` | Fallback LLM API key |
+| `PWNPILOT_EMBEDDING__API_KEY` | Primary embedding API key |
+| `PWNPILOT_EMBEDDING__FALLBACK_API_KEY` | Fallback embedding API key |
 
 ### Config reference
 
@@ -342,10 +355,13 @@ Security-sensitive values use dedicated env vars:
 |---|---|---|---|
 | `database` | `url` | `sqlite:///pwnpilot.db` | SQLAlchemy database URL |
 | `database` | `pool_size` | `5` | Connection pool size (PostgreSQL) |
-| `llm` | `local_url` | `http://localhost:11434` | Ollama/vLLM base URL |
-| `llm` | `local_model` | `llama3` | Planner/Executor model |
-| `llm` | `validator_model` | `mistral` | Validator model |
+| `llm` | `model_name` | `ollama/llama3` | Primary model identifier |
+| `llm` | `api_base_url` | `""` | Optional custom API base URL |
+| `llm` | `fallback_model_name` | `gpt-4o-mini` | Fallback model |
 | `llm` | `cloud_allowed` | `false` | Enable cloud LLM fallback |
+| `embedding` | `model_name` | `ollama/nomic-embed-text` | Primary embedding model |
+| `embedding` | `fallback_model_name` | `text-embedding-3-small` | Fallback embedding model |
+| `embedding` | `cloud_allowed` | `false` | Enable cloud embedding fallback |
 | `policy` | `active_scan_rate_limit` | `10` | Max active scans per minute (hard block) |
 | `policy` | `require_approval_for_exploit` | `true` | Pause for human approval before exploit actions |
 | `agent` | `max_iterations` | `50` | Agent loop iteration cap |
@@ -902,7 +918,7 @@ docs/
 
 **LLM interpretation timeout**
 - Increase `llm.timeout_seconds` in config
-- Use smaller model: `llm.local_model: mistral7b`
+- Use smaller model: `llm.model_name: ollama/mistral`
 
 ### Getting Help
 

@@ -127,6 +127,7 @@ class PluginLoader:
                 adapter_module=adapter_cls.__module__,
                 source=source,
                 risk_class=manifest.risk_class,
+                compatible_action_types=list(getattr(manifest, "compatible_action_types", []) or []),
                 manifest_version=manifest.version,
                 manifest_schema_version=manifest.schema_version,
                 binary_name=self._infer_binary_name(manifest.name),
@@ -136,6 +137,11 @@ class PluginLoader:
                 optional_params=self._infer_optional_params(manifest.input_schema),
                 description=manifest.description,
                 parameter_schema=dict(manifest.input_schema.get("properties", {})),
+                preferred_target_types=self._infer_preferred_target_types(manifest.input_schema),
+                preconditions=self._infer_preconditions(manifest.input_schema),
+                low_value_hint_codes=self._infer_low_value_hint_codes(manifest.input_schema),
+                fallback_family=self._infer_fallback_family(manifest.input_schema),
+                preflight_required_params=self._infer_preflight_required_params(manifest.input_schema),
                 trust_status=decision.status,
                 trust_reason=decision.reason,
                 enablement_source="trust_rejected",
@@ -151,6 +157,7 @@ class PluginLoader:
             adapter_module=adapter_cls.__module__,
             source=source,
             risk_class=manifest.risk_class,
+            compatible_action_types=list(getattr(manifest, "compatible_action_types", []) or []),
             manifest_version=manifest.version,
             manifest_schema_version=manifest.schema_version,
             binary_name=self._infer_binary_name(manifest.name),
@@ -160,6 +167,11 @@ class PluginLoader:
             optional_params=self._infer_optional_params(manifest.input_schema),
             description=manifest.description,
             parameter_schema=dict(manifest.input_schema.get("properties", {})),
+            preferred_target_types=self._infer_preferred_target_types(manifest.input_schema),
+            preconditions=self._infer_preconditions(manifest.input_schema),
+            low_value_hint_codes=self._infer_low_value_hint_codes(manifest.input_schema),
+            fallback_family=self._infer_fallback_family(manifest.input_schema),
+            preflight_required_params=self._infer_preflight_required_params(manifest.input_schema),
             trust_status=decision.status,
             trust_reason=decision.reason,
             verified_at=verified_at,
@@ -205,3 +217,30 @@ class PluginLoader:
         props = set(input_schema.get("properties", {}).keys())
         required = set(input_schema.get("required", []))
         return sorted(list(props - required))
+
+    def _infer_preferred_target_types(self, input_schema: dict[str, Any]) -> list[str]:
+        explicit = input_schema.get("x_preferred_target_types")
+        if isinstance(explicit, list):
+            return [str(v).strip() for v in explicit if str(v).strip()]
+        return []
+
+    def _infer_preconditions(self, input_schema: dict[str, Any]) -> list[str]:
+        explicit = input_schema.get("x_preconditions")
+        if isinstance(explicit, list):
+            return [str(v).strip() for v in explicit if str(v).strip()]
+        return []
+
+    def _infer_low_value_hint_codes(self, input_schema: dict[str, Any]) -> list[str]:
+        explicit = input_schema.get("x_low_value_hint_codes")
+        if isinstance(explicit, list):
+            return [str(v).strip() for v in explicit if str(v).strip()]
+        return []
+
+    def _infer_fallback_family(self, input_schema: dict[str, Any]) -> str:
+        return str(input_schema.get("x_fallback_family", "")).strip()
+
+    def _infer_preflight_required_params(self, input_schema: dict[str, Any]) -> list[str]:
+        explicit = input_schema.get("x_preflight_required_params")
+        if isinstance(explicit, list):
+            return [str(v).strip() for v in explicit if str(v).strip()]
+        return []

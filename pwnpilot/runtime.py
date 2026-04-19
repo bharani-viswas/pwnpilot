@@ -17,7 +17,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 import yaml
@@ -36,9 +36,9 @@ from pwnpilot.agent.supervisor import Supervisor, build_graph
 from pwnpilot.agent.validator import ValidatorNode
 from pwnpilot.control.approval import ApprovalService
 from pwnpilot.control.operator_session import OperatorSessionManager
-from pwnpilot.control.target_strategy import build_engagement_strategy
 from pwnpilot.data.approval_store import ApprovalStore
 from pwnpilot.control.engagement import EngagementService
+from pwnpilot.control.embedding_router import EmbeddingRouter
 from pwnpilot.control.llm_router import LLMRouter
 from pwnpilot.control.policy import PolicyEngine
 from pwnpilot.data.audit_store import AuditStore
@@ -50,6 +50,7 @@ from pwnpilot.data.models import Engagement, EngagementScope
 from pwnpilot.data.recon_store import ReconStore
 from pwnpilot.governance.authorization import AuthorizationArtifact, assert_authorized
 from pwnpilot.data.correlation import CorrelationEngine
+from pwnpilot.data.engagement_name_store import EngagementNameStore
 from pwnpilot.governance.retention import RetentionManager, EngagementClassification
 from pwnpilot.governance.kill_switch import KillSwitch
 from pwnpilot.governance.simulation import SimulationEngine
@@ -219,8 +220,8 @@ def _emit_terminal_lifecycle_events(
     """Write deterministic terminal engagement/report lifecycle audit events."""
     state = final_state or {}
     completion_state = str(state.get("completion_state", "")).strip() or None
-    error_text = str(state.get("error", "")).strip()
-    termination_reason = str(state.get("termination_reason", "")).strip() or None
+    error_text = _normalize_optional_text(state.get("error")) or ""
+    termination_reason = _normalize_optional_text(state.get("termination_reason"))
     report_complete = bool(state.get("report_complete", False))
     finalization_failed = bool(state.get("finalization_failed", False))
 
@@ -271,11 +272,16 @@ def _normalize_terminal_state(
 ) -> AgentState:
     """Return a terminal-ready state with deterministic completion markers."""
     normalized: AgentState = dict(state or {})
+    normalized["termination_reason"] = _normalize_optional_text(normalized.get("termination_reason"))
+    normalized["error"] = _normalize_optional_text(normalized.get("error"))
 
-    if default_termination_reason and not normalized.get("termination_reason"):
-        normalized["termination_reason"] = default_termination_reason
-    if default_error and not normalized.get("error"):
-        normalized["error"] = default_error
+    fallback_termination_reason = _normalize_optional_text(default_termination_reason)
+    fallback_error = _normalize_optional_text(default_error)
+
+    if fallback_termination_reason and not normalized.get("termination_reason"):
+        normalized["termination_reason"] = fallback_termination_reason
+    if fallback_error and not normalized.get("error"):
+        normalized["error"] = fallback_error
 
     report_complete = bool(normalized.get("report_complete", False))
     completion_state = str(normalized.get("completion_state", "")).strip()
@@ -295,14 +301,102 @@ def _normalize_terminal_state(
         normalized["finalization_failed"] = True
         if not normalized.get("finalization_failure_reason"):
             normalized["finalization_failure_reason"] = (
-                str(normalized.get("error") or "").strip()
-                or str(normalized.get("termination_reason") or "").strip()
+                _normalize_optional_text(normalized.get("error"))
+                or _normalize_optional_text(normalized.get("termination_reason"))
                 or "report_not_generated"
             )
         if completion_state == CompletionState.PENDING.value:
             normalized["completion_state"] = CompletionState.FAILED.value
 
     return normalized
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
+def _objective_counts(state: AgentState | dict[str, Any]) -> tuple[int, int]:
+    progress = state.get("objective_progress", {}) if isinstance(state, dict) else {}
+    if isinstance(progress, dict) and progress:
+        open_count = int(progress.get("open", 0) or 0)
+        in_progress_count = int(progress.get("in_progress", 0) or 0)
+        return open_count, in_progress_count
+
+    open_count = 0
+    in_progress_count = 0
+    objectives = state.get("assessment_objectives", []) if isinstance(state, dict) else []
+    if not isinstance(objectives, list):
+        return 0, 0
+    for item in objectives:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status == "open":
+            open_count += 1
+        elif status == "in_progress":
+            in_progress_count += 1
+    return open_count, in_progress_count
+
+
+def _should_persist_postmortem(state: AgentState | dict[str, Any]) -> bool:
+    previous_actions = state.get("previous_actions", []) if isinstance(state, dict) else []
+    failed_or_degraded_actions = any(
+        isinstance(item, dict)
+        and str(item.get("outcome_status", "")).strip() in {"failed", "degraded"}
+        for item in previous_actions
+    )
+    open_objectives, in_progress_objectives = _objective_counts(state)
+    degradation_reasons = state.get("degradation_reasons", []) if isinstance(state, dict) else []
+    operator_mode = str(state.get("operator_mode", "")).strip().lower() if isinstance(state, dict) else ""
+    operator_messages = state.get("operator_messages", []) if isinstance(state, dict) else []
+    operator_directives = state.get("operator_directives", {}) if isinstance(state, dict) else {}
+
+    return bool(
+        _normalize_optional_text(state.get("error"))
+        or state.get("finalization_failed")
+        or not state.get("report_complete", False)
+        or failed_or_degraded_actions
+        or open_objectives > 0
+        or in_progress_objectives > 0
+        or bool(degradation_reasons)
+        or _normalize_optional_text(state.get("termination_reason"))
+        or operator_mode in {"guided", "monitor"}
+        or bool(operator_messages)
+        or bool(operator_directives)
+    )
+
+
+def _derive_engagement_outcome(state: AgentState | dict[str, Any]) -> str:
+    completion_state = str(state.get("completion_state", "")).strip().lower() if isinstance(state, dict) else ""
+    report_complete = bool(state.get("report_complete", False)) if isinstance(state, dict) else False
+    finalization_failed = bool(state.get("finalization_failed", False)) if isinstance(state, dict) else False
+    run_verdict = str(state.get("run_verdict", "")).strip().lower() if isinstance(state, dict) else ""
+    open_objectives, in_progress_objectives = _objective_counts(state)
+    degradation_reasons = state.get("degradation_reasons", []) if isinstance(state, dict) else []
+    previous_actions = state.get("previous_actions", []) if isinstance(state, dict) else []
+    failed_or_degraded_actions = any(
+        isinstance(item, dict)
+        and str(item.get("outcome_status", "")).strip() in {"failed", "degraded"}
+        for item in previous_actions
+    )
+
+    if finalization_failed or not report_complete or completion_state == CompletionState.FAILED.value:
+        return "failed"
+
+    if (
+        run_verdict == "completed_with_degradation"
+        or bool(degradation_reasons)
+        or open_objectives > 0
+        or in_progress_objectives > 0
+        or failed_or_degraded_actions
+        or _normalize_optional_text(state.get("termination_reason")) is not None
+    ):
+        return "completed_with_degradation"
+
+    return "completed"
 
 
 def _persist_postmortem_artifact(
@@ -313,11 +407,7 @@ def _persist_postmortem_artifact(
 ) -> str | None:
     """Persist a compact terminal snapshot for forensic/debug reporting."""
     state = final_state or {}
-    should_persist = bool(
-        state.get("error")
-        or state.get("finalization_failed")
-        or not state.get("report_complete", False)
-    )
+    should_persist = _should_persist_postmortem(state)
     if not should_persist:
         return None
 
@@ -325,17 +415,25 @@ def _persist_postmortem_artifact(
         output_dir.mkdir(parents=True, exist_ok=True)
         recent_events = list(audit_store.events_for_engagement(engagement_id))[-50:]
         artifact_path = output_dir / f"postmortem_{engagement_id}.json"
+        raw_error = _normalize_optional_text(state.get("error"))
+        engagement_outcome = _derive_engagement_outcome(state)
+        fatal_error = raw_error if engagement_outcome == "failed" else None
+        diagnostic_error = raw_error if engagement_outcome != "failed" else None
         payload = {
             "engagement_id": str(engagement_id),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "error": state.get("error"),
-            "termination_reason": state.get("termination_reason"),
+            "engagement_outcome": engagement_outcome,
+            "error": fatal_error,
+            "diagnostic_error": diagnostic_error,
+            "termination_reason": _normalize_optional_text(state.get("termination_reason")),
             "completion_state": state.get("completion_state"),
             "finalization_failed": bool(state.get("finalization_failed", False)),
             "finalization_failure_reason": state.get("finalization_failure_reason"),
             "report_complete": bool(state.get("report_complete", False)),
             "report_trigger_reason": state.get("report_trigger_reason"),
             "stall_state": state.get("stall_state"),
+            "degradation_reasons": state.get("degradation_reasons", []),
+            "objective_progress": state.get("objective_progress", {}),
             "loop_state": {
                 "iteration_count": state.get("iteration_count", 0),
                 "no_new_findings_streak": state.get("no_new_findings_streak", 0),
@@ -378,13 +476,44 @@ def _persist_postmortem_artifact(
 # ---------------------------------------------------------------------------
 
 
-def get_db_session(config_path: Path | None = None) -> Any:
+def _engagement_db_path(base_url: str, engagement_id: str | None) -> str:
+    """Derive a per-engagement SQLite path from the base URL.
+
+    For SQLite databases, each engagement gets its own file:
+        sqlite:///pwnpilot.db  →  sqlite:///pwnpilot-{engagement_id}.db
+
+    For non-SQLite databases (PostgreSQL etc.) the base URL is returned
+    unchanged because schema-level isolation (engagement_id columns) is
+    sufficient and per-engagement databases are not practical.
+    """
+    if engagement_id and base_url.startswith("sqlite"):
+        # Strip the sqlite:/// prefix, inject engagement id before extension
+        prefix = "sqlite:///" if base_url.startswith("sqlite:///") else "sqlite://"
+        path_part = base_url[len(prefix):]
+        stem, _, ext = path_part.rpartition(".")
+        if not stem:
+            stem = path_part
+            ext = ""
+        new_path = f"{stem}-{engagement_id}.{ext}" if ext else f"{stem}-{engagement_id}"
+        return f"{prefix}{new_path}"
+    return base_url
+
+
+def get_db_session(config_path: Path | None = None, engagement_id: str | None = None) -> Any:
+    """Return a SQLAlchemy session.
+
+    When *engagement_id* is provided and the configured backend is SQLite,
+    a per-engagement database file is used (e.g. ``pwnpilot-<id>.db``).
+    This gives each run full isolation: no cross-engagement table sharing,
+    no uniqueness collisions from repeated tool output, and simple cleanup.
+    """
     cfg = _load_config(config_path)
-    db_url = (
+    base_url = (
         os.environ.get("PWNPILOT_DB_URL")
         or cfg.get("database", {}).get("url")
         or "sqlite:///pwnpilot.db"
     )
+    db_url = _engagement_db_path(base_url, engagement_id)
     if db_url.startswith("sqlite"):
         engine = create_engine(
             db_url,
@@ -409,6 +538,51 @@ def get_db_session(config_path: Path | None = None) -> Any:
 
     Session = sessionmaker(bind=engine)
     return Session()
+
+
+def bind_engagement_name(
+    name: str,
+    engagement_id: UUID,
+    config_path: Path | None = None,
+) -> str:
+    """Bind a user-friendly engagement name to a canonical engagement UUID."""
+    session = get_db_session(config_path=config_path)
+    try:
+        store = EngagementNameStore(session)
+        return store.bind(name=name, engagement_id=engagement_id)
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def resolve_engagement_reference(
+    reference: str,
+    config_path: Path | None = None,
+) -> UUID:
+    """Resolve engagement name or UUID string to canonical engagement UUID."""
+    try:
+        return UUID(reference)
+    except Exception:
+        pass
+
+    session = get_db_session(config_path=config_path)
+    try:
+        store = EngagementNameStore(session)
+        resolved = store.resolve(reference)
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    if resolved is None:
+        raise ValueError(
+            f"Unknown engagement reference {reference!r}. "
+            "Use an existing engagement name or UUID."
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -459,15 +633,21 @@ def get_engagement_session(engagement_id: str) -> dict[str, Any] | None:
 
 def _build_runtime(
     config_path: Path | None = None,
+    engagement_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build and return all runtime components."""
+    """Build and return all runtime components.
+
+    When *engagement_id* is provided, all stores are backed by a dedicated
+    per-engagement SQLite file (e.g. ``pwnpilot-<id>.db``) so that runs are
+    fully isolated from each other.
+    """
     cfg = _load_config(config_path)
     typed_cfg = _load_typed_config(config_path)
 
     # Configure process-wide structured logging from runtime config.
     configure_logging_from_config(getattr(typed_cfg, "logging", None))
 
-    session = get_db_session(config_path)
+    session = get_db_session(config_path, engagement_id=engagement_id)
 
     evidence_dir = Path(
         os.environ.get("PWNPILOT_EVIDENCE_DIR")
@@ -586,6 +766,20 @@ def _build_runtime(
         max_retries=typed_cfg.llm.max_retries,
     )
 
+    # Embedding router — mirrors LLM routing semantics for embedding models
+    embedding_router = EmbeddingRouter(
+        model_name=typed_cfg.embedding.model_name,
+        api_key=typed_cfg.embedding.api_key,
+        api_base_url=typed_cfg.embedding.api_base_url,
+        fallback_model_name=typed_cfg.embedding.fallback_model_name,
+        fallback_api_key=typed_cfg.embedding.fallback_api_key,
+        fallback_api_base_url=typed_cfg.embedding.fallback_api_base_url,
+        cloud_allowed_fn=lambda: typed_cfg.embedding.cloud_allowed,
+        redactor=redactor,
+        timeout_seconds=typed_cfg.embedding.timeout_seconds,
+        max_retries=typed_cfg.embedding.max_retries,
+    )
+
     # Approval service — wired to DB for crash durability, v2 decisions recorded
     approval_store = ApprovalStore(session)
     approval_service = ApprovalService(
@@ -627,6 +821,7 @@ def _build_runtime(
         "runtime_mode": runtime_mode,
         "has_display": has_display,
         "llm_router": llm_router,
+        "embedding_router": embedding_router,
         "approval_service": approval_service,
         "report_generator": report_generator,
         "cfg": cfg,
@@ -660,10 +855,14 @@ def create_and_run_engagement(
     provided it is subscribed to all events for this engagement so callers (e.g.
     the CLI) can print live output without coupling to the TUI.
     """
-    rt = _build_runtime(config_path)
+    # Pre-generate the engagement UUID so the per-engagement SQLite database
+    # file can be created by _build_runtime before any stores are initialised.
+    _engagement_uuid = uuid4()
+    rt = _build_runtime(config_path, engagement_id=str(_engagement_uuid))
 
     now = datetime.now(timezone.utc)
     engagement = Engagement(
+        engagement_id=_engagement_uuid,
         name=name,
         operator_id=os.environ.get("USER", "operator"),
         scope=EngagementScope(
@@ -675,6 +874,18 @@ def create_and_run_engagement(
         authoriser_identity=authoriser_identity,
         valid_from=now,
         valid_until=now + timedelta(hours=valid_hours),
+    )
+
+    name_key = bind_engagement_name(
+        name=name,
+        engagement_id=engagement.engagement_id,
+        config_path=config_path,
+    )
+    log.info(
+        "runtime.engagement_name_bound",
+        engagement_id=str(engagement.engagement_id),
+        engagement_name=name,
+        name_key=name_key,
     )
 
     eng_svc = EngagementService(engagement)
@@ -721,12 +932,10 @@ def create_and_run_engagement(
         "scope_cidrs": scope_cidrs,
         "scope_domains": scope_domains,
         "scope_urls": scope_urls,
-        "strategy_plan": build_engagement_strategy(
-            scope_cidrs=scope_cidrs,
-            scope_domains=scope_domains,
-            scope_urls=scope_urls,
-            available_tools=rt["planner_available_tools"],
-        ),
+        # Runtime planning is intentionally dynamic (LLM-driven).
+        # Keep deterministic strategy only for preflight visibility and guidance,
+        # not as a hard execution-time gate.
+        "strategy_plan": {},
     }
 
     metrics = metrics_registry.get_or_create(str(engagement.engagement_id))
@@ -798,11 +1007,13 @@ def create_and_run_engagement(
         event_bus=rt["event_bus"],
     )
 
-    db_path = Path(
-        os.environ.get("PWNPILOT_DB_URL", "").replace("sqlite:///", "")
-        or rt["typed_cfg"].database.url.replace("sqlite:///", "")
-        or "pwnpilot.db"
+    _base_db_url = (
+        os.environ.get("PWNPILOT_DB_URL")
+        or rt["typed_cfg"].database.url
+        or "sqlite:///pwnpilot.db"
     )
+    _eng_db_url = _engagement_db_path(_base_db_url, str(engagement.engagement_id))
+    db_path = Path(_eng_db_url.replace("sqlite:///", "").replace("sqlite://", ""))
     checkpointer = SqliteCheckpointer.from_path(db_path)
 
     graph = build_graph(planner, validator, executor, reporter, checkpointer=checkpointer)
@@ -878,22 +1089,6 @@ def create_and_run_engagement(
     return str(engagement.engagement_id)
 
 
-def get_engagement_preflight(
-    scope_cidrs: list[str],
-    scope_domains: list[str],
-    scope_urls: list[str],
-    config_path: Path | None = None,
-) -> dict[str, Any]:
-    """Return deterministic target strategy and tool availability for a scope."""
-    rt = _build_runtime(config_path)
-    return build_engagement_strategy(
-        scope_cidrs=scope_cidrs,
-        scope_domains=scope_domains,
-        scope_urls=scope_urls,
-        available_tools=rt["planner_available_tools"],
-    )
-
-
 def resume_engagement(
     engagement_id: UUID,
     config_path: Path | None = None,
@@ -907,13 +1102,15 @@ def resume_engagement(
     original run; LangGraph will automatically resume from the last checkpoint for
     the given thread_id (engagement_id).
     """
-    rt = _build_runtime(config_path)
+    rt = _build_runtime(config_path, engagement_id=str(engagement_id))
 
-    db_path = Path(
-        os.environ.get("PWNPILOT_DB_URL", "").replace("sqlite:///", "")
-        or rt["typed_cfg"].database.url.replace("sqlite:///", "")
-        or "pwnpilot.db"
+    _base_db_url = (
+        os.environ.get("PWNPILOT_DB_URL")
+        or rt["typed_cfg"].database.url
+        or "sqlite:///pwnpilot.db"
     )
+    _eng_db_url = _engagement_db_path(_base_db_url, str(engagement_id))
+    db_path = Path(_eng_db_url.replace("sqlite:///", "").replace("sqlite://", ""))
     checkpointer = SqliteCheckpointer.from_path(db_path)
 
     # Verify a checkpoint exists for this engagement
@@ -1058,12 +1255,8 @@ def resume_engagement(
         llm_router=rt["llm_router"],
         engagement_summary={
             "engagement_id": thread_id,
-            "strategy_plan": build_engagement_strategy(
-                scope_cidrs=[],
-                scope_domains=[],
-                scope_urls=[],
-                available_tools=rt["planner_available_tools"],
-            ),
+            # Resume should preserve dynamic planning semantics as well.
+            "strategy_plan": {},
         },
         audit_store=rt["audit_store"],
         finding_store=rt["finding_store"],
@@ -1170,7 +1363,7 @@ def generate_report(
     output_dir: Path = Path("."),
     config_path: Path | None = None,
 ) -> tuple[Path, Path]:
-    rt = _build_runtime(config_path)
+    rt = _build_runtime(config_path, engagement_id=str(engagement_id))
     return rt["report_generator"].build_bundle(
         engagement_id=engagement_id,
         output_dir=output_dir,
@@ -1285,7 +1478,7 @@ def run_policy_simulation(
 ) -> list[dict]:
     from pwnpilot.data.models import ActionRequest
 
-    rt = _build_runtime(config_path)
+    rt = _build_runtime(config_path, engagement_id=str(engagement_id))
     # Build a minimal engagement for simulation
     now = datetime.now(timezone.utc)
     engagement = Engagement(

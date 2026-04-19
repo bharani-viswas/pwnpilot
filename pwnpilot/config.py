@@ -134,6 +134,59 @@ class LLMConfig(BaseModel):
         return self.fallback_model_name
 
 
+class EmbeddingConfig(BaseModel):
+    """
+    Unified embedding-model configuration mirroring LLM routing patterns.
+
+    Supports LiteLLM embedding providers such as OpenAI, Azure OpenAI, Ollama,
+    vLLM-compatible endpoints, and other OpenAI-compatible APIs.
+    """
+
+    model_name: str = Field(
+        default="ollama/nomic-embed-text",
+        description="Primary embedding model identifier.",
+    )
+    api_key: str = Field(
+        default="",
+        description="API key for primary embedding provider.",
+    )
+    api_base_url: str = Field(
+        default="",
+        description="Custom API base URL for primary embedding provider.",
+    )
+    fallback_model_name: str = Field(
+        default="text-embedding-3-small",
+        description="Fallback embedding model identifier when primary fails.",
+    )
+    fallback_api_key: str = Field(
+        default="",
+        description="API key for fallback embedding provider.",
+    )
+    fallback_api_base_url: str = Field(
+        default="",
+        description="Custom API base URL for fallback embedding provider.",
+    )
+    cloud_allowed: bool = Field(
+        default=False,
+        description="Allow cloud fallback for embeddings when primary fails.",
+    )
+    max_retries: int = Field(default=3, ge=1, le=10)
+    timeout_seconds: int = Field(default=30, ge=5, le=300)
+
+    @property
+    def local_model(self) -> str:
+        """Backward compatibility: maps to model_name"""
+        model = self.model_name
+        if model.startswith("ollama/"):
+            return model.split("/", 1)[1]
+        return model
+
+    @property
+    def cloud_model(self) -> str:
+        """Backward compatibility: maps to fallback_model_name"""
+        return self.fallback_model_name
+
+
 class PolicyConfig(BaseModel):
     active_scan_rate_limit: int = Field(
         default=10,
@@ -302,6 +355,7 @@ class PwnpilotConfig(BaseModel):
 
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -342,6 +396,13 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
             llm_cfg["model_name"] = llm_cfg["local_model"]
         if "cloud_model" in llm_cfg and "fallback_model_name" not in llm_cfg:
             llm_cfg["fallback_model_name"] = llm_cfg["cloud_model"]
+
+    embedding_cfg = raw.get("embedding")
+    if isinstance(embedding_cfg, dict):
+        if "local_model" in embedding_cfg and "model_name" not in embedding_cfg:
+            embedding_cfg["model_name"] = embedding_cfg["local_model"]
+        if "cloud_model" in embedding_cfg and "fallback_model_name" not in embedding_cfg:
+            embedding_cfg["fallback_model_name"] = embedding_cfg["cloud_model"]
 
     return raw
 

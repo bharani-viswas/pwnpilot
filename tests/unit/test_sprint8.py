@@ -180,6 +180,9 @@ class TestCorrelationEngine:
         assert summary["total_findings"] == 2
         assert summary["overall_risk"] == "high"
         assert summary["severity_distribution"]["high"] == 1
+        assert summary["unconfirmed_findings"] == 2
+        assert summary["confirmed_findings"] == 0
+        assert summary["remediation_open_findings"] == 2
         assert "sqlmap" in summary["tool_coverage"]
         assert len(summary["top_findings"]) <= 5
 

@@ -38,6 +38,7 @@ class NmapAdapter(BaseAdapter):
                 "scan_type": {"type": "string", "default": "sV"},
                 "timing": {"type": "integer", "minimum": 0, "maximum": 5, "default": 3},
             },
+            "x_supported_target_types": ["ip", "domain", "cidr"],
         },
         output_schema={
             "type": "object",

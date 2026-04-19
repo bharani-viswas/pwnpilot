@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from pwnpilot.agent.planner import _classify_target_type, _strategy_progress
+from pwnpilot.agent.planner import _classify_target_type
 from pwnpilot.control.llm_router import CircuitState, LLMRouter
 from pwnpilot.plugins.registry import ToolDescriptor, ToolRegistry
 from pwnpilot.runtime import (
@@ -111,7 +111,7 @@ def test_compute_executable_tools_and_filter_catalog(monkeypatch) -> None:
 
 
 def test_run_policy_simulation_returns_decisions(monkeypatch) -> None:
-    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: {})
+    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None, engagement_id=None: {})
 
     actions = [
         {
@@ -129,48 +129,12 @@ def test_run_policy_simulation_returns_decisions(monkeypatch) -> None:
     assert out[0]["verdict"] in {"allow", "deny", "requires_approval"}
 
 
-def test_planner_target_type_and_strategy_progress() -> None:
+def test_planner_target_type_classification() -> None:
     assert _classify_target_type("https://example.com") == "url"
     assert _classify_target_type("10.0.0.0/24") == "cidr"
     assert _classify_target_type("10.0.0.1") == "ip"
     assert _classify_target_type("example.com") == "domain"
     assert _classify_target_type("") == "unknown"
-
-    plan = {
-        "sequence": [
-            {"step_id": "s1", "preferred_tools": ["whatweb"], "fallback_tools": ["nikto"]},
-            {"step_id": "s2", "preferred_tools": ["gobuster"], "fallback_tools": []},
-        ]
-    }
-    previous = [{"tool_name": "whatweb"}]
-    progress = _strategy_progress(plan, previous)
-    assert progress["completed_steps"] == ["s1"]
-    assert progress["current_step"]["step_id"] == "s2"
-    assert progress["remaining_steps"] == 1
-
-
-def test_strategy_progress_keeps_step_current_on_recoverable_hint() -> None:
-    plan = {
-        "sequence": [
-            {
-                "step_id": "web_discovery",
-                "preferred_tools": ["gobuster"],
-                "fallback_tools": ["shell"],
-                "recovery_rules": [
-                    {
-                        "hint_codes": ["wildcard_detected"],
-                        "preferred_tools": ["shell"],
-                    }
-                ],
-            },
-            {"step_id": "web_vuln_scan", "preferred_tools": ["nuclei"], "fallback_tools": []},
-        ]
-    }
-    previous = [{"tool_name": "gobuster", "execution_hint_codes": ["wildcard_detected"]}]
-    progress = _strategy_progress(plan, previous)
-    assert progress["completed_steps"] == []
-    assert progress["current_step"]["step_id"] == "web_discovery"
-    assert progress["current_step"]["recovery_preferred_tools"] == ["shell"]
 
 
 def test_llm_router_helpers_format_parse_and_retry(monkeypatch) -> None:

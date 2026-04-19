@@ -64,6 +64,35 @@ def test_planner_avoids_recent_low_value_tool_outcome() -> None:
     assert result["proposed_action"]["tool_name"] == "nuclei"
 
 
+def test_planner_keeps_sqlmap_params_and_defers_mode_enforcement() -> None:
+    planner = PlannerNode(
+        llm_router=_RepeatSqlmapLLM(),
+        engagement_summary={"engagement_id": str(uuid4())},
+        available_tools=["sqlmap"],
+        tools_catalog=[],
+    )
+
+    state = {
+        **_base_state(),
+        "previous_actions": [
+            {
+                "tool_name": "sqlmap",
+                "target": "http://localhost:3000/login",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["no_forms_detected"],
+            }
+        ],
+    }
+
+    # LLM proposes root target and forms mode; planner now defers mode enforcement
+    # to invocation compilation/executor policy.
+    state["proposed_action"] = None
+    result = planner(state)
+    params = result["proposed_action"].get("params", {})
+    assert result["proposed_action"]["tool_name"] == "sqlmap"
+    assert params.get("forms") is True
+
+
 def test_planner_fallback_skips_tools_with_extra_required_params() -> None:
     planner = PlannerNode(
         llm_router=_RepeatSqlmapLLM(),
@@ -253,7 +282,7 @@ class _JumpAheadLLM:
         }
 
 
-def test_planner_stays_within_step_recovery_candidates() -> None:
+def test_planner_no_longer_forces_step_recovery_candidates() -> None:
     planner = PlannerNode(
         llm_router=_JumpAheadLLM(),
         engagement_summary={
@@ -321,7 +350,7 @@ def test_planner_stays_within_step_recovery_candidates() -> None:
     }
 
     result = planner(state)
-    assert result["proposed_action"]["tool_name"] == "zap"
+    assert result["proposed_action"]["tool_name"] == "nmap"
 
 
 class _RepeatGobusterLLM:
@@ -336,7 +365,7 @@ class _RepeatGobusterLLM:
         }
 
 
-def test_planner_applies_recovery_param_overrides_for_same_tool() -> None:
+def test_planner_uses_dynamic_fallback_instead_of_recovery_param_overrides() -> None:
     planner = PlannerNode(
         llm_router=_RepeatGobusterLLM(),
         engagement_summary={
@@ -399,8 +428,63 @@ def test_planner_applies_recovery_param_overrides_for_same_tool() -> None:
     }
 
     result = planner(state)
-    assert result["proposed_action"]["tool_name"] == "gobuster"
-    assert result["proposed_action"]["params"]["force_wildcard"] is True
+    assert result["proposed_action"]["tool_name"] == "zap"
+
+
+def test_planner_ignores_recovery_override_param_without_step_gating() -> None:
+    planner = PlannerNode(
+        llm_router=_RepeatGobusterLLM(),
+        engagement_summary={
+            "engagement_id": str(uuid4()),
+            "strategy_plan": {
+                "sequence": [
+                    {
+                        "step_id": "web_discovery",
+                        "preferred_tools": ["gobuster"],
+                        "recovery_rules": [
+                            {
+                                "hint_codes": ["wildcard_detected"],
+                                "preferred_tools": ["gobuster"],
+                                "param_overrides": {
+                                    "gobuster": {
+                                        "exclude_length": 0,
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+        available_tools=["gobuster"],
+        tools_catalog=[
+            {
+                "tool_name": "gobuster",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {
+                    "target": {"type": "string"},
+                    "exclude_length": {"type": "integer"},
+                },
+            }
+        ],
+    )
+
+    state = {
+        **_base_state(),
+        "previous_actions": [
+            {
+                "tool_name": "gobuster",
+                "target": "http://localhost:3000",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["wildcard_detected"],
+            }
+        ],
+    }
+
+    result = planner(state)
+    assert "exclude_length" not in result["proposed_action"].get("params", {})
 
 
 def test_planner_forces_pivot_after_reject_streak() -> None:
@@ -673,9 +757,10 @@ def test_planner_parameterizes_sqlmap_target_from_attack_surface_fields() -> Non
     assert result["proposed_action"]["target"].endswith("/rest/products/search?q=1")
     assert result["proposed_action"]["params"]["forms"] is False
     assert result["proposed_action"]["params"]["data"] == "q=1"
+    assert result["proposed_action"]["params"]["mode_selection_reason"] == "attack_surface_parameterized"
 
 
-def test_planner_advances_when_step_budget_exhausted() -> None:
+def test_planner_does_not_set_strategy_step_id_without_strategy_gating() -> None:
     planner = PlannerNode(
         llm_router=_RepeatGobusterLLM(),
         engagement_summary={
@@ -733,8 +818,8 @@ def test_planner_advances_when_step_budget_exhausted() -> None:
     }
 
     result = planner(state)
-    assert result["proposed_action"]["tool_name"] == "nuclei"
-    assert result["proposed_action"].get("strategy_step_id") == "web_vuln_scan"
+    assert result["proposed_action"]["tool_name"] in {"gobuster", "nuclei"}
+    assert result["proposed_action"].get("strategy_step_id") is None
 
 
 def test_planner_adaptive_cooldown_avoids_repeat_low_yield_tool() -> None:
@@ -788,3 +873,171 @@ def test_planner_adaptive_cooldown_avoids_repeat_low_yield_tool() -> None:
     result = planner(state)
     assert result["proposed_action"]["tool_name"] == "nuclei"
     assert result["temporarily_unavailable_tools"].get("sqlmap", 0) >= 2
+
+
+class _RepeatNucleiLLM:
+    def plan(self, context: dict) -> dict:
+        return {
+            "action_type": "active_scan",
+            "tool_name": "nuclei",
+            "target": "http://localhost:3000",
+            "params": {"severity": "high"},
+            "rationale": "Run a broad scan",
+            "estimated_risk": "medium",
+        }
+
+
+def test_planner_objective_focus_overrides_to_injection_tooling() -> None:
+    planner = PlannerNode(
+        llm_router=_RepeatNucleiLLM(),
+        engagement_summary={"engagement_id": str(uuid4())},
+        available_tools=["nuclei", "sqlmap"],
+        tools_catalog=[
+            {
+                "tool_name": "nuclei",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {"target": {"type": "string"}},
+            },
+            {
+                "tool_name": "sqlmap",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {
+                    "target": {"type": "string"},
+                    "forms": {"type": "boolean"},
+                },
+            },
+        ],
+    )
+
+    state = {
+        **_base_state(),
+        "nonproductive_cycle_streak": 2,
+        "assessment_objectives": [
+            {
+                "objective_id": "injection:http://localhost:3000/rest/products/search?q=1",
+                "objective_class": "injection",
+                "title": "Potential SQL injection",
+                "asset_ref": "http://localhost:3000/rest/products/search?q=1",
+                "severity": "high",
+                "status": "open",
+            }
+        ],
+    }
+
+    result = planner(state)
+    assert result["proposed_action"]["tool_name"] == "sqlmap"
+    assert result["proposed_action"]["target"] == "http://localhost:3000/rest/products/search?q=1"
+    assert "Objective focus" in result["proposed_action"]["rationale"]
+
+
+def test_planner_detects_scan_churn_and_pivots_to_objective_followup() -> None:
+    planner = PlannerNode(
+        llm_router=_RepeatNucleiLLM(),
+        engagement_summary={"engagement_id": str(uuid4())},
+        available_tools=["nuclei", "sqlmap"],
+        tools_catalog=[
+            {
+                "tool_name": "nuclei",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {"target": {"type": "string"}},
+            },
+            {
+                "tool_name": "sqlmap",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {
+                    "target": {"type": "string"},
+                    "forms": {"type": "boolean"},
+                },
+            },
+        ],
+    )
+
+    state = {
+        **_base_state(),
+        "assessment_objectives": [
+            {
+                "objective_id": "injection:http://localhost:3000/rest/products/search?q=1",
+                "objective_class": "injection",
+                "title": "Potential SQL injection",
+                "asset_ref": "http://localhost:3000/rest/products/search?q=1",
+                "severity": "high",
+                "status": "in_progress",
+            }
+        ],
+        "previous_actions": [
+            {
+                "tool_name": "nuclei",
+                "target": "http://localhost:3000",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["no_matches"],
+                "failure_reasons": ["NoActionableOutput"],
+            },
+            {
+                "tool_name": "nuclei",
+                "target": "http://localhost:3000",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["no_matches"],
+                "failure_reasons": ["NoActionableOutput"],
+            },
+            {
+                "tool_name": "nuclei",
+                "target": "http://localhost:3000",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["execution_error"],
+                "failure_reasons": ["NoActionableOutput"],
+            },
+        ],
+    }
+
+    result = planner(state)
+    assert result["proposed_action"]["tool_name"] == "sqlmap"
+    assert "scan churn" in result["proposed_action"]["rationale"].lower()
+
+
+def test_planner_rebuild_fallback_rationale_matches_selected_tool() -> None:
+    planner = PlannerNode(
+        llm_router=_RepeatNucleiLLM(),
+        engagement_summary={"engagement_id": str(uuid4())},
+        available_tools=["zap", "nikto"],
+        tools_catalog=[
+            {
+                "tool_name": "zap",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {"target": {"type": "string"}},
+            },
+            {
+                "tool_name": "nikto",
+                "risk_class": "active_scan",
+                "required_params": ["target"],
+                "supported_target_types": ["url"],
+                "parameter_schema": {"target": {"type": "string"}},
+            },
+        ],
+    )
+
+    rebuilt = planner._rebuild_fallback_proposal(
+        {
+            "tool_name": "zap",
+            "action_type": "active_scan",
+            "target": "http://localhost:3000",
+            "params": {"target": "http://localhost:3000", "ajax_spider": True},
+            "rationale": "Moving to web_discovery with ZAP and ajax spider capabilities.",
+            "estimated_risk": "medium",
+        },
+        "nikto",
+        "Stayed within current strategy step.",
+    )
+
+    assert rebuilt["tool_name"] == "nikto"
+    assert "Planner fallback selected 'nikto'" in rebuilt["rationale"]
+    assert "web_discovery with ZAP" not in rebuilt["rationale"]

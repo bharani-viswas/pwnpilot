@@ -65,7 +65,18 @@ def cmd_version() -> None:
 _SEPARATOR = "─" * 72
 
 
-def _make_live_output_handler() -> object:
+def _resolve_engagement_id(reference: str, config_file: Optional[Path] = None) -> UUID:
+    """Resolve user-provided engagement name/reference to UUID."""
+    from pwnpilot.runtime import resolve_engagement_reference
+
+    try:
+        return resolve_engagement_reference(reference, config_path=config_file)
+    except Exception as exc:
+        console.print(f"[red]Unknown engagement '{reference}':[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _make_live_output_handler(prompt_on_reject: bool = False) -> object:
     """Return a callable that prints execution events as plain human-readable text.
 
     Design rationale (from hackingBuddyGPT / CAI research):
@@ -75,6 +86,8 @@ def _make_live_output_handler() -> object:
     No JSON, no structured formatting — just readable terminal output.
     """
     from pwnpilot.data.models import ExecutionEventType
+
+    prompted_fingerprints: set[str] = set()
 
     def _handler(event: object) -> None:
         et = getattr(event, "event_type", None)
@@ -129,6 +142,64 @@ def _make_live_output_handler() -> object:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+            if not prompt_on_reject:
+                return
+
+            if not sys.stdin.isatty():
+                sys.stdout.write("[operator] guided prompt skipped (non-interactive terminal)\n")
+                sys.stdout.flush()
+                return
+
+            fingerprint = f"{code}:{cls}"
+            if fingerprint in prompted_fingerprints:
+                return
+
+            try:
+                ask_view = typer.confirm(
+                    "Validator rejected this action. Add operator guidance for the next plan?",
+                    default=False,
+                )
+            except Exception:
+                return
+
+            if not ask_view:
+                prompted_fingerprints.add(fingerprint)
+                return
+
+            user_view = typer.prompt(
+                "Enter your guidance (objective/focus/constraints)",
+                default="",
+                show_default=False,
+            ).strip()
+            if not user_view:
+                prompted_fingerprints.add(fingerprint)
+                return
+
+            try:
+                from pwnpilot.runtime import get_engagement_session
+
+                engagement_id = getattr(event, "engagement_id", None)
+                if engagement_id is None:
+                    raise ValueError("missing engagement_id")
+
+                session = get_engagement_session(str(engagement_id))
+                operator_session = session.get("operator_session") if isinstance(session, dict) else None
+                if operator_session is None:
+                    raise ValueError("operator session unavailable")
+
+                operator_session.submit_directive_from_dict(
+                    notes=(
+                        f"Operator guidance after validator rejection "
+                        f"({code}/{cls}): {user_view}"
+                    )
+                )
+                sys.stdout.write("[operator] guidance submitted for next planner cycle\n")
+                sys.stdout.flush()
+                prompted_fingerprints.add(fingerprint)
+            except Exception as exc:
+                sys.stdout.write(f"[operator] failed to submit guidance: {exc}\n")
+                sys.stdout.flush()
+
         elif et == ExecutionEventType.EXECUTOR_RECOVERY_HINT:
             hint = payload.get("hint", "")
             if hint:
@@ -136,29 +207,6 @@ def _make_live_output_handler() -> object:
                 sys.stdout.flush()
 
     return _handler
-
-
-def _render_preflight(preflight: dict[str, object]) -> None:
-    family = str(preflight.get("target_family", "unknown"))
-    console.print(f"[bold cyan]Target family:[/bold cyan] {family}")
-
-    table = Table(title="Preflight Sequence and Tool Availability")
-    table.add_column("Step", style="cyan")
-    table.add_column("Preferred", style="green")
-    table.add_column("Available", style="green")
-    table.add_column("Missing", style="yellow")
-
-    for step in preflight.get("sequence", []):
-        if not isinstance(step, dict):
-            continue
-        table.add_row(
-            str(step.get("name", "")),
-            ", ".join(step.get("preferred_tools", [])),
-            ", ".join(step.get("preferred_available", [])),
-            ", ".join(step.get("preferred_missing", [])),
-        )
-
-    console.print(table)
 
 
 @app.command("start")
@@ -189,7 +237,7 @@ def cmd_start(
     NEW: Use --roe-file for ROE-based engagement creation (recommended).
     LEGACY: Use --cidr/--domain/--url/--roe-hash for direct scope specification.
     """
-    from pwnpilot.runtime import create_and_run_engagement, get_engagement_preflight
+    from pwnpilot.runtime import create_and_run_engagement
     from pwnpilot.agent.state import OperatorMode
     from pwnpilot.data.roe_validator import validate_roe_file
     from pwnpilot.agent.roe_interpreter import ROEInterpreter
@@ -313,56 +361,6 @@ def cmd_start(
     if dry_run:
         console.print("[yellow]DRY RUN: policy simulation only, no tool execution.[/yellow]")
 
-    preflight = get_engagement_preflight(
-        scope_cidrs=scope_cidr,
-        scope_domains=scope_domain,
-        scope_urls=scope_url,
-        config_path=config_file,
-    )
-    _render_preflight(preflight)
-
-    missing = preflight.get("missing_recommended_tools", [])
-    missing_tools = [str(t) for t in missing] if isinstance(missing, list) else []
-    if missing_tools:
-        console.print(
-            "[yellow]Missing recommended tools:[/yellow] " + ", ".join(sorted(missing_tools))
-        )
-        install_now = typer.confirm(
-            "Install missing recommended tools before starting?",
-            default=False,
-        )
-        if install_now:
-            installer = Path(__file__).resolve().parents[1] / "scripts" / "install_security_tools.sh"
-            if installer.exists():
-                run_installer = typer.confirm(
-                    "Run automated installer now (sudo required)?",
-                    default=False,
-                )
-                if run_installer:
-                    result = subprocess.run(
-                        ["sudo", "bash", str(installer)],
-                        check=False,
-                    )
-                    if result.returncode != 0:
-                        console.print(
-                            "[yellow]Installer did not complete successfully. Continuing with available tools.[/yellow]"
-                        )
-                    preflight = get_engagement_preflight(
-                        scope_cidrs=scope_cidr,
-                        scope_domains=scope_domain,
-                        scope_urls=scope_url,
-                        config_path=config_file,
-                    )
-                    _render_preflight(preflight)
-            else:
-                console.print(
-                    "[yellow]Installer script not found. Install tools manually, then rerun start if desired.[/yellow]"
-                )
-        else:
-            console.print(
-                "[yellow]Proceeding with currently available tools as requested.[/yellow]"
-            )
-
     if scope_url and not scope_cidr and not scope_domain:
         local_hosts = {"localhost", "127.0.0.1", "::1"}
         if any(any(host in str(url) for host in local_hosts) for url in scope_url):
@@ -390,6 +388,7 @@ def cmd_start(
         operator_directives["notes"] = notes
 
     try:
+        prompt_on_reject = operator_mode == OperatorMode.GUIDED
         engagement_id = create_and_run_engagement(
             name=name,
             scope_cidrs=scope_cidr,
@@ -401,7 +400,7 @@ def cmd_start(
             max_iterations=max_iterations,
             config_path=config_file,
             dry_run=dry_run,
-            event_subscriber=_make_live_output_handler(),
+            event_subscriber=_make_live_output_handler(prompt_on_reject=prompt_on_reject),
             operator_mode=operator_mode,
             operator_directives=operator_directives or None,
         )
@@ -419,7 +418,7 @@ def cmd_start(
 
 @app.command("resume")
 def cmd_resume(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID to resume"),
+    engagement: str = typer.Argument(..., help="Engagement name to resume"),
     config_file: Optional[Path] = typer.Option(None, "--config", help="Config YAML path"),
     guided: bool = typer.Option(False, "--guided", help="Resume in guided operator mode"),
     mode: Optional[str] = typer.Option(None, "--mode", help="Operator mode override: autonomous|guided|monitor|replay (overrides --guided)"),
@@ -453,15 +452,16 @@ def cmd_resume(
     if notes:
         operator_directives["notes"] = notes
 
-    console.print(f"[bold]Resuming engagement:[/bold] {engagement_id}")
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    console.print(f"[bold]Resuming engagement:[/bold] {engagement} ({engagement_id})")
     try:
         resume_engagement(
-            UUID(engagement_id),
+            engagement_id,
             config_path=config_file,
             operator_mode=operator_mode,
             operator_directives=operator_directives or None,
         )
-        console.print(f"[green]Resume complete for {engagement_id}")
+        console.print(f"[green]Resume complete for {engagement}[/green]")
     except Exception as exc:
         console.print(f"[red]Error: {exc}")
         raise typer.Exit(code=1) from exc
@@ -507,7 +507,7 @@ def cmd_deny(
 
 @app.command("grant-shell")
 def cmd_grant_shell(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     command: str = typer.Argument(..., help="Shell command name to grant (e.g. 'curl')"),
     operator: str = typer.Option("operator", "--operator", help="Operator identity"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
@@ -516,10 +516,11 @@ def cmd_grant_shell(
     from pwnpilot.runtime import _build_runtime
     from pwnpilot.data.permission_store import PermissionStore
 
-    rt = _build_runtime(config_file)
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    rt = _build_runtime(config_file, engagement_id=str(engagement_id))
     ps: PermissionStore = rt["permission_store"]
-    ps.grant_permission(UUID(engagement_id), "shell_command", command, granted_by=operator)
-    console.print(f"[green]Granted shell command '{command}' for engagement {engagement_id}[/green]")
+    ps.grant_permission(engagement_id, "shell_command", command, granted_by=operator)
+    console.print(f"[green]Granted shell command '{command}' for engagement {engagement}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -530,17 +531,18 @@ def cmd_grant_shell(
 
 @app.command("report")
 def cmd_report(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     output_dir: Path = typer.Option(Path("."), "--output", "-o", help="Output directory"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Generate a report for a completed or in-progress engagement."""
     from pwnpilot.runtime import generate_report
 
-    console.print(f"[bold]Generating report for:[/bold] {engagement_id}")
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    console.print(f"[bold]Generating report for:[/bold] {engagement} ({engagement_id})")
     try:
         bundle, summary = generate_report(
-            UUID(engagement_id), output_dir=output_dir, config_path=config_file
+            engagement_id, output_dir=output_dir, config_path=config_file
         )
         console.print(f"[green]Bundle:[/green]  {bundle}")
         console.print(f"[green]Summary:[/green] {summary}")
@@ -556,18 +558,19 @@ def cmd_report(
 
 @app.command("verify")
 def cmd_verify(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Verify the audit chain integrity for an engagement."""
     from pwnpilot.runtime import get_audit_store, get_db_session
 
-    session = get_db_session(config_path=config_file)
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    session = get_db_session(config_path=config_file, engagement_id=str(engagement_id))
     from pwnpilot.data.audit_store import AuditStore
     store = AuditStore(session)
     try:
-        store.verify_chain(UUID(engagement_id))
-        console.print(f"[green]Audit chain OK[/green] for {engagement_id}")
+        store.verify_chain(engagement_id)
+        console.print(f"[green]Audit chain OK[/green] for {engagement}")
     except Exception as exc:
         console.print(f"[red]Audit chain FAILED:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -581,16 +584,17 @@ def cmd_verify(
 @app.command("simulate")
 def cmd_simulate(
     actions_file: Path = typer.Argument(..., help="JSON file with list of ActionRequest dicts"),
-    engagement_id: str = typer.Option(..., "--engagement", help="Engagement UUID"),
+    engagement: str = typer.Option(..., "--engagement", help="Engagement name"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Run policy simulation against a list of actions (no tool execution)."""
     from pwnpilot.runtime import run_policy_simulation
 
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
     data = json.loads(actions_file.read_text())
     results = run_policy_simulation(
         actions=data,
-        engagement_id=UUID(engagement_id),
+        engagement_id=engagement_id,
         config_path=config_file,
     )
 
@@ -619,7 +623,7 @@ def cmd_simulate(
 @app.command("tui")
 def cmd_tui(
     engagement_id: Optional[str] = typer.Option(
-        None, "--engagement", "-e", help="Engagement UUID to watch (default: latest)"
+        None, "--engagement", "-e", help="Engagement name to watch (default: latest)"
     ),
     refresh: float = typer.Option(2.0, "--refresh", help="Refresh interval in seconds"),
 ) -> None:
@@ -630,7 +634,11 @@ def cmd_tui(
     live_operator_session = None
     if engagement_id:
         from pwnpilot.runtime import get_engagement_session
-        session = get_engagement_session(engagement_id)
+        try:
+            resolved = _resolve_engagement_id(engagement_id)
+            session = get_engagement_session(str(resolved))
+        except typer.Exit:
+            session = get_engagement_session(engagement_id)
         if session:
             live_event_bus = session.get("event_bus")
             live_operator_session = session.get("operator_session")
@@ -927,7 +935,7 @@ def cmd_roe_verify(
 
 @roe_app.command("list")
 def cmd_roe_list(
-    engagement_id: Optional[str] = typer.Option(None, "--engagement", "-e", help="Filter by engagement ID"),
+    engagement: Optional[str] = typer.Option(None, "--engagement", "-e", help="Filter by engagement name"),
     active_only: bool = typer.Option(True, "--all", help="Show inactive ROE files"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
@@ -945,10 +953,14 @@ def cmd_roe_list(
     table.add_column("Decided At")
 
     try:
-        session = get_db_session(config_path=config_file)
+        if engagement:
+            engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+            session = get_db_session(config_path=config_file, engagement_id=str(engagement_id))
+        else:
+            session = get_db_session(config_path=config_file)
         store = OperatorDecisionStore(session)
-        if engagement_id:
-            decisions = list(store.decisions_by_type(UUID(engagement_id), OperatorDecisionType.ROE_APPROVAL))
+        if engagement:
+            decisions = list(store.decisions_by_type(engagement_id, OperatorDecisionType.ROE_APPROVAL))
         else:
             console.print("[yellow]Specify --engagement to list ROE approvals for a specific engagement.[/yellow]")
             return
@@ -970,7 +982,7 @@ def cmd_roe_list(
 
 @roe_app.command("audit")
 def cmd_roe_audit(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Show approval and audit trail for an engagement."""
@@ -978,10 +990,11 @@ def cmd_roe_audit(
     from pwnpilot.data.audit_store import AuditStore
     from pwnpilot.data.operator_decision_store import OperatorDecisionStore
 
-    console.print(f"[bold cyan]Audit Trail for Engagement:[/bold cyan] {engagement_id}")
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    console.print(f"[bold cyan]Audit Trail for Engagement:[/bold cyan] {engagement} ({engagement_id})")
 
     try:
-        session = get_db_session(config_path=config_file)
+        session = get_db_session(config_path=config_file, engagement_id=str(engagement_id))
         audit_store = AuditStore(session)
         decision_store = OperatorDecisionStore(session)
 
@@ -991,7 +1004,7 @@ def cmd_roe_audit(
         table.add_column("Actor")
         table.add_column("Event")
         table.add_column("Details")
-        events = list(audit_store.events_for_engagement(UUID(engagement_id)))
+        events = list(audit_store.events_for_engagement(engagement_id))
         for ev in events:
             table.add_row(
                 str(ev.get("created_at", ""))[:19],
@@ -1002,7 +1015,7 @@ def cmd_roe_audit(
         console.print(table)
 
         # Operator decisions summary
-        decisions = list(decision_store.decisions_for_engagement(UUID(engagement_id)))
+        decisions = list(decision_store.decisions_for_engagement(engagement_id))
         if decisions:
             console.print(f"\n[bold]Operator Decisions:[/bold] {len(decisions)}")
             dtable = Table(show_header=True, header_style="bold")
@@ -1028,7 +1041,7 @@ def cmd_roe_audit(
 
 @roe_app.command("export")
 def cmd_roe_export(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     output: Path = typer.Option(None, "--output", "-o", help="Export file path (default: roe-audit-{engagement_id}.json)"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
@@ -1038,13 +1051,14 @@ def cmd_roe_export(
     from pwnpilot.data.operator_decision_store import OperatorDecisionStore
     from pwnpilot.services.export_service import ExportService
 
-    output_path = output or Path(f"roe-audit-{engagement_id}.json")
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    output_path = output or Path(f"roe-audit-{engagement}.json")
     try:
-        session = get_db_session(config_path=config_file)
+        session = get_db_session(config_path=config_file, engagement_id=str(engagement_id))
         audit_store = AuditStore(session)
         decision_store = OperatorDecisionStore(session)
         svc = ExportService(audit_store=audit_store, operator_decision_store=decision_store)
-        written = svc.export(UUID(engagement_id), output_path=output_path)
+        written = svc.export(engagement_id, output_path=output_path)
         console.print(f"[green]✓ Audit report exported:[/green] {written}")
     except Exception as exc:
         console.print(f"[red]Error exporting report:[/red] {exc}")
@@ -1053,7 +1067,7 @@ def cmd_roe_export(
 
 @app.command("retention-apply")
 def cmd_retention_apply(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     classification: str = typer.Option("unknown", "--classification", "-c",
                                        help="Engagement classification: ctf|lab|web_api|internal|external|iot|unknown"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
@@ -1062,7 +1076,8 @@ def cmd_retention_apply(
     from pwnpilot.runtime import _build_runtime
     from pwnpilot.governance.retention import EngagementClassification
 
-    rt = _build_runtime(config_file)
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    rt = _build_runtime(config_file, engagement_id=str(engagement_id))
     rm = rt["retention_manager"]
     try:
         cls = EngagementClassification(classification.lower())
@@ -1070,14 +1085,14 @@ def cmd_retention_apply(
         valid = [e.value for e in EngagementClassification]
         console.print(f"[red]Unknown classification {classification!r}. Choose: {valid}[/red]")
         raise typer.Exit(code=1)
-    rm.apply_ttl(UUID(engagement_id), classification=cls)
+    rm.apply_ttl(engagement_id, classification=cls)
     ttl = rm.ttl_days(cls)
-    console.print(f"[green]✓ Retention TTL applied:[/green] {ttl} days ({classification}) for {engagement_id}")
+    console.print(f"[green]✓ Retention TTL applied:[/green] {ttl} days ({classification}) for {engagement}")
 
 
 @app.command("retention-hold")
 def cmd_retention_hold(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     holder: str = typer.Option(..., "--holder", help="Identity placing the hold (name or email)"),
     reason: str = typer.Option(..., "--reason", help="Reason for legal hold"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
@@ -1085,30 +1100,32 @@ def cmd_retention_hold(
     """Place a legal hold on an engagement, preventing data deletion."""
     from pwnpilot.runtime import _build_runtime
 
-    rt = _build_runtime(config_file)
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    rt = _build_runtime(config_file, engagement_id=str(engagement_id))
     rm = rt["retention_manager"]
-    hold = rm.place_legal_hold(UUID(engagement_id), holder=holder, reason=reason)
-    console.print(f"[green]✓ Legal hold placed by {hold.holder}[/green] on {engagement_id}: {reason}")
+    hold = rm.place_legal_hold(engagement_id, holder=holder, reason=reason)
+    console.print(f"[green]✓ Legal hold placed by {hold.holder}[/green] on {engagement}: {reason}")
 
 
 @app.command("retention-release")
 def cmd_retention_release(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID"),
+    engagement: str = typer.Argument(..., help="Engagement name"),
     operator: str = typer.Option("operator", "--operator", help="Operator releasing the hold"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Release a legal hold on an engagement."""
     from pwnpilot.runtime import _build_runtime
 
-    rt = _build_runtime(config_file)
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    rt = _build_runtime(config_file, engagement_id=str(engagement_id))
     rm = rt["retention_manager"]
-    rm.release_legal_hold(UUID(engagement_id))
-    console.print(f"[green]✓ Legal hold released[/green] for {engagement_id}")
+    rm.release_legal_hold(engagement_id)
+    console.print(f"[green]✓ Legal hold released[/green] for {engagement}")
 
 
 @app.command("replay")
 def cmd_replay(
-    engagement_id: str = typer.Argument(..., help="Engagement UUID to build replay snapshot for"),
+    engagement: str = typer.Argument(..., help="Engagement name to build replay snapshot for"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output JSON file (default: replay-{engagement_id}.json)"),
     config_file: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
@@ -1119,13 +1136,14 @@ def cmd_replay(
     from pwnpilot.data.operator_decision_store import OperatorDecisionStore
     from pwnpilot.services.replay_service import ReplayService
 
-    output_path = output or Path(f"replay-{engagement_id}.json")
+    engagement_id = _resolve_engagement_id(engagement, config_file=config_file)
+    output_path = output or Path(f"replay-{engagement}.json")
     try:
-        session = get_db_session(config_path=config_file)
+        session = get_db_session(config_path=config_file, engagement_id=str(engagement_id))
         audit_store = AuditStore(session)
         decision_store = OperatorDecisionStore(session)
         svc = ReplayService(audit_store=audit_store, operator_decision_store=decision_store)
-        snapshot = svc.build_snapshot(UUID(engagement_id))
+        snapshot = svc.build_snapshot(engagement_id)
         snapshot_dict = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else vars(snapshot)
         output_path.write_text(json.dumps(snapshot_dict, indent=2, default=str))
         console.print(f"[green]✓ Replay snapshot written:[/green] {output_path}")

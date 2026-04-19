@@ -51,6 +51,10 @@ _LOW_VALUE_HINT_CODES = frozenset({
     "no_matches",
     "output_format_invalid",
     "execution_error",
+    "target_projection_invalid",
+    "no_attack_surface",
+    "parser_schema_mismatch",
+    "low_value_repetition",
 })
 
 _LOW_VALUE_FAILURE_REASONS = frozenset({
@@ -61,6 +65,79 @@ _LOW_VALUE_FAILURE_REASONS = frozenset({
     "NoActionableOutput",
     "UnknownRuntimeFailure",
 })
+
+_OBJECTIVE_TOOL_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "injection": ("sqlmap", "zap", "nuclei"),
+    "auth": ("zap", "nuclei", "sqlmap"),
+    "access_control": ("zap", "nuclei", "sqlmap"),
+    "exposure": ("nuclei", "nikto", "zap"),
+    "headers": ("zap", "nuclei", "nikto"),
+    "session": ("zap", "nuclei", "sqlmap"),
+    "generic": ("nuclei", "zap", "nikto", "sqlmap"),
+}
+
+_SCAN_CHURN_HINT_CODES = frozenset({
+    "wildcard_detected",
+    "no_forms_detected",
+    "no_matches",
+    "execution_error",
+    "output_format_invalid",
+    "target_projection_invalid",
+    "no_attack_surface",
+    "parser_schema_mismatch",
+    "low_value_repetition",
+})
+
+
+def _action_has_meaningful_progress(action: dict[str, Any]) -> bool:
+    if not isinstance(action, dict):
+        return False
+
+    telemetry_keys = {
+        "outcome_status",
+        "new_findings_count",
+        "exploit_signal_score",
+        "confirmation_candidate_count",
+        "execution_hint_codes",
+        "failure_reasons",
+    }
+    if not any(key in action for key in telemetry_keys):
+        # Backward compatibility: older history entries only recorded tool names.
+        return True
+
+    outcome = str(action.get("outcome_status", "")).strip().lower()
+    if outcome not in {"success", "degraded"}:
+        return False
+
+    action_type = str(action.get("action_type", "")).strip().lower()
+    new_findings = int(action.get("new_findings_count", 0) or 0)
+    exploit_score = int(action.get("exploit_signal_score", 0) or 0)
+    confirmation_candidates = int(action.get("confirmation_candidate_count", 0) or 0)
+    hint_codes = {
+        str(code).strip()
+        for code in action.get("execution_hint_codes", [])
+        if str(code).strip()
+    }
+    failure_reasons = {
+        str(reason).strip()
+        for reason in action.get("failure_reasons", [])
+        if str(reason).strip()
+    }
+
+    low_value_only = bool(hint_codes) and hint_codes.issubset(_LOW_VALUE_HINT_CODES)
+    low_value_failure = bool(failure_reasons & _LOW_VALUE_FAILURE_REASONS)
+
+    # Exploit phases require stronger proof signals than scan/recon phases.
+    if action_type in {"exploit", "post_exploit", "data_exfil"}:
+        return (exploit_score > 0 or confirmation_candidates > 0) and not low_value_only
+
+    if exploit_score > 0 or confirmation_candidates > 0:
+        return True
+
+    if new_findings > 0 and not low_value_failure and not low_value_only:
+        return True
+
+    return False
 
 # v2: RepetitionDetector singleton used by PlannerNode
 _repetition_detector = RepetitionDetector(repeat_threshold=3, similarity_threshold=5)
@@ -117,75 +194,87 @@ def _normalize_base_url(url: str) -> str:
     return str(url or "").strip()
 
 
-def _strategy_progress(
-    strategy_plan: dict[str, Any],
-    previous: list[dict[str, Any]],
-) -> dict[str, Any]:
-    sequence = strategy_plan.get("sequence", []) if isinstance(strategy_plan, dict) else []
-    if not isinstance(sequence, list) or not sequence:
-        return {}
+def _objective_priority(objective: dict[str, Any]) -> int:
+    severity = str(objective.get("severity", "")).strip().lower()
+    status = str(objective.get("status", "")).strip().lower()
+    base = {
+        "critical": 400,
+        "high": 300,
+        "medium": 200,
+        "low": 100,
+        "info": 50,
+    }.get(severity, 25)
+    status_bonus = {
+        "open": 30,
+        "in_progress": 20,
+        "disproved": 10,
+        "confirmed": 0,
+    }.get(status, 0)
+    return base + status_bonus
 
-    used_tools = {
-        str(item.get("tool_name", "")).strip()
-        for item in previous
-        if isinstance(item, dict)
-    }
 
-    completed_steps: list[str] = []
-    current_step: dict[str, Any] | None = None
+def _base_target_match(left: str, right: str) -> bool:
+    left_base = _normalize_base_url(left)
+    right_base = _normalize_base_url(right)
+    return bool(left_base) and left_base == right_base
 
-    for step in sequence:
-        if not isinstance(step, dict):
+
+def _recent_no_forms_hint(previous: list[dict[str, Any]], target: str, lookback: int = 8) -> bool:
+    recent = previous[-max(1, lookback):]
+    for action in reversed(recent):
+        if not isinstance(action, dict):
             continue
-        step_tools = {
-            str(t).strip()
-            for t in (step.get("preferred_tools", []) + step.get("fallback_tools", []))
-            if str(t).strip()
+        if str(action.get("tool_name", "")).strip() != "sqlmap":
+            continue
+        if not _base_target_match(str(action.get("target", "")), target):
+            continue
+        hint_codes = {
+            str(code).strip()
+            for code in action.get("execution_hint_codes", [])
+            if str(code).strip()
         }
-        step_actions = [
-            item for item in previous
-            if isinstance(item, dict) and str(item.get("tool_name", "")).strip() in step_tools
-        ]
-        step_id = str(step.get("step_id", "")).strip()
-        if step_actions:
-            latest_action = step_actions[-1]
-            hint_codes = {
-                str(code).strip()
-                for code in latest_action.get("execution_hint_codes", [])
-                if str(code).strip()
-            }
-            latest_error = str(latest_action.get("error", "")).strip()
-            recovery_policy = None
-            for rule in step.get("recovery_rules", []):
-                rule_codes = {
-                    str(code).strip()
-                    for code in rule.get("hint_codes", [])
-                    if str(code).strip()
-                }
-                if hint_codes & rule_codes:
-                    recovery_policy = rule
-                    break
+        if "no_forms_detected" in hint_codes:
+            return True
+    return False
 
-            if hint_codes & _LOW_VALUE_HINT_CODES or latest_error:
-                current_step = {
-                    **step,
-                    "recovery_hint_codes": sorted(hint_codes),
-                    "recovery_preferred_tools": list(recovery_policy.get("preferred_tools", [])) if recovery_policy else [],
-                    "active_recovery_rule": recovery_policy or {},
-                }
-                break
 
-            if step_id:
-                completed_steps.append(step_id)
+def _safe_mode_reason(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text)
+
+
+def _scan_churn_detected(
+    previous: list[dict[str, Any]],
+    target: str,
+    action_type: str,
+) -> bool:
+    recent = previous[-6:]
+    if len(recent) < 3:
+        return False
+
+    churn_events = 0
+    for action in recent:
+        if not isinstance(action, dict):
             continue
-        current_step = step
-        break
+        if str(action.get("action_type", "")).strip() != action_type:
+            continue
+        if not _base_target_match(str(action.get("target", "")), target):
+            continue
 
-    return {
-        "completed_steps": completed_steps,
-        "current_step": current_step,
-        "remaining_steps": max(0, len(sequence) - len(completed_steps)),
-    }
+        hints = {
+            str(code).strip()
+            for code in action.get("execution_hint_codes", [])
+            if str(code).strip()
+        }
+        reasons = {
+            str(reason).strip()
+            for reason in action.get("failure_reasons", [])
+            if str(reason).strip()
+        }
+        if (hints & _SCAN_CHURN_HINT_CODES) or ("NoActionableOutput" in reasons):
+            churn_events += 1
+
+    return churn_events >= 3
 
 
 class PlannerNode:
@@ -368,31 +457,9 @@ class PlannerNode:
         if memory_context:
             context["memory_context"] = memory_context
 
-        strategy_plan = self._engagement.get("strategy_plan")
-        strategy_progress: dict[str, Any] = {}
-        current_step: dict[str, Any] | None = None
-        step_budget_next_candidates: list[str] = []
-        step_budget_next_step_id: str | None = None
-        if isinstance(strategy_plan, dict) and strategy_plan:
-            strategy_progress = _strategy_progress(strategy_plan, previous)
-            current_step = strategy_progress.get("current_step") if isinstance(strategy_progress, dict) else None
-            context["target_strategy"] = strategy_plan
-            context["target_strategy_progress"] = strategy_progress
-
-            if isinstance(current_step, dict):
-                step_attempts = self._step_attempt_count(previous, current_step)
-                context["current_step_attempt_count"] = step_attempts
-                context["per_step_budget"] = self._per_step_budget
-                if step_attempts >= self._per_step_budget:
-                    next_candidates, next_step_id = self._next_strategy_step_candidates(
-                        strategy_plan,
-                        str(current_step.get("step_id", "")).strip(),
-                    )
-                    if next_candidates:
-                        step_budget_next_candidates = next_candidates
-                        step_budget_next_step_id = next_step_id
-                        context["step_budget_exhausted"] = True
-                        context["step_budget_exhausted_step_id"] = str(current_step.get("step_id", "")).strip()
+        objective_focus = self._current_objective_focus(state)
+        if objective_focus:
+            context["objective_focus"] = objective_focus
         
         # Extract canonical tool parameter schemas for LLM (NEW: Schema guidance for accurate params)
         if self._tools_catalog:
@@ -467,50 +534,40 @@ class PlannerNode:
 
         raw_proposal = self._apply_attack_surface_targeting(raw_proposal, recon)
 
-        proposed_tool = str(raw_proposal.get("tool_name", ""))
-        step_recovery_candidates = self._step_recovery_candidates(current_step)
-        recovery_override_applied = False
-
-        raw_proposal, recovery_override_applied = self._apply_recovery_param_overrides(
-            raw_proposal,
-            current_step,
-            proposed_tool,
+        proposal_target = str(raw_proposal.get("target", "")).strip()
+        proposal_action_type = str(raw_proposal.get("action_type", "")).strip() or "active_scan"
+        scan_churn_active = _scan_churn_detected(
+            previous=previous,
+            target=proposal_target,
+            action_type=proposal_action_type,
         )
+        objective_followup_required = bool(objective_focus) and (
+            scan_churn_active
+            or int(state.get("nonproductive_cycle_streak", 0) or 0) >= 2
+            or str(objective_focus.get("status", "")).strip().lower() in {"open", "disproved"}
+        )
+        if objective_followup_required:
+            raw_proposal = self._apply_objective_followup(
+                proposal=raw_proposal,
+                objective=objective_focus or {},
+                cooldown_map=cooldown_map,
+                previous=previous,
+                blocked_families=blocked_families,
+            )
+            if scan_churn_active:
+                raw_proposal["rationale"] = (
+                    str(raw_proposal.get("rationale", "")).strip()
+                    + " Detected repeated low-value scan churn; forcing objective-driven follow-up."
+                ).strip()
+                log.warning(
+                    "planner.scan_churn_objective_pivot",
+                    tool=raw_proposal.get("tool_name"),
+                    target=raw_proposal.get("target"),
+                )
+
         proposed_tool = str(raw_proposal.get("tool_name", ""))
 
-        if step_recovery_candidates and proposed_tool not in step_recovery_candidates:
-            recovery_tool = self._select_fallback_tool(
-                blocked_tool=proposed_tool,
-                cooldown_map=cooldown_map,
-                target=str(raw_proposal.get("target", "")),
-                action_type=str(raw_proposal.get("action_type", "")),
-                previous=previous,
-                candidate_tools=step_recovery_candidates,
-            )
-            if recovery_tool:
-                log.warning(
-                    "planner.step_recovery_override",
-                    blocked_tool=proposed_tool,
-                    fallback_tool=recovery_tool,
-                    step_id=str(current_step.get("step_id", "")),
-                    hint_codes=list(current_step.get("recovery_hint_codes", [])),
-                )
-                raw_proposal = self._rebuild_fallback_proposal(
-                    raw_proposal,
-                    recovery_tool,
-                    (
-                        "Stayed within the current target-strategy step because the "
-                        "previous attempt returned recoverable low-value hints."
-                    ),
-                )
-                raw_proposal, recovery_override_applied = self._apply_recovery_param_overrides(
-                    raw_proposal,
-                    current_step,
-                    recovery_tool,
-                )
-                proposed_tool = str(raw_proposal.get("tool_name", ""))
-
-        if not recovery_override_applied and self._recent_low_value_outcome(
+        if self._recent_low_value_outcome(
             tool_name=proposed_tool,
             target=str(raw_proposal.get("target", "")),
             action_type=str(raw_proposal.get("action_type", "")),
@@ -522,7 +579,6 @@ class PlannerNode:
                 target=str(raw_proposal.get("target", "")),
                 action_type=str(raw_proposal.get("action_type", "")),
                 previous=previous,
-                candidate_tools=step_recovery_candidates,
                 blocked_families=blocked_families,
             )
             if fallback_tool:
@@ -560,37 +616,6 @@ class PlannerNode:
                     fallback_tool,
                     f"Switched from '{proposed_tool}' because it recently failed as unavailable.",
                 )
-
-        if step_budget_next_candidates and current_step:
-            budget_tool = self._select_fallback_tool(
-                blocked_tool=str(raw_proposal.get("tool_name", "")),
-                cooldown_map=cooldown_map,
-                target=str(raw_proposal.get("target", "")),
-                action_type=str(raw_proposal.get("action_type", "")),
-                previous=previous,
-                candidate_tools=step_budget_next_candidates,
-                blocked_families=blocked_families,
-            )
-            if budget_tool:
-                raw_proposal = self._rebuild_fallback_proposal(
-                    raw_proposal,
-                    budget_tool,
-                    (
-                        f"Advanced from step '{str(current_step.get('step_id', '')).strip()}' "
-                        "after exhausting per-step budget."
-                    ),
-                )
-                if step_budget_next_step_id:
-                    raw_proposal["strategy_step_id"] = step_budget_next_step_id
-                log.info(
-                    "planner.step_budget_advance",
-                    from_step=str(current_step.get("step_id", "")).strip(),
-                    to_step=step_budget_next_step_id,
-                    tool=budget_tool,
-                )
-
-        if isinstance(current_step, dict) and not raw_proposal.get("strategy_step_id"):
-            raw_proposal["strategy_step_id"] = str(current_step.get("step_id", "")).strip()
 
         # Guardrail for prolonged validator reject churn: force a tool pivot.
         # This prevents planner/validator deadlocks where the loop keeps proposing
@@ -682,6 +707,14 @@ class PlannerNode:
             rejection_repeat_count = 0
             rejection_reason_code = ""
             rejection_class = ""
+
+        # Normalize params before proposal validation.
+        proposal_tool = str(raw_proposal.get("tool_name", "")).strip()
+        proposal_params = raw_proposal.get("params")
+        if isinstance(proposal_params, dict):
+            raw_proposal["params"] = self._sanitize_tool_params(proposal_tool, proposal_params)
+        else:
+            raw_proposal["params"] = {}
 
         # Validate proposal structure
         try:
@@ -849,59 +882,6 @@ class PlannerNode:
             )
         return updated
 
-    def _step_attempt_count(
-        self,
-        previous: list[dict[str, Any]],
-        current_step: dict[str, Any],
-    ) -> int:
-        if not isinstance(current_step, dict):
-            return 0
-
-        step_id = str(current_step.get("step_id", "")).strip()
-        if not step_id:
-            return 0
-
-        attempts = 0
-        for action in previous:
-            if not isinstance(action, dict):
-                continue
-            if str(action.get("strategy_step_id", "")).strip() == step_id:
-                attempts += 1
-        return attempts
-
-    def _next_strategy_step_candidates(
-        self,
-        strategy_plan: dict[str, Any],
-        current_step_id: str,
-    ) -> tuple[list[str], str | None]:
-        sequence = strategy_plan.get("sequence", []) if isinstance(strategy_plan, dict) else []
-        if not isinstance(sequence, list) or not sequence:
-            return [], None
-
-        current_index = -1
-        for idx, step in enumerate(sequence):
-            if not isinstance(step, dict):
-                continue
-            if str(step.get("step_id", "")).strip() == current_step_id:
-                current_index = idx
-                break
-
-        if current_index < 0 or current_index >= len(sequence) - 1:
-            return [], None
-
-        next_step = sequence[current_index + 1]
-        if not isinstance(next_step, dict):
-            return [], None
-
-        candidates: list[str] = []
-        for key in ("preferred_tools", "fallback_tools"):
-            for tool_name in next_step.get(key, []):
-                candidate = str(tool_name).strip()
-                if candidate and candidate not in candidates:
-                    candidates.append(candidate)
-
-        return candidates, str(next_step.get("step_id", "")).strip() or None
-
     def _select_fallback_tool(
         self,
         blocked_tool: str,
@@ -964,6 +944,7 @@ class PlannerNode:
         rationale_suffix: str,
     ) -> dict[str, Any]:
         rebuilt = deepcopy(proposal)
+        original_tool = str(proposal.get("tool_name", "")).strip()
         rebuilt["tool_name"] = fallback_tool
 
         tool_meta = self._tool_meta(fallback_tool)
@@ -979,13 +960,18 @@ class PlannerNode:
                     if key in allowed_params
                 }
 
-        rebuilt["params"] = filtered_params
+        rebuilt["params"] = self._sanitize_tool_params(fallback_tool, filtered_params)
 
         if tool_meta and str(tool_meta.get("risk_class", "")).strip():
             rebuilt["action_type"] = str(tool_meta.get("risk_class", "")).strip()
 
+        transition_note = (
+            f"Planner fallback selected '{fallback_tool}'"
+            + (f" instead of '{original_tool}'" if original_tool and original_tool != fallback_tool else "")
+            + " due to runtime guardrails."
+        )
         rebuilt["rationale"] = (
-            str(proposal.get("rationale", "")).strip() + " " + rationale_suffix.strip()
+            transition_note + " " + rationale_suffix.strip()
         ).strip()
         return rebuilt
 
@@ -1003,49 +989,15 @@ class PlannerNode:
         requested = str(action_type or "").strip().lower()
         if not risk_class or not requested:
             return True
-        return risk_class == requested
-
-    def _step_recovery_candidates(self, current_step: dict[str, Any] | None) -> list[str]:
-        if not isinstance(current_step, dict):
-            return []
-
-        ordered: list[str] = []
-        for key in ("recovery_preferred_tools", "preferred_tools", "fallback_tools"):
-            for tool_name in current_step.get(key, []):
-                candidate = str(tool_name).strip()
-                if candidate and candidate not in ordered:
-                    ordered.append(candidate)
-        return ordered
-
-    def _apply_recovery_param_overrides(
-        self,
-        proposal: dict[str, Any],
-        current_step: dict[str, Any] | None,
-        tool_name: str,
-    ) -> tuple[dict[str, Any], bool]:
-        if not isinstance(current_step, dict):
-            return proposal, False
-
-        recovery_rule = current_step.get("active_recovery_rule", {})
-        if not isinstance(recovery_rule, dict):
-            return proposal, False
-
-        overrides_map = recovery_rule.get("param_overrides", {})
-        if not isinstance(overrides_map, dict):
-            return proposal, False
-
-        tool_overrides = overrides_map.get(tool_name)
-        if not isinstance(tool_overrides, dict) or not tool_overrides:
-            return proposal, False
-
-        merged = deepcopy(proposal)
-        existing_params = merged.get("params") if isinstance(merged.get("params"), dict) else {}
-        merged["params"] = {**existing_params, **tool_overrides}
-        merged["rationale"] = (
-            str(merged.get("rationale", "")).strip()
-            + " Applied step recovery parameter overrides based on recent runtime hints."
-        ).strip()
-        return merged, True
+        if risk_class == requested:
+            return True
+        # Also accept if tool declares this action_type as explicitly compatible.
+        compatible = [
+            str(v).strip().lower()
+            for v in (tool_meta.get("compatible_action_types") or [])
+            if str(v).strip()
+        ]
+        return requested in compatible
 
     def _apply_attack_surface_targeting(
         self,
@@ -1123,6 +1075,7 @@ class PlannerNode:
             sqlmap_params = dict(params_obj)
             # Form discovery is usually low-value on SPA roots and API-first targets.
             sqlmap_params["forms"] = False
+            sqlmap_params["mode_selection_reason"] = "attack_surface_parameterized"
 
             if parameters and not sqlmap_params.get("data") and not _target_has_query_params(str(updated.get("target", ""))):
                 sqlmap_params["data"] = f"{parameters[0]}=1"
@@ -1155,6 +1108,58 @@ class PlannerNode:
             to_target=preferred_target,
         )
         return updated
+
+    def _enforce_sqlmap_mode_from_history(
+        self,
+        proposal: dict[str, Any],
+        previous: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not isinstance(proposal, dict):
+            return proposal
+
+        tool_name = str(proposal.get("tool_name", "")).strip()
+        if tool_name != "sqlmap":
+            return proposal
+
+        target = str(proposal.get("target", "")).strip()
+        if not target or not _recent_no_forms_hint(previous, target):
+            return proposal
+
+        updated = deepcopy(proposal)
+        params_obj = updated.get("params") if isinstance(updated.get("params"), dict) else {}
+        sqlmap_params = dict(params_obj)
+        sqlmap_params["forms"] = False
+        if not _safe_mode_reason(sqlmap_params.get("mode_selection_reason")):
+            sqlmap_params["mode_selection_reason"] = "no_forms_hint_recovery"
+        updated["params"] = sqlmap_params
+        updated["rationale"] = (
+            str(updated.get("rationale", "")).strip()
+            + " Disabled sqlmap form discovery because this target recently returned no_forms_detected."
+        ).strip()
+        return updated
+
+    def _sanitize_tool_params(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
+        sanitized = dict(params or {})
+        if tool_name == "gobuster":
+            exclude_length = sanitized.get("exclude_length")
+            if exclude_length not in (None, ""):
+                try:
+                    sanitized["exclude_length"] = max(1, int(exclude_length))
+                except (TypeError, ValueError):
+                    sanitized.pop("exclude_length", None)
+        elif tool_name == "sqlmap":
+            forms_value = sanitized.get("forms")
+            if forms_value is not None:
+                if isinstance(forms_value, bool):
+                    sanitized["forms"] = forms_value
+                else:
+                    sanitized["forms"] = str(forms_value).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+        return sanitized
 
     def _tool_requires_extra_params(self, tool_name: str) -> bool:
         """Return True when a tool requires mandatory params beyond target.
@@ -1222,6 +1227,65 @@ class PlannerNode:
             if hint_codes & _LOW_VALUE_HINT_CODES or failure_reasons & _LOW_VALUE_FAILURE_REASONS:
                 return True
         return False
+
+    def _current_objective_focus(self, state: AgentState) -> dict[str, Any] | None:
+        objectives = state.get("assessment_objectives", [])
+        if not isinstance(objectives, list):
+            return None
+
+        candidates = [
+            obj for obj in objectives
+            if isinstance(obj, dict)
+            and str(obj.get("status", "")).strip().lower() in {"open", "in_progress", "disproved"}
+        ]
+        if not candidates:
+            return None
+
+        ranked = sorted(candidates, key=_objective_priority, reverse=True)
+        return ranked[0]
+
+    def _apply_objective_followup(
+        self,
+        proposal: dict[str, Any],
+        objective: dict[str, Any],
+        cooldown_map: dict[str, int],
+        previous: list[dict[str, Any]],
+        blocked_families: set[str],
+    ) -> dict[str, Any]:
+        updated = deepcopy(proposal)
+        objective_class = str(objective.get("objective_class", "generic")).strip().lower() or "generic"
+        objective_target = str(objective.get("asset_ref", "")).strip()
+        objective_id = str(objective.get("objective_id", "")).strip()
+        objective_status = str(objective.get("status", "")).strip().lower()
+
+        candidate_tools = list(_OBJECTIVE_TOOL_CANDIDATES.get(objective_class, _OBJECTIVE_TOOL_CANDIDATES["generic"]))
+        selected = self._select_fallback_tool(
+            blocked_tool="",
+            cooldown_map=cooldown_map,
+            target=objective_target or str(updated.get("target", "")),
+            action_type=str(updated.get("action_type", "")),
+            previous=previous,
+            candidate_tools=candidate_tools,
+            blocked_families=blocked_families,
+        )
+
+        if selected:
+            updated = self._rebuild_fallback_proposal(
+                updated,
+                selected,
+                "Pivoted to objective-focused follow-up for pending validation.",
+            )
+
+        if objective_target and self._tool_supports_target(str(updated.get("tool_name", "")), objective_target):
+            updated["target"] = objective_target
+
+        updated["rationale"] = (
+            str(updated.get("rationale", "")).strip()
+            + f" Objective focus: {objective_class} ({objective_status})"
+            + (f" [id:{objective_id}]" if objective_id else "")
+            + "."
+        ).strip()
+        return updated
 
     def _emit_agent_invoked(
         self,

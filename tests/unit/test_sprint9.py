@@ -29,7 +29,9 @@ class TestPwnpilotConfig:
         cfg = PwnpilotConfig()
         assert cfg.database.url == "sqlite:///pwnpilot.db"
         assert cfg.llm.local_model == "llama3"
+        assert cfg.embedding.local_model == "nomic-embed-text"
         assert cfg.llm.cloud_allowed is False
+        assert cfg.embedding.cloud_allowed is False
         assert cfg.agent.max_iterations == 50
         assert cfg.storage.evidence_dir == "~/.pwnpilot/evidence"
         assert cfg.storage.report_dir == "reports"
@@ -66,10 +68,12 @@ class TestPwnpilotConfig:
         config_file.write_text(yaml.dump(config_data))
 
         monkeypatch.setenv("PWNPILOT_LLM__LOCAL_MODEL", "phi3")
+        monkeypatch.setenv("PWNPILOT_EMBEDDING__MODEL_NAME", "text-embedding-3-small")
         monkeypatch.setenv("PWNPILOT_DATABASE__URL", "sqlite:///env_override.db")
 
         cfg = load_config(config_path=config_file)
         assert cfg.llm.local_model == "phi3"
+        assert cfg.embedding.model_name == "text-embedding-3-small"
         assert cfg.database.url == "sqlite:///env_override.db"
 
     def test_invalid_log_level_exits(self, tmp_path: Path):

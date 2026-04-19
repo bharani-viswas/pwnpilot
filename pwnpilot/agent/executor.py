@@ -29,6 +29,7 @@ import structlog
 
 from pwnpilot.agent.state import AgentState
 from pwnpilot.control.approval import ApprovalService
+from pwnpilot.control.invocation_compiler import InvocationCompiler
 from pwnpilot.control.target_resolver import TargetResolver
 from pwnpilot.agent.action_validator import ActionValidationError, ActionValidator
 from pwnpilot.data.retrieval_store import RetrievalStore
@@ -64,6 +65,266 @@ _AUTH_PATH_MARKERS = (
     "session",
     "admin",
 )
+
+_EXPLOIT_KEYWORDS = (
+    "sql injection",
+    "sqli",
+    "command injection",
+    "remote code execution",
+    "rce",
+    "xss",
+    "cross-site scripting",
+    "path traversal",
+    "directory traversal",
+    "idor",
+    "broken access control",
+    "ssrf",
+    "lfi",
+    "rfi",
+    "deserialization",
+    "auth bypass",
+    "privilege escalation",
+)
+
+_LOW_VALUE_HINT_CODES = {
+    "wildcard_detected",
+    "no_forms_detected",
+    "no_matches",
+    "output_format_invalid",
+    "execution_error",
+}
+
+_OBJECTIVE_CLASS_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "injection": (
+        "sql injection",
+        "sqli",
+        "command injection",
+        "xss",
+        "cross-site scripting",
+        "deserialization",
+        "rce",
+        "remote code execution",
+    ),
+    "access_control": (
+        "idor",
+        "broken access control",
+        "authorization",
+        "insecure direct object",
+        "privilege escalation",
+    ),
+    "auth": (
+        "auth",
+        "login",
+        "signin",
+        "token",
+        "session",
+        "password",
+    ),
+    "exposure": (
+        "exposure",
+        "metrics",
+        "prometheus",
+        "disclosure",
+        "directory listing",
+        "debug",
+    ),
+    "headers": (
+        "header",
+        "csp",
+        "x-content-type-options",
+        "x-frame-options",
+        "cross-origin",
+    ),
+    "session": (
+        "session",
+        "cookie",
+        "csrf",
+    ),
+}
+
+
+def _finding_severity_weight(raw_severity: str) -> int:
+    sev = str(raw_severity or "").strip().lower()
+    if sev == "critical":
+        return 3
+    if sev == "high":
+        return 2
+    if sev == "medium":
+        return 1
+    return 0
+
+
+def _finding_has_repro_evidence(finding: dict[str, Any]) -> bool:
+    if not isinstance(finding, dict):
+        return False
+    for key in ("curl_command", "matched_at", "proof", "evidence", "request", "response"):
+        value = finding.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _score_exploitation_progress(parsed_output: dict[str, Any]) -> tuple[int, int]:
+    findings = parsed_output.get("findings", [])
+    if not isinstance(findings, list):
+        return 0, 0
+
+    exploit_signal_score = 0
+    confirmation_candidate_count = 0
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+
+        title = str(finding.get("title", "")).strip().lower()
+        vuln_ref = str(finding.get("vuln_ref", "")).strip().lower()
+        severity = str(finding.get("severity", "")).strip().lower()
+
+        has_exploit_pattern = any(keyword in title or keyword in vuln_ref for keyword in _EXPLOIT_KEYWORDS)
+        has_repro_evidence = _finding_has_repro_evidence(finding)
+
+        score = _finding_severity_weight(severity)
+        if has_exploit_pattern:
+            score += 3
+        if has_repro_evidence:
+            score += 1
+
+        exploit_signal_score += score
+        if score > 0 and (has_exploit_pattern or has_repro_evidence or severity in {"high", "critical", "medium"}):
+            confirmation_candidate_count += 1
+
+    return exploit_signal_score, confirmation_candidate_count
+
+
+def _classify_objective_class(text: str) -> str:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return "generic"
+    for objective_class, keywords in _OBJECTIVE_CLASS_KEYWORDS.items():
+        if any(keyword in normalized for keyword in keywords):
+            return objective_class
+    return "generic"
+
+
+def _extract_objective_tags(
+    parsed_output: dict[str, Any],
+    target: str,
+    execution_hints: list[dict[str, Any]],
+) -> list[str]:
+    tags: set[str] = set()
+
+    findings = parsed_output.get("findings", [])
+    if isinstance(findings, list):
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            title = str(finding.get("title", "")).strip()
+            vuln_ref = str(finding.get("vuln_ref", "")).strip()
+            tags.add(_classify_objective_class(f"{title} {vuln_ref}"))
+
+    parsed_target = urlparse(str(target or "").strip())
+    path_lower = parsed_target.path.lower()
+    if any(marker in path_lower for marker in _AUTH_PATH_MARKERS):
+        tags.add("auth")
+
+    for hint in execution_hints:
+        code = str(hint.get("code", "")).strip().lower()
+        if code in {"no_forms_detected", "wildcard_detected"}:
+            tags.add("generic")
+
+    tags.discard("")
+    return sorted(tags)
+
+
+def _build_assessment_objectives(
+    findings_summary: dict[str, Any],
+    previous_actions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    objectives: dict[str, dict[str, Any]] = {}
+
+    top_findings = findings_summary.get("top_findings", []) if isinstance(findings_summary, dict) else []
+    if isinstance(top_findings, list):
+        for finding in top_findings:
+            if not isinstance(finding, dict):
+                continue
+            title = str(finding.get("title", "")).strip()
+            asset_ref = str(finding.get("asset_ref", "")).strip()
+            severity = str(finding.get("severity", "medium")).strip().lower() or "medium"
+            objective_class = _classify_objective_class(f"{title} {finding.get('vuln_ref', '')}")
+            objective_id = f"{objective_class}:{asset_ref or title}".lower()
+            objectives[objective_id] = {
+                "objective_id": objective_id,
+                "objective_class": objective_class,
+                "title": title,
+                "asset_ref": asset_ref,
+                "severity": severity,
+                "status": "open",
+                "attempts": 0,
+                "confirmations": 0,
+                "low_value_attempts": 0,
+            }
+
+    for action in previous_actions:
+        if not isinstance(action, dict):
+            continue
+
+        action_target = str(action.get("target", "")).strip()
+        action_severity = "medium"
+        action_tags = [
+            str(tag).strip().lower()
+            for tag in action.get("objective_tags", [])
+            if str(tag).strip()
+        ]
+        if not action_tags:
+            action_tags = ["generic"]
+
+        for tag in action_tags:
+            objective_id = f"{tag}:{action_target or 'global'}".lower()
+            obj = objectives.setdefault(
+                objective_id,
+                {
+                    "objective_id": objective_id,
+                    "objective_class": tag,
+                    "title": f"Follow-up for {tag}",
+                    "asset_ref": action_target,
+                    "severity": action_severity,
+                    "status": "open",
+                    "attempts": 0,
+                    "confirmations": 0,
+                    "low_value_attempts": 0,
+                },
+            )
+
+            obj["attempts"] = int(obj.get("attempts", 0) or 0) + 1
+            if bool(action.get("requires_followup_validation", False)) or int(action.get("confirmation_candidate_count", 0) or 0) > 0:
+                obj["confirmations"] = int(obj.get("confirmations", 0) or 0) + 1
+            if bool(action.get("objective_low_value", False)):
+                obj["low_value_attempts"] = int(obj.get("low_value_attempts", 0) or 0) + 1
+
+    for obj in objectives.values():
+        attempts = int(obj.get("attempts", 0) or 0)
+        confirmations = int(obj.get("confirmations", 0) or 0)
+        low_value_attempts = int(obj.get("low_value_attempts", 0) or 0)
+        if confirmations > 0:
+            obj["status"] = "confirmed"
+        elif attempts >= 2 and low_value_attempts >= 2:
+            obj["status"] = "disproved"
+        elif attempts > 0:
+            obj["status"] = "in_progress"
+        else:
+            obj["status"] = "open"
+
+    objective_list = sorted(
+        objectives.values(),
+        key=lambda item: (str(item.get("status", "")) != "open", -_finding_severity_weight(str(item.get("severity", "")))),
+    )
+    progress = {
+        "total": len(objective_list),
+        "open": sum(1 for item in objective_list if str(item.get("status", "")) == "open"),
+        "in_progress": sum(1 for item in objective_list if str(item.get("status", "")) == "in_progress"),
+        "confirmed": sum(1 for item in objective_list if str(item.get("status", "")) == "confirmed"),
+        "disproved": sum(1 for item in objective_list if str(item.get("status", "")) == "disproved"),
+    }
+    return objective_list, progress
 
 
 def _service_host_fields(service: dict[str, Any], fallback_target: str) -> tuple[str, str | None]:
@@ -120,6 +381,54 @@ def _normalize_params(params: dict[str, Any], tool_name: str) -> dict[str, Any]:
             normalized["severity"] = severity.lower() if severity.lower() in _SEVERITY_ORDER else "medium"
     
     return normalized
+
+
+def _normalize_base_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return str(url or "").strip()
+
+
+def _base_target_match(left: str, right: str) -> bool:
+    left_base = _normalize_base_url(left)
+    right_base = _normalize_base_url(right)
+    return bool(left_base) and left_base == right_base
+
+
+def _recent_no_forms_hint(previous_actions: list[dict[str, Any]], target: str, lookback: int = 8) -> bool:
+    recent = previous_actions[-max(1, lookback):]
+    for action in reversed(recent):
+        if not isinstance(action, dict):
+            continue
+        if str(action.get("tool_name", "")).strip() != "sqlmap":
+            continue
+        if not _base_target_match(str(action.get("target", "")), target):
+            continue
+        hint_codes = {
+            str(code).strip()
+            for code in action.get("execution_hint_codes", [])
+            if str(code).strip()
+        }
+        if "no_forms_detected" in hint_codes:
+            return True
+    return False
+
+
+def _enforce_sqlmap_non_forms_mode(
+    params: dict[str, Any],
+    target: str,
+    previous_actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    normalized = dict(params or {})
+    if not _recent_no_forms_hint(previous_actions, target):
+        return normalized, False
+
+    if bool(normalized.get("forms", False)):
+        normalized["forms"] = False
+        if not str(normalized.get("mode_selection_reason", "")).strip():
+            normalized["mode_selection_reason"] = "no_forms_hint_enforced_executor"
+    return normalized, True
 
 
 def _merge_attack_surface(
@@ -287,6 +596,7 @@ class ExecutorNode:
         target_family: str = "unknown",
         target_resolver: TargetResolver | None = None,
         capability_registry: Any | None = None,
+        invocation_compiler: InvocationCompiler | None = None,
         event_bus: object | None = None,
         retrieval_store: Any | None = None,
     ) -> None:
@@ -301,6 +611,7 @@ class ExecutorNode:
         self._target_family = str(target_family or "unknown")
         self._target_resolver = target_resolver
         self._capability_registry = capability_registry
+        self._invocation_compiler = invocation_compiler or InvocationCompiler()
         self._event_bus = event_bus  # ExecutionEventBus | None
         self._retrieval_store = retrieval_store
         # ActionValidator is lazily initialised once the tool_runner adapters are available
@@ -359,8 +670,8 @@ class ExecutorNode:
 
         resolved_target_snapshot: dict[str, Any] = {}
         target_for_tool = proposal.target
+        supported_target_types: list[str] = []
         if self._target_resolver:
-            supported_target_types: list[str] = []
             if self._capability_registry:
                 contract = self._capability_registry.contract_for(proposal.tool_name)
                 if isinstance(contract, dict):
@@ -372,9 +683,71 @@ class ExecutorNode:
                 supported_target_types=supported_target_types,
             )
 
+        compile_result = self._invocation_compiler.compile(
+            tool_name=proposal.tool_name,
+            target=target_for_tool,
+            params=proposal.params if isinstance(proposal.params, dict) else {},
+            resolved_target=resolved_target_snapshot,
+            supported_target_types=supported_target_types,
+            previous_actions=list(state.get("previous_actions", []) or []),
+        )
+        if not compile_result.feasible:
+            reason = compile_result.reason_detail or "Invocation is not feasible for selected tool."
+            hint = compile_result.remediation_hint or "Adjust target/params and retry."
+            updated_proposal = proposal_dict.copy()
+            updated_proposal["rejection_reason"] = f"{reason} {hint}".strip()
+            self._audit_event(
+                state,
+                "InvocationRejected",
+                {
+                    "tool": proposal.tool_name,
+                    "target": target_for_tool,
+                    "reason_code": compile_result.reason_code or "INVOCATION_UNFIT",
+                    "reason_detail": reason,
+                    "remediation_hint": hint,
+                    "diagnostics": compile_result.diagnostics,
+                },
+            )
+            if self._metrics:
+                self._metrics.record_nonproductive_cycle()
+            return {
+                **state,
+                "proposed_action": updated_proposal,
+                "validation_result": {
+                    "verdict": "reject",
+                    "risk_override": None,
+                    "rationale": reason,
+                    "rejection_reason_code": compile_result.reason_code or "INVOCATION_UNFIT",
+                    "rejection_reason_detail": reason,
+                    "rejection_class": "invocation",
+                },
+                "nonproductive_cycle_streak": state.get("nonproductive_cycle_streak", 0) + 1,
+                "last_execution_hints": [
+                    {
+                        "code": str(compile_result.diagnostics.get("invocation_subcode", "")).strip()
+                        or "target_projection_invalid",
+                        "message": reason,
+                        "severity": "warning",
+                        "recommended_action": hint,
+                    }
+                ],
+                "error": None,
+            }
+
+        target_for_tool = compile_result.target or target_for_tool
+        proposal_params_compiled = compile_result.params if isinstance(compile_result.params, dict) else {}
+
         # Construct typed ActionRequest
         try:
-            normalized_params = _normalize_params(proposal.params, proposal.tool_name)
+            normalized_params = _normalize_params(proposal_params_compiled, proposal.tool_name)
+            sqlmap_mode_enforced = False
+            if proposal.tool_name == "sqlmap":
+                normalized_params, sqlmap_mode_enforced = _enforce_sqlmap_non_forms_mode(
+                    params=normalized_params,
+                    target=target_for_tool,
+                    previous_actions=list(state.get("previous_actions", []) or []),
+                )
+
             action = ActionRequest(
                 engagement_id=engagement_id,
                 action_type=ActionType(proposal.action_type),
@@ -491,6 +864,9 @@ class ExecutorNode:
             str(v) for v in (action.params.get("cmd", action.params.get("command", [proposal.target])) or [])
             if str(v)
         )
+        effective_sqlmap_mode = None
+        if action.tool_name == "sqlmap":
+            effective_sqlmap_mode = "forms" if bool(action.params.get("forms", False)) else "parameterized"
 
         self._audit_event(
             state,
@@ -507,6 +883,8 @@ class ExecutorNode:
                     if hasattr(action.risk_level, "value")
                     else str(action.risk_level)
                 ),
+                "effective_sqlmap_mode": effective_sqlmap_mode,
+                "sqlmap_mode_enforced": bool(sqlmap_mode_enforced) if action.tool_name == "sqlmap" else False,
             },
         )
 
@@ -721,6 +1099,11 @@ class ExecutorNode:
         streak = state.get("no_new_findings_streak", 0)
         streak = 0 if new_evidence > 0 else streak + 1
         execution_hints = list(result.parsed_output.get("execution_hints", []))
+        hint_codes = {
+            str(hint.get("code", "")).strip()
+            for hint in execution_hints
+            if str(hint.get("code", "")).strip()
+        }
         run_evidence_ids: list[str] = []
         if result.stdout_evidence_id is not None:
             run_evidence_ids.append(str(result.stdout_evidence_id))
@@ -737,7 +1120,20 @@ class ExecutorNode:
             if hasattr(result.outcome_status, "value")
             else str(result.outcome_status)
         )
-        is_productive_execution = bool(new_evidence) or has_structured_output
+        exploit_signal_score, confirmation_candidate_count = _score_exploitation_progress(result.parsed_output)
+        action_type_value = action.action_type.value if hasattr(action.action_type, "value") else str(action.action_type)
+        recon_progress = bool(has_structured_output) and action_type_value in {"recon_passive", "active_scan"}
+        finding_progress = bool(new_evidence) and (exploit_signal_score > 0 or confirmation_candidate_count > 0)
+        low_value_only = bool(hint_codes) and hint_codes.issubset(_LOW_VALUE_HINT_CODES)
+        objective_tags = _extract_objective_tags(
+            parsed_output=result.parsed_output,
+            target=target_for_tool,
+            execution_hints=execution_hints,
+        )
+
+        is_productive_execution = recon_progress or finding_progress
+        if low_value_only and not finding_progress:
+            is_productive_execution = False
         current_nonproductive = int(state.get("nonproductive_cycle_streak", 0) or 0)
         next_nonproductive = 0 if is_productive_execution and outcome_status_value == "success" else current_nonproductive + 1
 
@@ -896,13 +1292,29 @@ class ExecutorNode:
                 ],
                 "execution_hint_codes": [hint.get("code") for hint in execution_hints],
                 "new_findings_count": int(result.parsed_output.get("new_findings_count", 0) or 0),
+                "exploit_signal_score": int(exploit_signal_score),
+                "confirmation_candidate_count": int(confirmation_candidate_count),
+                "requires_followup_validation": bool(
+                    confirmation_candidate_count > 0 or exploit_signal_score > 0
+                ),
+                "objective_tags": objective_tags,
+                "objective_low_value": bool(low_value_only and not finding_progress),
                 "parser_confidence": result.parser_confidence,
                 "had_runtime_hints": bool(execution_hints),
+                "effective_sqlmap_mode": effective_sqlmap_mode,
+                "sqlmap_mode_enforced": bool(sqlmap_mode_enforced) if action.tool_name == "sqlmap" else False,
+                "sqlmap_mode_selection_reason": (
+                    str(action.params.get("mode_selection_reason", "")).strip()
+                    if action.tool_name == "sqlmap"
+                    else ""
+                ),
+                "invocation_compile": compile_result.diagnostics,
+                "invocation_subcode": str(compile_result.diagnostics.get("invocation_subcode", "")).strip(),
             }
         )
 
         if self._metrics:
-            hint_codes = [
+            hint_codes_list = [
                 str(hint.get("code", "")).strip()
                 for hint in execution_hints
                 if str(hint.get("code", "")).strip()
@@ -912,7 +1324,7 @@ class ExecutorNode:
             self._metrics.record_action_outcome(
                 tool_name=action.tool_name,
                 new_findings_count=int(result.parsed_output.get("new_findings_count", 0) or 0),
-                execution_hint_codes=hint_codes,
+                execution_hint_codes=hint_codes_list,
                 target_family=self._target_family,
             )
             if result.error_class:
@@ -970,6 +1382,9 @@ class ExecutorNode:
 
         # Build recon summary for planner context (NEW: Feedback loop)
         recon_summary = state.get("recon_summary", {})
+        assessment_objectives = list(state.get("assessment_objectives", []) or [])
+        objective_progress = dict(state.get("objective_progress", {}) or {})
+        depth_metrics = dict(state.get("depth_metrics", {}) or {})
         if self._recon_store and self._finding_store:
             try:
                 recon_summary = self._recon_store.get_summary(engagement_id)
@@ -985,6 +1400,22 @@ class ExecutorNode:
                     recon_summary.get("attack_surface"),
                     attack_surface_updates,
                 )
+                assessment_objectives, objective_progress = _build_assessment_objectives(
+                    findings_summary=findings_summary,
+                    previous_actions=previous,
+                )
+                depth_metrics = {
+                    "exploit_signal_score_total": int(
+                        sum(int(item.get("exploit_signal_score", 0) or 0) for item in previous if isinstance(item, dict))
+                    ),
+                    "confirmation_candidate_total": int(
+                        sum(int(item.get("confirmation_candidate_count", 0) or 0) for item in previous if isinstance(item, dict))
+                    ),
+                    "followup_validation_actions": int(
+                        sum(1 for item in previous if isinstance(item, dict) and bool(item.get("requires_followup_validation", False)))
+                    ),
+                    "objective_progress": objective_progress,
+                }
             except Exception as summary_exc:
                 log.warning("executor.summary_error", exc=str(summary_exc))
 
@@ -1002,6 +1433,9 @@ class ExecutorNode:
             "no_new_findings_streak": streak,
             "nonproductive_cycle_streak": next_nonproductive,
             "recon_summary": recon_summary,
+            "assessment_objectives": assessment_objectives,
+            "objective_progress": objective_progress,
+            "depth_metrics": depth_metrics,
             "last_execution_hints": execution_hints,
             # Clear active action fields after completion
             "active_action_id": None,

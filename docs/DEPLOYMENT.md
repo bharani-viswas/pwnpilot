@@ -303,11 +303,22 @@ bash /tmp/verify.sh
 ```bash
 sudo tee /etc/pwnpilot/config.yaml > /dev/null << 'EOF'
 llm:
-  provider: "openai"
+  model_name: "gpt-4o"
   api_key: "sk-YOUR_API_KEY_HERE"
-  model: "gpt-4o"      # or "gpt-4", "gpt-3.5-turbo"
-  timeout: 30
-  temperature: 0.7
+  api_base_url: ""
+  fallback_model_name: "gpt-4o-mini"
+  fallback_api_key: ""
+  cloud_allowed: true
+  timeout_seconds: 30
+
+embedding:
+  model_name: "text-embedding-3-small"
+  api_key: "sk-YOUR_API_KEY_HERE"
+  api_base_url: ""
+  fallback_model_name: "text-embedding-3-small"
+  fallback_api_key: ""
+  cloud_allowed: true
+  timeout_seconds: 30
 
 database:
   url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"
@@ -321,11 +332,22 @@ sudo chmod 640 /etc/pwnpilot/config.yaml
 ```bash
 sudo tee /etc/pwnpilot/config.yaml > /dev/null << 'EOF'
 llm:
-  provider: "anthropic"
+  model_name: "claude-3-sonnet-20240229"
   api_key: "sk-ant-YOUR_API_KEY_HERE"
-  model: "claude-3-sonnet"   # or "claude-3-opus", "claude-3-haiku"
-  timeout: 30
-  temperature: 0.7
+  api_base_url: ""
+  fallback_model_name: "gpt-4o-mini"
+  fallback_api_key: ""
+  cloud_allowed: true
+  timeout_seconds: 30
+
+embedding:
+  model_name: "text-embedding-3-small"
+  api_key: "sk-YOUR_API_KEY_HERE"
+  api_base_url: ""
+  fallback_model_name: "text-embedding-3-small"
+  fallback_api_key: ""
+  cloud_allowed: true
+  timeout_seconds: 30
 
 database:
   url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"
@@ -339,11 +361,22 @@ sudo chmod 640 /etc/pwnpilot/config.yaml
 ```bash
 sudo tee /etc/pwnpilot/config.yaml > /dev/null << 'EOF'
 llm:
-  provider: "ollama"
-  base_url: "http://localhost:11434"
-  model: "mistral"      # or "neural-chat", "dolphin-mixtral"
-  timeout: 30
-  temperature: 0.7
+  model_name: "ollama/mistral"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
+  fallback_model_name: "gpt-4o-mini"
+  fallback_api_key: ""
+  cloud_allowed: false
+  timeout_seconds: 30
+
+embedding:
+  model_name: "ollama/nomic-embed-text"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
+  fallback_model_name: "text-embedding-3-small"
+  fallback_api_key: ""
+  cloud_allowed: false
+  timeout_seconds: 30
 
 database:
   url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"

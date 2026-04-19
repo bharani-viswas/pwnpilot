@@ -23,6 +23,14 @@ class ToolDescriptor:
     optional_params: list[str] = field(default_factory=list)
     description: str = ""
     parameter_schema: dict[str, Any] = field(default_factory=dict)
+    preferred_target_types: list[str] = field(default_factory=list)
+    preconditions: list[str] = field(default_factory=list)
+    low_value_hint_codes: list[str] = field(default_factory=list)
+    fallback_family: str = ""
+    preflight_required_params: list[str] = field(default_factory=list)
+    # Additional action_types this tool is valid for beyond risk_class.
+    # Empty list means only risk_class is accepted (legacy default).
+    compatible_action_types: list[str] = field(default_factory=list)
     trust_status: str = "unknown"
     trust_reason: str = ""
     enabled: bool = True
@@ -35,6 +43,7 @@ class ToolDescriptor:
         return {
             "tool_name": self.tool_name,
             "risk_class": self.risk_class,
+            "compatible_action_types": list(self.compatible_action_types),
             "manifest_version": self.manifest_version,
             "binary_name": self.binary_name,
             "categories": list(self.categories),
@@ -43,6 +52,11 @@ class ToolDescriptor:
             "optional_params": list(self.optional_params),
             "description": self.description,
             "parameter_schema": dict(self.parameter_schema),
+            "preferred_target_types": list(self.preferred_target_types),
+            "preconditions": list(self.preconditions),
+            "low_value_hint_codes": list(self.low_value_hint_codes),
+            "fallback_family": self.fallback_family,
+            "preflight_required_params": list(self.preflight_required_params),
         }
 
 

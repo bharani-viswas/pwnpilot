@@ -39,6 +39,10 @@ class PluginManifest(BaseModel):
     name: str
     version: str
     risk_class: str  # recon_passive | active_scan | exploit | post_exploit
+    # Optional: additional action_types this tool is valid for beyond risk_class.
+    # When set, the validator accepts any action_type in this list instead of
+    # requiring strict risk_class equality.  risk_class is always implicitly included.
+    compatible_action_types: list[str] = []
     description: str = ""
     input_schema: dict[str, Any] = {}
     output_schema: dict[str, Any] = {}

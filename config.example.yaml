@@ -97,6 +97,33 @@ llm:
   timeout_seconds: 30
 
 # =============================================================================
+# EMBEDDING MODEL CONFIGURATION - SAME ROUTING PATTERN AS LLM (via LiteLLM)
+# =============================================================================
+embedding:
+  # Primary embedding model
+  # Examples:
+  #   "text-embedding-3-small"        → OpenAI
+  #   "text-embedding-3-large"        → OpenAI
+  #   "ollama/nomic-embed-text"       → Local Ollama
+  model_name: "ollama/nomic-embed-text"
+
+  # Primary provider credentials/endpoint
+  api_key: ""
+  api_base_url: ""
+
+  # Fallback embedding model (used when primary fails and cloud_allowed=true)
+  fallback_model_name: "text-embedding-3-small"
+  fallback_api_key: ""
+  fallback_api_base_url: ""
+
+  # Cloud fallback policy gate
+  cloud_allowed: false
+
+  # Retry/timeout behavior
+  max_retries: 3
+  timeout_seconds: 30
+
+# =============================================================================
 # TOOLS CONFIGURATION — Resource Limits & Plugin Discovery
 # =============================================================================
 tools:

@@ -22,7 +22,10 @@ def _engagement_service() -> EngagementService:
     eng = Engagement(
         name="exec-storage-test",
         operator_id="op",
-        scope=EngagementScope(scope_cidrs=["10.0.0.0/8"]),
+        scope=EngagementScope(
+            scope_cidrs=["10.0.0.0/8"],
+            scope_urls=["http://localhost:3000"],
+        ),
         roe_document_hash="b" * 64,
         authoriser_identity="operator@example.com",
         valid_from=now - timedelta(hours=1),
@@ -154,6 +157,102 @@ def test_executor_stores_findings_hosts_services_and_hints() -> None:
     assert recon_store.upsert_service.call_count >= 2
     assert out["recon_summary"]["findings_summary"]["findings_count"] == 1
     assert "attack_surface" in out["recon_summary"]
+
+
+def test_executor_enforces_sqlmap_non_forms_after_no_forms_hint() -> None:
+    policy = PolicyEngine(_engagement_service())
+    runner = MagicMock()
+    approval = MagicMock()
+    audit = MagicMock()
+
+    result = MagicMock()
+    result.exit_code = 0
+    result.duration_ms = 5
+    result.stdout_hash = "h1"
+    result.stderr_hash = "h2"
+    result.stdout_evidence_id = None
+    result.stderr_evidence_id = None
+    result.stdout_evidence_path = None
+    result.stderr_evidence_path = None
+    result.parser_confidence = 0.7
+    result.error_class = None
+    result.outcome_status = MagicMock(value="degraded")
+    result.failure_reasons = []
+    result.parsed_output = {
+        "new_findings_count": 0,
+        "execution_hints": [{"code": "no_forms_detected"}],
+        "findings": [],
+        "hosts": [],
+        "services": [],
+    }
+    result.model_dump.return_value = {"exit_code": 0, "parsed_output": result.parsed_output}
+    runner.execute.return_value = result
+
+    executor = ExecutorNode(
+        policy_engine=policy,
+        tool_runner=runner,
+        approval_service=approval,
+        audit_store=audit,
+    )
+
+    engagement_id = str(uuid4())
+    state = {
+        **_base_state(engagement_id),
+        "proposed_action": {
+            "action_type": "active_scan",
+            "tool_name": "sqlmap",
+            "target": "http://localhost:3000",
+            "params": {"forms": True},
+            "rationale": "retry sqlmap",
+            "estimated_risk": "medium",
+        },
+        "previous_actions": [
+            {
+                "tool_name": "sqlmap",
+                "target": "http://localhost:3000/login",
+                "action_type": "active_scan",
+                "execution_hint_codes": ["no_forms_detected"],
+            }
+        ],
+    }
+
+    out = executor(state)
+    called_action = runner.execute.call_args.args[0]
+    assert called_action.params.get("forms") is False
+    assert out["previous_actions"][-1].get("effective_sqlmap_mode") == "parameterized"
+    assert out["previous_actions"][-1].get("sqlmap_mode_enforced") is True
+
+
+def test_executor_rejects_infeasible_invocation_before_run() -> None:
+    policy = PolicyEngine(_engagement_service())
+    runner = MagicMock()
+    approval = MagicMock()
+    audit = MagicMock()
+
+    executor = ExecutorNode(
+        policy_engine=policy,
+        tool_runner=runner,
+        approval_service=approval,
+        audit_store=audit,
+    )
+
+    engagement_id = str(uuid4())
+    state = {
+        **_base_state(engagement_id),
+        "proposed_action": {
+            "action_type": "active_scan",
+            "tool_name": "gobuster",
+            "target": "localhost",
+            "params": {"mode": "dir"},
+            "rationale": "discover paths",
+            "estimated_risk": "medium",
+        },
+    }
+
+    out = executor(state)
+    assert out["validation_result"]["verdict"] == "reject"
+    assert out["validation_result"]["rejection_reason_code"] == "INVOCATION_UNFIT"
+    assert runner.execute.call_count == 0
 
 
 def test_extract_attack_surface_updates_from_services_and_findings() -> None:

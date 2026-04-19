@@ -99,13 +99,17 @@ class CorrelationEngine:
         - tool_coverage: set of tool names that produced findings
         - overall_risk: lowest severity that covers ≥20 % of findings
         - total_findings: int
-        - open_findings: int (status = new | confirmed)
+        - unconfirmed_findings: int (status = new)
+        - confirmed_findings: int (status = confirmed)
+        - active_findings: int (status = new | confirmed)
+        - remediation_open_findings: int (status = new | confirmed)
+        - open_findings: int (legacy alias for remediation_open_findings)
         """
-        findings = self._findings.findings_for_engagement(engagement_id)
-
         dist: dict[str, int] = {s: 0 for s in _SEVERITY_ORDER}
         tool_names: set[str] = set()
-        open_count = 0
+        unconfirmed_count = 0
+        confirmed_count = 0
+        remediation_open_count = 0
 
         from pwnpilot.data.finding_store import FindingRow
         db_rows = (
@@ -120,8 +124,12 @@ class CorrelationEngine:
             if sev in dist:
                 dist[sev] += 1
             tool_names.add(row.tool_name)
-            if row.status in ("new", "confirmed"):
-                open_count += 1
+            if row.status == FindingStatus.NEW.value:
+                unconfirmed_count += 1
+                remediation_open_count += 1
+            elif row.status == FindingStatus.CONFIRMED.value:
+                confirmed_count += 1
+                remediation_open_count += 1
 
         total = len(db_rows)
         top_5 = [
@@ -141,7 +149,11 @@ class CorrelationEngine:
         return {
             "engagement_id": str(engagement_id),
             "total_findings": total,
-            "open_findings": open_count,
+            "unconfirmed_findings": unconfirmed_count,
+            "confirmed_findings": confirmed_count,
+            "active_findings": remediation_open_count,
+            "remediation_open_findings": remediation_open_count,
+            "open_findings": remediation_open_count,
             "severity_distribution": dist,
             "top_findings": top_5,
             "tool_coverage": sorted(tool_names),

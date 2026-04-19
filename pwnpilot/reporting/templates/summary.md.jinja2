@@ -29,6 +29,7 @@ _No services discovered._
 
 {% for f in findings %}
 ### {{ loop.index }}. {{ f.title }}
+{% set insight = finding_insights.get(f.finding_id|string, {}) %}
 
 | Field | Value |
 |-------|-------|
@@ -39,11 +40,69 @@ _No services discovered._
 | **Confidence** | {{ "%.0f%%" | format(f.confidence * 100) }} |
 | **Status** | {{ f.status.value if f.status else f.status }} |
 
+**Status Rationale:** {{ insight.status_rationale if insight.status_rationale else "_No status rationale recorded._" }}
+
+**Issue Description:** {{ insight.issue_description if insight.issue_description else "_No issue description available._" }}
+
+**How It Can Be Exploited:** {{ insight.exploitation_path if insight.exploitation_path else "_No exploitation path recorded._" }}
+
+**Proof of Exploitation Performed:**
+{% if insight.proof_lines %}
+{% for proof in insight.proof_lines %}
+- {{ proof }}
+{% endfor %}
+{% else %}
+- _No proof transcript captured._
+{% endif %}
+
+**Evidence Artifacts:**
+{% if insight.evidence_artifacts %}
+{% for evidence_id in insight.evidence_artifacts %}
+- `{{ evidence_id }}`
+{% endfor %}
+{% else %}
+- _No evidence artifact IDs linked to this finding._
+{% endif %}
+
 **Remediation:** {{ f.remediation or "_No remediation provided._" }}
 
 {% else %}
 _No findings recorded._
 {% endfor %}
+
+---
+
+## Objective Progress
+
+{% if objective_progress %}
+- Total objectives: {{ objective_progress.total or 0 }}
+- Open: {{ objective_progress.open or 0 }}
+- In progress: {{ objective_progress.in_progress or 0 }}
+- Confirmed: {{ objective_progress.confirmed or 0 }}
+- Disproved: {{ objective_progress.disproved or 0 }}
+{% else %}
+_No objective telemetry recorded._
+{% endif %}
+
+{% if assessment_objectives %}
+### Active Objectives
+
+{% for objective in assessment_objectives %}
+- `{{ objective.objective_class }}` {{ objective.title }}{% if objective.asset_ref %} on `{{ objective.asset_ref }}`{% endif %} — {{ objective.status }}
+{% endfor %}
+{% endif %}
+
+---
+
+## Depth Metrics
+
+{% if depth_metrics %}
+- Exploit signal score total: {{ depth_metrics.exploit_signal_score_total or 0 }}
+- Confirmation candidates: {{ depth_metrics.confirmation_candidate_total or 0 }}
+- Follow-up validation actions: {{ depth_metrics.followup_validation_actions or 0 }}
+{% else %}
+_No depth metrics recorded._
+{% endif %}
 
 ---
 

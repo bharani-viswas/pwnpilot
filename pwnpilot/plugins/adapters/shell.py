@@ -55,6 +55,11 @@ class ShellAdapter(BaseAdapter):
         name="shell",
         version="1.0",
         risk_class="recon_passive",
+        # Shell commands span both passive recon (ls, id, ps, dig) and
+        # active investigation (curl, netstat).  Allow either action_type
+        # so the planner can use shell for active_scan proposals without
+        # triggering a risk-class mismatch rejection in the validator.
+        compatible_action_types=["recon_passive", "active_scan"],
         description="Controlled, allow-listed terminal command execution",
         input_schema={
             "type": "object",

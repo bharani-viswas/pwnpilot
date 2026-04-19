@@ -50,12 +50,30 @@ Welcome to PwnPilot documentation! This guide provides complete information abou
   - Data flow
   - Integration points
 
+### Strategic & Research
+- **[Novel Attack Generation Roadmap](NOVEL_ATTACK_GENERATION_ROADMAP.md)** - Phased roadmap to achieve research-level exploit capability
+  - State-of-the-art LLM pentesting capabilities (RAG, payload generation, RL)
+  - Capability gaps analysis
+  - 5-phase implementation plan (Phases 6A-6E)
+  - Safety considerations and mitigations
+  - Expected 1.3-1.5x success rate improvement
+
+- **[Attack Generation Comparison](ATTACK_GENERATION_COMPARISON.md)** - Technical comparison: pwnpilot vs. research systems
+  - Why research systems create novel attack patterns
+  - Architectural differences explained
+  - Real-world example: SQL injection discovery
+  - Capability matrix
+  - Key technical gaps
+
 ### Additional Information
 - **[Background](BACKGROUND.md)** - Technical history, improvements, and architectural decisions
   - Issues discovered and fixed
   - Performance improvements achieved
   - System-wide Python migration rationale
   - Lessons learned
+
+- **[Error Handling](ERROR_HANDLING.md)** - Error handling strategy and taxonomy
+- **[Error Handling Implementation](ERROR_HANDLING_IMPLEMENTATION.md)** - Implementation details of error recovery
 
 - **[License](LICENSE)** - Software license
 

@@ -132,9 +132,20 @@ database:
   url: "sqlite:////var/lib/pwnpilot/pwnpilot.db"
 
 llm:
-  provider: "ollama"
-  base_url: "http://localhost:11434"
-  model: "mistral"
+  model_name: "ollama/mistral"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
+  fallback_model_name: "gpt-4o-mini"
+  fallback_api_key: ""
+  cloud_allowed: false
+
+embedding:
+  model_name: "ollama/nomic-embed-text"
+  api_key: ""
+  api_base_url: ""
+  fallback_model_name: "text-embedding-3-small"
+  fallback_api_key: ""
+  cloud_allowed: false
 ```
 
 ### LLM Options
@@ -142,25 +153,25 @@ llm:
 **OpenAI:**
 ```yaml
 llm:
-  provider: "openai"
+  model_name: "gpt-4o"
   api_key: "sk-..."
-  model: "gpt-4o"
+  api_base_url: ""
 ```
 
 **Anthropic:**
 ```yaml
 llm:
-  provider: "anthropic"
+  model_name: "claude-3-sonnet-20240229"
   api_key: "sk-ant-..."
-  model: "claude-3-sonnet"
+  api_base_url: ""
 ```
 
 **Local Ollama:**
 ```yaml
 llm:
-  provider: "ollama"
-  base_url: "http://localhost:11434"
-  model: "mistral"
+  model_name: "ollama/mistral"
+  api_key: ""
+  api_base_url: "http://localhost:11434"
 ```
 
 ### Enable Service (Optional)

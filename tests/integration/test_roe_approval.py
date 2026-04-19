@@ -48,7 +48,6 @@ def sample_extracted_policy():
         restricted_actions=["MODIFY_DATA", "DELETE_DATA"],
         max_iterations=5,
         max_retries=3,
-        timeout_seconds=300,
         cloud_allowed=False,
     )
 

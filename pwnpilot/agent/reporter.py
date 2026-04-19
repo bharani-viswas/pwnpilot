@@ -69,6 +69,9 @@ class ReporterNode:
             "readiness_gate_results": readiness,
             "degradation_reasons": health["degradation_reasons"],
             "termination_reason": health["termination_reason"],
+            "assessment_objectives": list(state.get("assessment_objectives", []) or []),
+            "objective_progress": dict(state.get("objective_progress", {}) or {}),
+            "depth_metrics": dict(state.get("depth_metrics", {}) or {}),
         }
 
         try:

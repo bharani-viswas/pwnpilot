@@ -32,6 +32,11 @@ class CapabilityRegistry:
                 "requires_display": False,
                 "network_profile": "remote",
                 "supported_target_types": list(item.get("supported_target_types", [])),
+                "preferred_target_types": list(item.get("preferred_target_types", [])),
+                "preconditions": list(item.get("preconditions", [])),
+                "low_value_hint_codes": list(item.get("low_value_hint_codes", [])),
+                "fallback_family": str(item.get("fallback_family", "")).strip(),
+                "preflight_required_params": list(item.get("preflight_required_params", [])),
             }
 
     def contract_for(self, tool_name: str) -> dict[str, Any] | None:

@@ -185,7 +185,6 @@ class LLMRouter:
 Your role: Analyze engagement state and decide the NEXT action that provides maximum value.
 
 Decision Logic (Priority Order):
-0. FOLLOW TARGET STRATEGY: If target_strategy_progress.current_step exists, prioritize that step before jumping ahead
 1. VERIFY HIGH-RISK FINDINGS: If unverified high/critical findings exist → attempt verification
 2. DEEPEN EXPLOITATION: If verified vulnerabilities exist → attempt exploitation or post-exploitation
 3. EXPAND DISCOVERY: If few findings → expand reconnaissance to new targets/ranges
@@ -200,8 +199,6 @@ Context Available:
 - tools_catalog: Capability metadata for each available tool
 - tool_parameter_schemas: CANONICAL parameter specifications for each tool (SEE BELOW)
 - temporarily_unavailable_tools: tools that recently failed due to runtime availability errors
-- target_strategy: deterministic step sequence and tool mapping for this target family
-- target_strategy_progress: completed steps and current recommended step
 
 TOOL PARAMETER REFERENCE:
 {schemas_section}
@@ -215,9 +212,6 @@ CONSTRAINTS:
 - If an unavailable or incompatible tool would be ideal, pick the closest available alternative and explain why in rationale.
 - If a tool appears in temporarily_unavailable_tools, do NOT propose it in this iteration.
 - If rejection_reason indicates a missing binary/tool unavailable error, you MUST select a different tool.
-- If target_strategy_progress.current_step exists, prefer a tool from that step's preferred_tools,
-  then fallback_tools only if preferred tools are unavailable.
-- Do not skip endpoint/route discovery steps for web targets unless that step is marked completed.
 
 Strategy Examples:
 - "Found CORS vulnerability" → "Test PUT/DELETE requests to verify exploitability"

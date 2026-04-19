@@ -83,6 +83,9 @@ class AgentState(TypedDict, total=False):
     # -----------------------------------------------------------------------
     recon_summary: dict[str, Any]
     memory_context: dict[str, Any]        # retrieved findings/strategies
+    assessment_objectives: list[dict[str, Any]]
+    objective_progress: dict[str, Any]
+    depth_metrics: dict[str, Any]
 
     # -----------------------------------------------------------------------
     # Repetition detection
@@ -169,6 +172,9 @@ def make_initial_state(
         run_started_at_epoch=time.time(),
         recon_summary={},
         memory_context={},
+        assessment_objectives=[],
+        objective_progress={},
+        depth_metrics={},
         repeated_action_count=0,
         last_repeated_action_key=None,
         previous_actions=[],

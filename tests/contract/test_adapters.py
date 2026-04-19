@@ -614,15 +614,27 @@ class TestGobusterContract:
         result = self.adapter.parse(b"", b"error", 2)
         assert result.parser_error is not None
 
-    def test_parse_wildcard_noise_lowers_confidence(self):
+    def test_parse_wildcard_noise_suppresses_findings(self):
         out = (
             b"[!] Wildcard response found: /abc (Status: 200) [Size: 2345]\n"
             b"/admin (Status: 200) [Size: 2345]\n"
         )
         result = self.adapter.parse(out, b"", 0)
-        assert result.findings
+        assert result.findings == []
         assert any(h["code"] == "wildcard_detected" for h in result.execution_hints)
-        assert result.confidence <= 0.5
+        assert any(h["code"] == "wildcard_findings_suppressed" for h in result.execution_hints)
+        assert result.confidence <= 0.35
+
+    def test_parse_wildcard_noise_respects_force_mode_output(self):
+        out = (
+            b"[!] Wildcard response found: /abc (Status: 200) [Size: 2345]\n"
+            b"[!] To force processing of wildcard responses, specify the --wildcard switch.\n"
+            b"/admin (Status: 200) [Size: 2345]\n"
+        )
+        result = self.adapter.parse(out, b"", 0)
+        assert len(result.findings) == 1
+        assert result.findings[0]["path"] == "/admin"
+        assert result.confidence == 0.45
 
 
 # ---------------------------------------------------------------------------

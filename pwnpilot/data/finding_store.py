@@ -99,6 +99,16 @@ def _fingerprint(asset_ref: str, vuln_ref: str, tool_name: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _coerce_uuid_list(values: list[str] | None) -> list[UUID]:
+    result: list[UUID] = []
+    for value in values or []:
+        try:
+            result.append(UUID(str(value)))
+        except (ValueError, TypeError, AttributeError):
+            log.warning("finding.invalid_evidence_id", evidence_id=str(value))
+    return result
+
+
 class FindingStore:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -183,7 +193,7 @@ class FindingStore:
             confidence=confidence,
             exploitability=exploitability,
             cvss_vector=cvss_vector,
-            evidence_ids=[UUID(e) for e in ev_ids],
+            evidence_ids=_coerce_uuid_list(ev_ids),
             remediation=remediation,
         )
 
@@ -196,7 +206,11 @@ class FindingStore:
         )
         result = []
         for r in rows:
-            ev_ids = [UUID(e) for e in json.loads(r.evidence_ids_json)]
+            try:
+                stored_evidence = json.loads(r.evidence_ids_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                stored_evidence = []
+            ev_ids = _coerce_uuid_list(stored_evidence)
             result.append(
                 Finding(
                     finding_id=UUID(r.finding_id),

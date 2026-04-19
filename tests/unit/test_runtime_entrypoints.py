@@ -11,14 +11,13 @@ from pwnpilot.runtime import (
     generate_report,
     get_approval_service,
     get_audit_store,
-    get_engagement_preflight,
     get_tool_registry,
     resume_engagement,
 )
 
 
 def test_create_and_run_engagement_dry_run(monkeypatch) -> None:
-    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: {})
+    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None, engagement_id=None: {})
 
     eid = create_and_run_engagement(
         name="dry-run",
@@ -33,17 +32,6 @@ def test_create_and_run_engagement_dry_run(monkeypatch) -> None:
     assert len(eid) > 10
 
 
-def test_get_engagement_preflight_uses_runtime_tools(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "pwnpilot.runtime._build_runtime",
-        lambda config_path=None: {"planner_available_tools": ["nmap", "whatweb"]},
-    )
-
-    pre = get_engagement_preflight(["10.0.0.0/24"], [], [], None)
-    assert "target_family" in pre
-    assert "sequence" in pre
-
-
 def test_runtime_getters_and_generate_report(monkeypatch, tmp_path: Path) -> None:
     fake_approval = object()
     fake_audit = object()
@@ -55,7 +43,7 @@ def test_runtime_getters_and_generate_report(monkeypatch, tmp_path: Path) -> Non
 
     monkeypatch.setattr(
         "pwnpilot.runtime._build_runtime",
-        lambda config_path=None: {
+            lambda config_path=None, engagement_id=None: {
             "approval_service": fake_approval,
             "audit_store": fake_audit,
             "report_generator": _ReportGen(),
@@ -78,7 +66,7 @@ def test_resume_engagement_raises_when_checkpoint_missing(monkeypatch) -> None:
         "typed_cfg": SimpleNamespace(database=SimpleNamespace(url="sqlite:///pwnpilot.db")),
         "audit_store": SimpleNamespace(append=lambda **kwargs: None),
     }
-    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: fake_rt)
+    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None, engagement_id=None: fake_rt)
 
     class _CP:
         def get_tuple(self, cfg):
@@ -117,7 +105,7 @@ def test_create_and_run_engagement_full_path(monkeypatch, tmp_path: Path) -> Non
         ),
     }
 
-    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: fake_rt)
+    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None, engagement_id=None: fake_rt)
     monkeypatch.setattr("pwnpilot.runtime.PlannerNode", lambda **kwargs: object())
     monkeypatch.setattr("pwnpilot.runtime.ValidatorNode", lambda **kwargs: object())
     monkeypatch.setattr("pwnpilot.runtime.ExecutorNode", lambda **kwargs: object())
@@ -183,7 +171,7 @@ def test_resume_engagement_success_path(monkeypatch, tmp_path: Path) -> None:
         "event_bus": object(),
     }
 
-    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None: fake_rt)
+    monkeypatch.setattr("pwnpilot.runtime._build_runtime", lambda config_path=None, engagement_id=None: fake_rt)
     monkeypatch.setattr("pwnpilot.runtime.SqliteCheckpointer.from_path", lambda path: _CP())
     monkeypatch.setattr("pwnpilot.runtime.PlannerNode", lambda **kwargs: object())
     monkeypatch.setattr("pwnpilot.runtime.ValidatorNode", lambda **kwargs: object())
